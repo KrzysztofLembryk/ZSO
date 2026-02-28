@@ -1,0 +1,26 @@
+
+BEGIN
+{
+  printf("Tracing block device I/O... Hit Ctrl-C to end.\n");
+}
+
+tracepoint:block:block_bio_queue
+{
+  @start[args->sector] = nsecs;
+}
+
+tracepoint:block:block_rq_complete,
+tracepoint:block:block_bio_complete
+/@start[args->sector]/
+{
+  @usecs = hist((nsecs - @start[args->sector]) / 1000);
+  // https://bpftrace.org/docs/release_024/stdlib
+  // delete(@start, args->sector);
+  // Deprecated version works, new one unfortunately doesn't
+  delete(@start[args->sector]);
+}
+
+END
+{
+  clear(@start);
+}

@@ -1,0 +1,20 @@
+// TASK: For the first task assignment, you need to write a BPF program using 
+// bpftool that counts the number of times each signal number was sent to processes 
+// in the system, and plot a histogram of the results.
+// 
+// SOLUTION: each signal number means each syscall; for every syscall we have a 
+// tracepoint, so to count how many times each syscall was invoked we need to attach 
+// a probe to EVERY AVAILABLE syscall; we attach them to only ENTER events, since if
+// we did sys_* we would have too many BPF programs, and also it is not necessary
+// to wait for both exit and enter events.
+// We can check using: 'bpftrace -vl tracepoint:syscalls:...' that every args struct 
+// has __syscall_nr from which we obtain SIGNAL NUMBER
+
+// Without histogram
+bpftrace -e 'tracepoint:syscalls:sys_enter_* {@countSyscalls[args->__syscall_nr] = count();}'
+
+// With both map and histogram
+bpftrace -e 'tracepoint:syscalls:sys_enter_* { @countSyscalls[args->__syscall_nr] = count(); @histSyscalls = hist(args->__syscall_nr);}'
+
+// Only histogram
+bpftrace -e 'tracepoint:syscalls:sys_enter_* {@histSyscalls = hist(args->__syscall_nr);}'
