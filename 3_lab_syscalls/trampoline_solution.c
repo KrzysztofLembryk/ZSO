@@ -1,4 +1,4 @@
-#include <math.h>
+#include <signal.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <stdint.h>
@@ -10,56 +10,56 @@ typedef void (*sighandler_t)(int);
 
 sighandler_t make_signal_handler(int signum)
 {
-    const int COUNT_IDX_IN_CODE = 17;
-    const int BUFF_START_IDX_IN_CODE = 23;
-    const int BUFF_END_IDX_IN_CODE = 30;
+    const size_t COUNT_IDX_IN_CODE = 25;
+    const size_t BUFF_START_IDX_IN_CODE = 31;
+    const size_t BUFF_END_IDX_IN_CODE = 38;
     // ######## SYSCALL TABLE FOR WRITE ########
     // 
     // %rax | system call | %rdi | %rsi | %rdx
     //  1   |  sys_write  |  fd  | *buf | count
     // 
     // #########################################
-    // We need to modify byte 15 and set it to our least byte of dynamically 
-    // calculated count.
-    // We also need to modify bytes 22-25 and set them to our string buf address.
     static uint8_t code[] = {
         // in rdi we have signum - but we ignore it
+        0x55,                                       // push rbp
+        0x48, 0x89, 0xEC,                           // mov rsp,rbp
+        0x48, 0x83, 0xEC, 0x10,                     // sub 0x10,rsp
         0x48, 0xC7, 0xC0, 0x01, 0x00, 0x00, 0x00,   // mov 1, rax
         0x48, 0xC7, 0xC7, 0x01, 0x00, 0x00, 0x00,   // mov 1, rdi
         0x48, 0xC7, 0xC2, 0x10, 0x00, 0x00, 0x00,   // mov count, rdx, 
-                                                    // count is at 17th byte 
-        // 0x48, 0xBE, 0x10, 0x00, 0x00, 0x00, 0x10, 0x00, 0x00, 0x00,
-                                                    // mov buf, rsi, addr bytes 22-29
-        0x48, 0x89, 0xD0,                           // mov rdx, rax
-        // 0x0F, 0x05,                                 // syscall
-        0xC3,                       /* ret rax              */
+        0x48, 0xBE, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+                                                    // movabs buf, rsi
+        0x0F, 0x05,                                 // syscall
+        0x90,                                       // nop  
+        0xC9,                                       // leave
+        0xC3,                                       // ret
     };
 
-    int n_signum_chars = (int)((ceil(log10(signum))+1));
-    printf("n_signum_chars: %d\n", n_signum_chars);
+    // snprintf returns number of characters that would be saved if buffer was big
+    // enough
+    int n_signum_digits = snprintf(NULL, 0, "%d", signum);
+    char *signum_str = (char*)malloc(n_signum_digits);
 
-    char *signum_str = (char*)malloc(n_signum_chars);
     sprintf(signum_str, "%d", signum);
-    printf("signum_str: %s\n", signum_str);
 
-    uint8_t least_byte = (uint8_t) n_signum_chars;
-    printf("least byte: %d\n", least_byte);
+    uint8_t least_byte = (uint8_t) (n_signum_digits);
+    uint8_t *ptr_bytes = (uint8_t *)&signum_str;
+
     code[COUNT_IDX_IN_CODE] = least_byte;
+    // little endian, ptr has 8 bytes, we allocated memory so even after function
+    // returns, pointer is still valid, thus we write it to our code in place that
+    // moves this pointer to RSI
+    for (size_t i = 0; i < sizeof(signum_str); i++) 
+    {
+        if (BUFF_START_IDX_IN_CODE + i > BUFF_END_IDX_IN_CODE)
+        {
+            printf("BUFF_START_IDX_IN_CODE + i > BUFF_END_IDX_IN_CODE\n");
+            exit(-1);
+        }
 
-    unsigned char *ptr_bytes = (unsigned char *)&signum_str;
-    // little endian
-    printf("sizeof signum_str: %ld\n", sizeof(signum_str));
-    // for (size_t i = 0; i < sizeof(signum_str); i++) 
-    // {
-    //     if (BUFF_START_IDX_IN_CODE + i > BUFF_END_IDX_IN_CODE)
-    //     {
-    //         printf("BUFF_START_IDX_IN_CODE + i > BUFF_END_IDX_IN_CODE\n");
-    //         exit(-1);
-    //     }
-
-    //     unsigned char byte = ptr_bytes[i];
-    //     code[BUFF_START_IDX_IN_CODE + i] = byte;
-    // }
+        uint8_t byte = ptr_bytes[i];
+        code[BUFF_START_IDX_IN_CODE + i] = byte;
+    }
 
     const size_t len = sizeof(code);
 
@@ -83,10 +83,10 @@ sighandler_t make_signal_handler(int signum)
 
     // func is a pointer to a function taking no args and returning int
     // (int(*)())p - we cast pointer p to a function pointer type int (*)(void)
-    int (*func)(int) = (int(*)(int))p;
+    void (*func)(int) = (void(*)(int))p;
     // func(signum);
-    printf("(dynamic) code returned %d\n", func(signum));
-    // printf("(our string) signum: %s\n", signum_str);
+
+    return signal(signum, func);
 }
 
 
