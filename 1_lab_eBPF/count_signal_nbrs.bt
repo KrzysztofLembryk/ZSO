@@ -1,6 +1,15 @@
 // TASK: For the first task assignment, you need to write a BPF program using 
-// bpftool that counts the number of times each signal number was sent to processes 
+// bpftool that counts the number of times each SIGNAL NUMBER was sent to processes 
 // in the system, and plot a histogram of the results.
+
+// Probably good solve with linear histogram with step 1, so that each signal nbr has
+// its own column
+bpftrace -e 'tracepoint:signal:signal_deliver { @histSigNums = lhist(args->sig, 1, 64, 1);}'
+
+// !!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!
+//  Below solution is WRONG since we count SYSCALLS NUMBERS not SIGNAL NUMBERS.
+//  To fix it we should use tracepoint:signal:signal_deliver, args->sig
+// !!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!
 // 
 // SOLUTION: each signal number means each syscall; for every syscall we have a 
 // tracepoint, so to count how many times each syscall was invoked we need to attach 

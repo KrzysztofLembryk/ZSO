@@ -5,6 +5,7 @@
 # Cheetsheet - useful commands
 - <span style="color:yellow">VERY IMPORTANTe</span>
 , allows to check members of automatically generated tracepoint ```args``` struct: ```bpftrace -vl tracepoint:syscalls:sys_enter_openat```
+- Tracepoints can be found under: ```/sys/kernel/debug/tracing```
 
 ## What is a PROBE
 A probe is a mechanism used to **"trace"** or "instrument" the system. 

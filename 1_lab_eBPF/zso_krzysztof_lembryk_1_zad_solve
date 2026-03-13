@@ -1,0 +1,1 @@
+bpftrace -e 'tracepoint:signal:signal_generate { @histSigNums = lhist(args->sig, 1, 64, 1);}'

@@ -20,6 +20,9 @@ tracepoint:block:block_bio_complete
   delete(@start[args->sector]);
 }
 
+
+// bpftrace -e 'tracepoint:signal:signal_deliver { @countSig[args->sig] = count(); @histSigNums = hist(args->sig);}'
+
 END
 {
   clear(@start);
