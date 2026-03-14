@@ -22,7 +22,7 @@ sighandler_t make_signal_handler(int signum)
     static uint8_t code[] = {
         // in rdi we have signum - but we ignore it
         0x55,                                       // push rbp
-        0x48, 0x89, 0xEC,                           // mov rsp,rbp
+        0x48, 0x89, 0xE5,                           // mov rsp,rbp
         0x48, 0x83, 0xEC, 0x10,                     // sub 0x10,rsp
         0x48, 0xC7, 0xC0, 0x01, 0x00, 0x00, 0x00,   // mov 1, rax
         0x48, 0xC7, 0xC7, 0x01, 0x00, 0x00, 0x00,   // mov 1, rdi
@@ -30,6 +30,7 @@ sighandler_t make_signal_handler(int signum)
         0x48, 0xBE, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
                                                     // movabs buf, rsi
         0x0F, 0x05,                                 // syscall
+        // 0xFF, 0xD0,
         0x90,                                       // nop  
         0xC9,                                       // leave
         0xC3,                                       // ret
@@ -38,27 +39,29 @@ sighandler_t make_signal_handler(int signum)
     // snprintf returns number of characters that would be saved if buffer was big
     // enough
     int n_signum_digits = snprintf(NULL, 0, "%d", signum);
-    char *signum_str = (char*)malloc(n_signum_digits);
+    // + 1 for null character
+    char *signum_str = (char*)malloc(n_signum_digits + 1);
+
+    if (!signum_str) 
+    {
+        perror("malloc");
+        exit(1);
+    }
 
     sprintf(signum_str, "%d", signum);
 
-    uint8_t least_byte = (uint8_t) (n_signum_digits);
-    uint8_t *ptr_bytes = (uint8_t *)&signum_str;
-
+    uint8_t least_byte = (uint8_t) (n_signum_digits + 1);
     code[COUNT_IDX_IN_CODE] = least_byte;
-    // little endian, ptr has 8 bytes, we allocated memory so even after function
-    // returns, pointer is still valid, thus we write it to our code in place that
-    // moves this pointer to RSI
-    for (size_t i = 0; i < sizeof(signum_str); i++) 
-    {
-        if (BUFF_START_IDX_IN_CODE + i > BUFF_END_IDX_IN_CODE)
-        {
-            printf("BUFF_START_IDX_IN_CODE + i > BUFF_END_IDX_IN_CODE\n");
-            exit(-1);
-        }
 
-        uint8_t byte = ptr_bytes[i];
-        code[BUFF_START_IDX_IN_CODE + i] = byte;
+    // to be able to use >> and get all bytes of our pointer
+    uintptr_t buf_addr = (uintptr_t)signum_str;
+    for (size_t i = 0; i < 8; i++) 
+    {
+        if (BUFF_START_IDX_IN_CODE + i > BUFF_END_IDX_IN_CODE) {
+            fprintf(stderr, "BUFF_START_IDX_IN_CODE + i > BUFF_END_IDX_IN_CODE\n");
+            exit(1);
+        }
+        code[BUFF_START_IDX_IN_CODE + i] = (uint8_t)((buf_addr >> (8 * i)) & 0xFF);
     }
 
     const size_t len = sizeof(code);
@@ -81,10 +84,8 @@ sighandler_t make_signal_handler(int signum)
         exit(2);
     }
 
-    // func is a pointer to a function taking no args and returning int
-    // (int(*)())p - we cast pointer p to a function pointer type int (*)(void)
+    // (void(*)(int))p - we cast pointer p to a function pointer type void (*)(int)
     void (*func)(int) = (void(*)(int))p;
-    // func(signum);
 
     return signal(signum, func);
 }
@@ -92,7 +93,11 @@ sighandler_t make_signal_handler(int signum)
 
 int main()
 {
-    make_signal_handler(69);
-    pause();
-    return 0;
+    sighandler_t old = make_signal_handler(2);
+    while (1)
+    {
+        kill(getpid(), SIGINT);
+        sleep(1);
+    }
+    // for (;;) pause();
 }
