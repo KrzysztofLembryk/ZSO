@@ -30,7 +30,6 @@ sighandler_t make_signal_handler(int signum)
         0x48, 0xBE, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
                                                     // movabs buf, rsi
         0x0F, 0x05,                                 // syscall
-        // 0xFF, 0xD0,
         0x90,                                       // nop  
         0xC9,                                       // leave
         0xC3,                                       // ret
@@ -90,14 +89,3 @@ sighandler_t make_signal_handler(int signum)
     return signal(signum, func);
 }
 
-
-int main()
-{
-    sighandler_t old = make_signal_handler(2);
-    while (1)
-    {
-        kill(getpid(), SIGINT);
-        sleep(1);
-    }
-    // for (;;) pause();
-}
