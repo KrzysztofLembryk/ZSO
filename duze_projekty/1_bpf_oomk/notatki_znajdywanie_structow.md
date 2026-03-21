@@ -1,5 +1,11 @@
 # Useful remarks
 
+##  how to kprobes/tracepoints structs
+- in vmlinux.h EVERY KERNAL TYPE is generated
+- so we can just do: ```grep -A 30 "struct pt_regs" vmlinux.h```
+- or find it in kernel version in ptrace.h which is in ```/usr/src/linux-headers-$(uname -r)/arch/x86/include/asm/ptrace.h ```
+- for TRACEPOINTS we check: ```/sys/kernel/debug/tracing/events```
+
 ## libbpf
 - ```#include <bpf/bpf_helpers.h>```
 - ```#include <bpf/bpf_tracing.h>```
