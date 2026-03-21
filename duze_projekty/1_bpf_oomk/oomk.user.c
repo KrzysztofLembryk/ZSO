@@ -18,22 +18,6 @@ int main(void)
         return 1;
     }
 
-    // bpf_map__set_initial_value - must be set before loading a programme that uses
-    // given map
-    // err = bpf_map__set_initial_value(skel->maps.my_map, &init_map_value, sizeof(init_map_value));
-    // if (err)
-    // {
-    //     fprintf(stderr, "Failed set initial map value to %d\n", init_map_value);
-    //     goto cleanup;
-    // }
-
-    // err = oomk__load(skel);
-    // if (err)
-    // {
-    //     fprintf(stderr, "Failed to load BPF programme\n");
-    //     goto cleanup;
-    // }
-
     err = oomk__attach(skel);
     if (err)
     {
@@ -46,12 +30,10 @@ int main(void)
     sysinfo(&info);
 
     printf("user sysinfo: %lu / %lu\n", info.freeram, info.totalram);
-    sleep(2);
 
-    sysinfo(&info);
-
-    sleep(2);
-
+    /* Keep the process alive so our probes work */
+    for (;;)
+        pause();
 
 cleanup:
     oomk__destroy(skel);

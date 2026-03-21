@@ -1,4 +1,5 @@
 #include <stdio.h>
+#include <sys/sysinfo.h>
 #include <stdlib.h>
 #include <unistd.h>
 #include <string.h>
@@ -22,6 +23,10 @@ int main(void)
 
     printf("Allocated 1GB at %p, pid=%d\n", (void *)p, (int)getpid());
     fflush(stdout);
+
+    struct sysinfo info;
+
+    sysinfo(&info);
 
     /* Keep the process alive so the allocation remains resident */
     for (;;)
