@@ -33,7 +33,10 @@ int main(void)
 
     /* Keep the process alive so our probes work */
     for (;;)
-        pause();
+    {
+        sleep(1);
+        sysinfo(&info);
+    }
 
 cleanup:
     oomk__destroy(skel);
