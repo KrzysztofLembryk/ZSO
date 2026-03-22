@@ -34,6 +34,7 @@
 #define ALLOWED_NUMBER_OF_OPENED_FD 99
 #define ALLOWED_NUMBER_OF_WRITES 99
 #define ALLOWED_NUMBER_OF_MB_TO_READ (10U * 1024 * 1024 - 1)
+#define ALLOWED_NUMBER_OF_THREADS 99
 
 // Global variable (translated into one elem array by compiler) that tells us if we 
 // can kill processes (if memory usage is >= 1GB)
@@ -102,6 +103,7 @@ struct info {
     __u32 fcntl_op;
     __u32 write_count;
     __u32 read_mb_count;
+    __u32 spawned_threads_count;
 };
 
 static struct info new_info()
@@ -112,6 +114,7 @@ static struct info new_info()
         .fcntl_op = 0,
         .write_count = 0,
         .read_mb_count = 0,
+        .spawned_threads_count = 0
     };
     
     return init_value;
@@ -223,6 +226,26 @@ static int handle_counting_read_bytes(struct sys_exit_funcs_args *ctx)
     return 0;
 }
 
+static int handle_spawning_threads(struct sys_exit_funcs_args *ctx)
+{
+    if (is_oomp_present())
+    {
+        GET_PROC_INFO_OR_RETURN()
+        if (ctx->ret >= 0)
+        {
+            proc_info->spawned_threads_count += 1;
+
+            if (i_can_kill 
+                && proc_info->read_mb_count > ALLOWED_NUMBER_OF_THREADS)
+            {
+                int ret = bpf_send_signal(SIGKILL);
+                bpf_map_delete_elem(&state_map, &pid);
+            }
+        }
+    }
+    return 0;
+}
+
 #define FD_EXIT_HANDLER(name) \
 SEC("tracepoint/syscalls/sys_exit_" #name) \
 int name##_exit(struct sys_exit_funcs_args *ctx) { \
@@ -239,6 +262,12 @@ int name##_exit(struct sys_exit_funcs_args *ctx) { \
 SEC("tracepoint/syscalls/sys_exit_" #name) \
 int name##_exit(struct sys_exit_funcs_args *ctx) { \
     return handle_counting_read_bytes(ctx); \
+}
+
+#define SPAWN_THREAD_EXIT_HANDLER(name) \
+SEC("tracepoint/syscalls/sys_exit_" #name) \
+int name##_exit(struct sys_exit_funcs_args *ctx) { \
+    return handle_spawning_threads(ctx); \
 }
 
 //###################################################################################
@@ -458,6 +487,12 @@ READ_BYTES_EXIT_HANDLER(preadv)
 READ_BYTES_EXIT_HANDLER(preadv2)
 READ_BYTES_EXIT_HANDLER(pread64)
 
+//###################################################################################
+// 5) Programs that spawn 100 or more threads should be killed.
+//      - syscalls: clone3 (used by pthread_create), clone (old API, but may be used)
+//###################################################################################
+SPAWN_THREAD_EXIT_HANDLER(clone)
+SPAWN_THREAD_EXIT_HANDLER(clone3)
 
 struct sys_enter_getrandom_args {
     unsigned long long unused;       /* padding / common fields */
