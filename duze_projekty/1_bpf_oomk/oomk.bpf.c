@@ -491,8 +491,14 @@ READ_BYTES_EXIT_HANDLER(pread64)
 // 5) Programs that spawn 100 or more threads should be killed.
 //      - syscalls: clone3 (used by pthread_create), clone (old API, but may be used)
 //###################################################################################
+
 SPAWN_THREAD_EXIT_HANDLER(clone)
 SPAWN_THREAD_EXIT_HANDLER(clone3)
+
+//###################################################################################
+// 6) Programs that call the rand() function 100 or more times should be killed.
+//      rand() needs UPROBE, and using ltrace instead of strace
+//###################################################################################
 
 struct sys_enter_getrandom_args {
     unsigned long long unused;       /* padding / common fields */
