@@ -2,7 +2,7 @@ CC = gcc
 CFLAGS = -O2 -g -pthread
 
 
-TARGETS = oomp_test_fds oomp_test_threads oomp_test_reads oomp_test_readv oomp_test_rw_below oomp_test_writes oomp_test_pwrite64 oomp_test_packets oomp_test_packets_udp oomp_test_rand oomp_test_fds_creat oomp_test_fds_dup oomp_test_fds_pipe oomp_test_fds_fcntl
+TARGETS = oomp_test_fds oomp_test_threads oomp_test_reads oomp_test_readv oomp_test_rw_below oomp_test_writes oomp_test_pwrite64 oomp_test_packets oomp_test_packets_udp oomp_test_rand oomp_test_fds_creat oomp_test_fds_dup oomp_test_fds_pipe oomp_test_fds_fcntl oomp_test_fds_openat
 EXTRA_TARGETS = oomp_test_use_memory
 
 all: $(TARGETS) $(EXTRA_TARGETS)

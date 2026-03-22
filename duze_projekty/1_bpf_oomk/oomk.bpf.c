@@ -225,41 +225,6 @@ static int handle_opening_new_fd(struct sys_exit_fd_funcs_args *ctx)
             if (i_can_kill 
                 && read_value->used_fd_count > ALLOWED_NUMBER_OF_OPENED_FD)
             {
-                bpf_printk("creat_exit, used fds: %u, will be killed\n", read_value->used_fd_count);
-                int ret = bpf_send_signal(SIGKILL);
-                bpf_map_delete_elem(&state_map, &pid);
-            }
-        }
-    }
-}
-
-SEC("tracepoint/syscalls/sys_exit_creat")
-int creat_exit(struct sys_exit_fd_funcs_args *ctx)
-{
-    if (is_oomp_present())
-    {
-        struct info init_value = {.rand_calls_count = 0, .used_fd_count = 0};
-        struct info *read_value;
-        pid_t pid = bpf_get_current_pid_tgid() >> 32;
-
-        bpf_map_update_elem(&state_map, &pid, &init_value, BPF_NOEXIST);
-        read_value = bpf_map_lookup_elem(&state_map, &pid);
-
-        if(!read_value)
-        {
-            return 0;
-        }
-
-        int i_can_kill = __sync_fetch_and_add(&is_killing_allowed, 0);
-        // if creat unsuccesful we do nothing, since new fd wasnt created
-        if (ctx->ret >= 0)
-        {
-            read_value->used_fd_count += 1;
-
-            if (i_can_kill 
-                && read_value->used_fd_count > ALLOWED_NUMBER_OF_OPENED_FD)
-            {
-                bpf_printk("creat_exit, used fds: %u, will be killed\n", read_value->used_fd_count);
                 int ret = bpf_send_signal(SIGKILL);
                 bpf_map_delete_elem(&state_map, &pid);
             }
@@ -268,149 +233,22 @@ int creat_exit(struct sys_exit_fd_funcs_args *ctx)
     return 0;
 }
 
-SEC("tracepoint/syscalls/sys_exit_open")
-int open_exit(struct sys_exit_fd_funcs_args *ctx)
-{
-    if (is_oomp_present())
-    {
-        struct info init_value = {.rand_calls_count = 0, .used_fd_count = 0};
-        struct info *read_value;
-        pid_t pid = bpf_get_current_pid_tgid() >> 32;
-
-        bpf_map_update_elem(&state_map, &pid, &init_value, BPF_NOEXIST);
-        read_value = bpf_map_lookup_elem(&state_map, &pid);
-
-        if(!read_value)
-        {
-            return 0;
-        }
-
-        int i_can_kill = __sync_fetch_and_add(&is_killing_allowed, 0);
-        // if creat unsuccesful we do nothing, since new fd wasnt created
-        if (ctx->ret >= 0)
-        {
-            read_value->used_fd_count += 1;
-
-            if (i_can_kill 
-                && read_value->used_fd_count > ALLOWED_NUMBER_OF_OPENED_FD)
-            {
-                bpf_printk("open_exit, used fds: %u, will be killed\n", read_value->used_fd_count);
-                int ret = bpf_send_signal(SIGKILL);
-                bpf_map_delete_elem(&state_map, &pid);
-            }
-        }
-    }
-    return 0;
+#define FD_EXIT_HANDLER(name) \
+SEC("tracepoint/syscalls/sys_exit_" #name) \
+int name##_exit(struct sys_exit_fd_funcs_args *ctx) { \
+    return handle_opening_new_fd(ctx); \
 }
 
-SEC("tracepoint/syscalls/sys_exit_openat")
-int openat_exit(struct sys_exit_fd_funcs_args *ctx)
-{
-    if (is_oomp_present())
-    {
-        struct info init_value = {.rand_calls_count = 0, .used_fd_count = 0};
-        struct info *read_value;
-        pid_t pid = bpf_get_current_pid_tgid() >> 32;
+FD_EXIT_HANDLER(creat)
+// open invokes sys_cal: my_syscall4(__NR_openat, AT_FDCWD, path, flags, mode);
+// which uses openat, thus sys_exit_open is not needed, only openat
+// FD_EXIT_HANDLER(open)
+FD_EXIT_HANDLER(openat)
+FD_EXIT_HANDLER(dup)
 
-        bpf_map_update_elem(&state_map, &pid, &init_value, BPF_NOEXIST);
-        read_value = bpf_map_lookup_elem(&state_map, &pid);
-
-        if(!read_value)
-        {
-            return 0;
-        }
-
-        int i_can_kill = __sync_fetch_and_add(&is_killing_allowed, 0);
-        // if creat unsuccesful we do nothing, since new fd wasnt created
-        if (ctx->ret >= 0)
-        {
-            read_value->used_fd_count += 1;
-
-            if (i_can_kill 
-                && read_value->used_fd_count > ALLOWED_NUMBER_OF_OPENED_FD)
-            {
-                
-                bpf_printk("openat_exit, used fds: %u, will be killed\n", read_value->used_fd_count);
-                int ret = bpf_send_signal(SIGKILL);
-                bpf_map_delete_elem(&state_map, &pid);
-            }
-        }
-    }
-    return 0;
-}
-
-
-SEC("tracepoint/syscalls/sys_exit_dup")
-int dup_exit(struct sys_exit_fd_funcs_args *ctx)
-{
-    if (is_oomp_present())
-    {
-        struct info init_value = {.rand_calls_count = 0, .used_fd_count = 0};
-        struct info *read_value;
-        pid_t pid = bpf_get_current_pid_tgid() >> 32;
-
-        bpf_map_update_elem(&state_map, &pid, &init_value, BPF_NOEXIST);
-        read_value = bpf_map_lookup_elem(&state_map, &pid);
-
-        if(!read_value)
-        {
-            return 0;
-        }
-
-        int i_can_kill = __sync_fetch_and_add(&is_killing_allowed, 0);
-        // if creat unsuccesful we do nothing, since new fd wasnt created
-        if (ctx->ret >= 0)
-        {
-            read_value->used_fd_count += 1;
-
-            if (i_can_kill 
-                && read_value->used_fd_count > ALLOWED_NUMBER_OF_OPENED_FD)
-            {
-                int ret = bpf_send_signal(SIGKILL);
-                bpf_map_delete_elem(&state_map, &pid);
-            }
-        }
-    }
-    return 0;
-}
-
-
-SEC("tracepoint/syscalls/sys_exit_dup2")
-int dup2_exit(struct sys_exit_fd_funcs_args *ctx)
-{
-    if (is_oomp_present())
-    {
-        struct info init_value = {.rand_calls_count = 0, .used_fd_count = 0};
-        struct info *read_value;
-        pid_t pid = bpf_get_current_pid_tgid() >> 32;
-
-        bpf_map_update_elem(&state_map, &pid, &init_value, BPF_NOEXIST);
-        read_value = bpf_map_lookup_elem(&state_map, &pid);
-
-        if(!read_value)
-        {
-            return 0;
-        }
-
-        int i_can_kill = __sync_fetch_and_add(&is_killing_allowed, 0);
-        // if creat unsuccesful we do nothing, since new fd wasnt created
-        if (ctx->ret >= 0)
-        {
-            read_value->used_fd_count += 1;
-
-            if (i_can_kill 
-                && read_value->used_fd_count > ALLOWED_NUMBER_OF_OPENED_FD)
-            {
-                int ret = bpf_send_signal(SIGKILL);
-                bpf_map_delete_elem(&state_map, &pid);
-            }
-        }
-    }
-    return 0;
-}
 
 SEC("tracepoint/syscalls/sys_exit_close")
-int close_exit(struct sys_exit_fd_funcs_args *ctx)
+int close_fd_exit(struct sys_exit_fd_funcs_args *ctx)
 {
     if (is_oomp_present())
     {
