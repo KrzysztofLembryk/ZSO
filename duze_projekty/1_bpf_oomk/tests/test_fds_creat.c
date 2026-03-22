@@ -4,7 +4,6 @@
 
 int main() 
 {
-    printf("Testing creat...\n");
     for (int i = 0; i < 200; i++) {
         int fd = creat("/dev/null", 0666);
         if (fd < 0) perror("creat");

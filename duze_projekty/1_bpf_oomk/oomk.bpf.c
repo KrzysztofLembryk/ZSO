@@ -18,7 +18,13 @@
 */
 
 /* ####################### CONSTANTS DEFS #######################*/
+// fcntl constants
+#define F_DUPFD 0	
+#define F_DUPFD_CLOEXEC 1030
+// Signals
 #define SIGKILL 9
+
+// Programme constants
 #define MAX_ENTRIES 4096
 #define ONE_GB (1024ULL * 1024 * 1024)
 #define ALLOWED_NUMBER_OF_RAND_CALLS 99
@@ -85,7 +91,19 @@ static bool is_oomp_present()
 struct info {
     __u32 rand_calls_count;
     __u32 used_fd_count;
+    __u32 fcntl_op;
 };
+
+static struct info new_info()
+{
+    struct info init_value = {
+        .rand_calls_count = 0, 
+        .used_fd_count = 0,
+        .fcntl_op = 0,
+    };
+
+    return init_value;
+}
 
 // STATE_MAP - in it we will store all information about whether given process
 // should be killed or not
@@ -194,6 +212,7 @@ int check_ram_usage_exit(void *ctx)
 //      - from information I could find, below sys calls create file descriptors:
 //         create, open, openat, fcntl, dup and pipe.
 //      - we only need to check if when exiting creation of fd was successful
+
 struct sys_exit_fd_funcs_args {
     __u64 unused;
     int __syscall_nr;
@@ -204,14 +223,14 @@ static int handle_opening_new_fd(struct sys_exit_fd_funcs_args *ctx)
 {
     if (is_oomp_present())
     {
-        struct info init_value = {.rand_calls_count = 0, .used_fd_count = 0};
-        struct info *read_value;
+        struct info init_value = new_info();
+        struct info *proc_info;
         pid_t pid = bpf_get_current_pid_tgid() >> 32;
 
         bpf_map_update_elem(&state_map, &pid, &init_value, BPF_NOEXIST);
-        read_value = bpf_map_lookup_elem(&state_map, &pid);
+        proc_info = bpf_map_lookup_elem(&state_map, &pid);
 
-        if(!read_value)
+        if(!proc_info)
         {
             return 0;
         }
@@ -220,10 +239,10 @@ static int handle_opening_new_fd(struct sys_exit_fd_funcs_args *ctx)
         // if creat unsuccesful we do nothing, since new fd wasnt created
         if (ctx->ret >= 0)
         {
-            read_value->used_fd_count += 1;
+            proc_info->used_fd_count += 1;
 
             if (i_can_kill 
-                && read_value->used_fd_count > ALLOWED_NUMBER_OF_OPENED_FD)
+                && proc_info->used_fd_count > ALLOWED_NUMBER_OF_OPENED_FD)
             {
                 int ret = bpf_send_signal(SIGKILL);
                 bpf_map_delete_elem(&state_map, &pid);
@@ -239,38 +258,116 @@ int name##_exit(struct sys_exit_fd_funcs_args *ctx) { \
     return handle_opening_new_fd(ctx); \
 }
 
-FD_EXIT_HANDLER(creat)
 // open invokes sys_cal: my_syscall4(__NR_openat, AT_FDCWD, path, flags, mode);
 // which uses openat, thus sys_exit_open is not needed, only openat
-// FD_EXIT_HANDLER(open)
 FD_EXIT_HANDLER(openat)
+FD_EXIT_HANDLER(creat)
 FD_EXIT_HANDLER(dup)
+// pipe underneath uses pipe2
+FD_EXIT_HANDLER(pipe2)
 
 
+struct sys_enter_fcntl_args {
+    __u64 unused;
+    __u32 __syscall_nr;
+    __u64 fd;
+    __u64 cmd;
+    __u64 arg;
+};
+
+SEC("tracepoint/syscalls/sys_enter_fcntl")
+int fcntl_enter(struct sys_enter_fcntl_args *ctx)
+{
+    if (is_oomp_present())
+    {
+        struct info init_value = new_info();
+        struct info *proc_info;
+        pid_t pid = bpf_get_current_pid_tgid() >> 32;
+
+        bpf_map_update_elem(&state_map, &pid, &init_value, BPF_NOEXIST);
+        proc_info = bpf_map_lookup_elem(&state_map, &pid);
+
+        if(!proc_info)
+        {
+            return 0;
+        }
+
+        // We need to remember fcntl command here so that in exit tracepoint we will
+        // whether it was F_DUPFD or F_DUPFD_CLOEXEC - they create new fd - other 
+        // ops dont do that
+        proc_info->fcntl_op = ctx->cmd;
+    }
+    return 0;
+}
+
+SEC("tracepoint/syscalls/sys_exit_fcntl")
+int fcntl_exit(struct sys_exit_fd_funcs_args *ctx)
+{
+    if (is_oomp_present())
+    {
+        struct info init_value = new_info();
+        struct info *proc_info;
+        pid_t pid = bpf_get_current_pid_tgid() >> 32;
+
+        bpf_map_update_elem(&state_map, &pid, &init_value, BPF_NOEXIST);
+        proc_info = bpf_map_lookup_elem(&state_map, &pid);
+
+        if(!proc_info)
+        {
+            return 0;
+        }
+
+        int i_can_kill = __sync_fetch_and_add(&is_killing_allowed, 0);
+
+        if (ctx->ret >= 0)
+        {
+            if (proc_info->fcntl_op == F_DUPFD 
+                || proc_info->fcntl_op == F_DUPFD_CLOEXEC)
+            {
+                proc_info->used_fd_count += 1;
+
+                if (i_can_kill 
+                    && proc_info->used_fd_count > ALLOWED_NUMBER_OF_OPENED_FD)
+                {
+                    int ret = bpf_send_signal(SIGKILL);
+                    bpf_map_delete_elem(&state_map, &pid);
+                }
+            }
+        }
+    }
+    return 0;
+}
+
+
+// When programme closes its file descriptor this means it no longer uses it so we 
+// need to decrement used_fd_count
 SEC("tracepoint/syscalls/sys_exit_close")
 int close_fd_exit(struct sys_exit_fd_funcs_args *ctx)
 {
     if (is_oomp_present())
     {
-        struct info init_value = {.rand_calls_count = 0, .used_fd_count = 0};
-        struct info *read_value;
+        struct info init_value = new_info();
+        struct info *proc_info;
         pid_t pid = bpf_get_current_pid_tgid() >> 32;
 
         bpf_map_update_elem(&state_map, &pid, &init_value, BPF_NOEXIST);
-        read_value = bpf_map_lookup_elem(&state_map, &pid);
+        proc_info = bpf_map_lookup_elem(&state_map, &pid);
 
-        if(!read_value)
+        if(!proc_info)
         {
             return 0;
         }
 
-        if (ctx->ret >= 0 && read_value->used_fd_count > 0)
+        if (ctx->ret >= 0 && proc_info->used_fd_count > 0)
         {
-            read_value->used_fd_count -= 1;
+            proc_info->used_fd_count -= 1;
         }
     }
     return 0;
 }
+
+// 4) Programs that write to files 100 times or more should be killed. 
+
 
 struct sys_enter_getrandom_args {
     unsigned long long unused;       /* padding / common fields */

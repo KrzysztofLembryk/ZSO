@@ -8,7 +8,6 @@
  
 int main() 
 {
-    printf("Testing dup...\n");
     int original_fd = open("/dev/null", O_RDONLY);
     if (original_fd < 0) 
     { 

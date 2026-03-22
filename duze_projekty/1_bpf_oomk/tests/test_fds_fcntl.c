@@ -3,7 +3,6 @@
 #include <stdio.h>
 
 int main() {
-    printf("Testing fcntl(F_DUPFD)...\n");
     int base = open("/dev/null", O_RDONLY);
     if (base < 0) 
     { 

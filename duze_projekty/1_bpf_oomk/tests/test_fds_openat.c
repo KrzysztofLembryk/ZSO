@@ -4,7 +4,6 @@
 #include <stdio.h>
 
 int main() {
-    printf("Testing openat...\n");
     for (int i = 0; i < 200; i++) {
         // AT_FDCWD makes openat behave like open
         int fd = openat(AT_FDCWD, "/dev/null", O_RDONLY);

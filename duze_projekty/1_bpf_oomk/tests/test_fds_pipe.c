@@ -3,7 +3,6 @@
 #include <stdio.h>
 
 int main() {
-    printf("Testing pipe...\n");
     for (int i = 0; i < 100; i++) 
     { // Each pipe gives 2 fds
         int fds[2];
