@@ -2,7 +2,7 @@ CC = gcc
 CFLAGS = -O2 -g -pthread
 
 
-TARGETS = oomp_test_fds oomp_test_threads oomp_test_reads oomp_test_readv oomp_test_rw_below oomp_test_writes oomp_test_pwrite64 oomp_test_packets oomp_test_packets_udp oomp_test_rand oomp_test_fds_creat oomp_test_fds_dup oomp_test_fds_pipe oomp_test_fds_fcntl oomp_test_fds_openat oomp_test_fds_creat_dup_openat_fcntl_pipe oomp_test_fds_socket
+TARGETS = oomp_test_fds oomp_test_threads oomp_test_reads oomp_test_readv oomp_test_rw_below oomp_test_writes oomp_test_pwrite64 oomp_test_packets oomp_test_packets_udp oomp_test_rand oomp_test_fds_creat oomp_test_fds_dup oomp_test_fds_pipe oomp_test_fds_fcntl oomp_test_fds_openat oomp_test_fds_creat_dup_openat_fcntl_pipe oomp_test_fds_socket oomp_test_map_entry_rmvd
 EXTRA_TARGETS = oomp_test_use_memory
 
 all: $(TARGETS) $(EXTRA_TARGETS)
@@ -12,6 +12,9 @@ oomp_test_fds: test_fds.c
 
 oomp_test_fds_%: test_fds_%.c
 	$(CC) $(CFLAGS) $< -o $@
+
+oomp_test_map_entry_rmvd: test_exited_proc_map_entry_rmvd.c
+	$(CC) $(CFLAGS) test_exited_proc_map_entry_rmvd.c -o oomp_test_map_entry_rmvd
 
 oomp_test_threads: test_threads.c
 	$(CC) $(CFLAGS) test_threads.c -o oomp_test_threads

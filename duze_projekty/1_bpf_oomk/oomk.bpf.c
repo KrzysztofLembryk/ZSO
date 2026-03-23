@@ -15,7 +15,7 @@
     - tracepoints - /sys/kernel/debug/tracing 
         check members of tracepoint ```args``` struct: 
         ```bpftrace -vl tracepoint:syscalls:sys_enter_openat```
-    - kprobes - 
+    - kprobes - file from teacher
     - structs - /usr/src/linux-headers-$(uname -r)/arch/x86/include/asm/ptrace.h 
     - strace - for syscalls
     - ltrace - for library calls (i.e. for rand())
@@ -28,7 +28,9 @@
 // Signals
 #define SIGKILL 9
 
-// Programme constants
+
+#define KILLING_ENABLED 1
+#define KILLING_DISABLED 0
 #define MAX_ENTRIES 4096
 #define ONE_GB (1024ULL * 1024 * 1024)
 #define ALLOWED_NUMBER_OF_RAND_CALLS 99
@@ -181,8 +183,8 @@ static int handle_opening_new_fd(struct sys_exit_funcs_args *ctx)
             if (i_can_kill 
                 && proc_info->used_fd_count > ALLOWED_NUMBER_OF_OPENED_FD)
             {
-                int ret = bpf_send_signal(SIGKILL);
                 bpf_map_delete_elem(&state_map, &pid);
+                int ret = bpf_send_signal(SIGKILL);
             }
         }
     }
@@ -204,8 +206,8 @@ static int handle_writes(struct sys_exit_funcs_args *ctx)
             if (i_can_kill 
                 && proc_info->write_count > ALLOWED_NUMBER_OF_WRITES)
             {
-                int ret = bpf_send_signal(SIGKILL);
                 bpf_map_delete_elem(&state_map, &pid);
+                int ret = bpf_send_signal(SIGKILL);
             }
         }
     }
@@ -224,8 +226,8 @@ static int handle_counting_read_bytes(struct sys_exit_funcs_args *ctx)
             if (i_can_kill 
                 && proc_info->read_mb_count > ALLOWED_NUMBER_OF_MB_TO_READ)
             {
-                int ret = bpf_send_signal(SIGKILL);
                 bpf_map_delete_elem(&state_map, &pid);
+                int ret = bpf_send_signal(SIGKILL);
             }
         }
     }
@@ -244,8 +246,8 @@ static int handle_spawning_threads(struct sys_exit_funcs_args *ctx)
             if (i_can_kill 
                 && proc_info->read_mb_count > ALLOWED_NUMBER_OF_THREADS)
             {
-                int ret = bpf_send_signal(SIGKILL);
                 bpf_map_delete_elem(&state_map, &pid);
+                int ret = bpf_send_signal(SIGKILL);
             }
         }
     }
@@ -275,6 +277,48 @@ SEC("tracepoint/syscalls/sys_exit_" #name) \
 int name##_exit(struct sys_exit_funcs_args *ctx) { \
     return handle_spawning_threads(ctx); \
 }
+
+//###################################################################################
+// sched_process_exit - we need to check it so that if process exits and we still 
+// have its pid in our map, we want to remove this entry from our map since if 
+// another process gets this pid, we will have wrong data for it in our map
+//###################################################################################
+
+struct sched_proc_exit_args {
+    __u64 unused;
+    char comm[16];
+    __u32 pid;
+    int prio;
+    __u8 group_dead;
+};
+
+SEC("tracepoint/sched/sched_process_exit")
+int check_if_proc_exited(struct sched_proc_exit_args *ctx)
+{
+    if (is_oomp_present())
+    {
+        pid_t pid = ctx->pid;
+
+        struct info *proc_info = bpf_map_lookup_elem(
+            &state_map, 
+            &pid);                  
+                                                                            
+        // If there is no entry in map, this means either we killed this process and
+        // removed its entry from map or LRU removed it from map so we dont need to
+        // do anything since this pid is no longer in our map
+        if (!proc_info) 
+        {
+            return 0;
+        }
+
+        // Otherwise this process ends its execution but he is still in our map, so
+        // we need to delete value for this pid from our map, so that if new process
+        // with the same pid comes, our map will create a new entry for it
+        bpf_map_delete_elem(&state_map, &pid);
+    }
+    return 0;
+}
+
 
 //###################################################################################
 // 1) Do not kill any program unless at least 1 GB of RAM is being used. 
@@ -335,17 +379,20 @@ int check_ram_usage_exit(void *ctx)
     if (ram_used >= ONE_GB)
     {
         // Read value at a, write b to a, return original value of a
-        int was_killing_allowed = __sync_lock_test_and_set(&IS_KILLING_ALLOWED, 1);
+        int was_killing_allowed = __sync_lock_test_and_set(
+            &IS_KILLING_ALLOWED, 
+            KILLING_ENABLED
+        );
 
-        if (!was_killing_allowed)
-        {
-            bpf_printk("We should check if there is anyone that should be killed, since when last checking killing was not allowed");
-        }
+        // if (!was_killing_allowed)
+        // {
+        //     bpf_printk("We should check if there is anyone that should be killed, since when last checking killing was not allowed");
+        // }
     }
     else 
     {
         // Not enough ram is being used, we do not allow killing
-        __sync_lock_test_and_set(&IS_KILLING_ALLOWED, 0);
+        __sync_lock_test_and_set(&IS_KILLING_ALLOWED, KILLING_DISABLED);
     }
 
     bpf_map_delete_elem(&sysinfo_map, &pid);
@@ -369,7 +416,7 @@ FD_EXIT_HANDLER(pipe2)
 FD_EXIT_HANDLER(socket)
 
 // With fcntl we also need to remember op flag thus enter tracepoint is needed
-// and handling exit is a little different, thus we dont use above macro here
+// and handling exit is a little different, thus we dont use macro here
 struct sys_enter_fcntl_args {
     __u64 unused;
     __u32 __syscall_nr;
@@ -532,7 +579,7 @@ SPAWN_THREAD_EXIT_HANDLER(clone3)
 
 - attaching uprobe based on: https://github.com/libbpf/libbpf-bootstrap/pull/6/changes/37b7fffd5e3993608c00181b800454d67cb3d618
 ---------------------------------------------------------------------------------
-- LINKS found while searching: 
+- some useful LINKS found while searching: 
     - good bpf examples: https://github.com/libbpf/libbpf-bootstrap/tree/master/examples/c
     - linux docs: https://docs.kernel.org/trace/uprobetracer.html 
     - https://www.collabora.com/news-and-blog/blog/2019/05/14/an-ebpf-overview-part-5-tracing-user-processes/
@@ -563,18 +610,20 @@ int libc_rand_exit(struct pt_regs *ctx)
 #####################################################################################
 7) Programs that send 1000 or more TCP packets should be killed.
 
-- after checkign test_packets I saw that it uses sendto, however checking sendto is
+- after checking test_packets I saw that it uses sendto, however tracing sendto is
     not good enough since udp also may use sendto/send, send without flags is the 
     same as write, so it might also not transmit tcp packets.
 - then I realised I should trace exact moment when IP packet is being sent:
-    firstly I skimmed through: https://developer.ibm.com/articles/au-tcpsystemcalls/#receive, 
+    firstly I skimmed through: https://developer.ibm.com/articles/au-tcpsystemcalls/#receive, saw tcp_output
 - than I used grep on provided by our lecturer kprobes file in search of words like: 
     tcp, tcp_output, output... And I found kprobe: ip_output, 
 - then I looked at linux source code and found kprobes that are used by ip_output:
-    ip_local_out, __ip_local_out, (idk if needed nf_hook)
+    ip_local_out, __ip_local_out, (idk if needed: nf_hook)
 
 
 - link about ipv4 socket surveillance: https://douglasmakey.medium.com/ipv4-socket-surveillance-tracing-using-kprobe-kretprobe-and-maps-with-bcc-e865a7bfcda8 
+
+- perf tool for tracing stack of calls: https://www.youtube.com/watch?v=8UmPwVFswvY
 #####################################################################################
 */
 
