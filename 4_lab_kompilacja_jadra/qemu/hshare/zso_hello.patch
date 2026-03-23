@@ -1,0 +1,25 @@
+diff --git a/arch/x86/boot/video.c b/arch/x86/boot/video.c
+index 0641c8c46..cee0f6ae8 100644
+--- a/arch/x86/boot/video.c
++++ b/arch/x86/boot/video.c
+@@ -155,6 +155,8 @@ static void display_menu(void)
+ 	for (col = 0; col < modes_per_line; col++)
+ 		puts("Mode: Resolution:  Type: ");
+ 	putchar('\n');
++	puts("Hello ZSO");
++	putchar('\n');
+ 
+ 	col = 0;
+ 	ch = '0';
+diff --git a/init/main.c b/init/main.c
+index 07a311681..bba5f7fd7 100644
+--- a/init/main.c
++++ b/init/main.c
+@@ -943,6 +943,7 @@ void start_kernel(void)
+ 	boot_cpu_hotplug_init();
+ 
+ 	pr_notice("Kernel command line: %s\n", saved_command_line);
++	pr_notice("Hello ZSO!!!\n");
+ 	/* parameters may set static keys */
+ 	parse_early_param();
+ 	after_dashes = parse_args("Booting kernel",

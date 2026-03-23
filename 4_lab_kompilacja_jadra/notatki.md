@@ -1,6 +1,7 @@
 # kompilacja jadra
 - pamietac zeby pobrac DOBRĄ WERSJĘ
 
+
 - **Unreliable guide to hacking the linux kernel** - wstęp jak wygląda praca w jądrze
 - najlepsze: ```make menuconfig```
 
