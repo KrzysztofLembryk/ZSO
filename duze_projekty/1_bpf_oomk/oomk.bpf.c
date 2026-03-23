@@ -495,56 +495,58 @@ READ_BYTES_EXIT_HANDLER(pread64)
 SPAWN_THREAD_EXIT_HANDLER(clone)
 SPAWN_THREAD_EXIT_HANDLER(clone3)
 
-//###################################################################################
-// 6) Programs that call the rand() function 100 or more times should be killed.
-//      rand() needs UPROBE, and using ltrace instead of strace
-//###################################################################################
+/* #####################################################################################
+6) Programs that call the rand() function 100 or more times should be killed.
+    rand() needs UPROBE, and using ltrace instead of strace, since strace doesnt show
+    anything (we have loop in our programme, but strace stops showing anything new
+    after executing prlimit and munmap)
 
-struct sys_enter_getrandom_args {
-    unsigned long long unused;       /* padding / common fields */
-    int __syscall_nr;
-    char * ubuf;
-    size_t len;
-    unsigned int flags;
-};
+- rand() is in libc, cmd: gcc --print-file-name=libc.a
+    - location: /usr/lib/gcc/x86_64-linux-gnu/12/../../../x86_64-linux-gnu/libc.a
 
-// TODO: rand() needs UPROBE, not KPROBE or TRACEPOINT
-SEC("tracepoint/syscalls/sys_enter_getrandom")
-int rand_entry(struct sys_enter_getrandom_args *ctx)
+- first we find rand symbol from our programme: nm ./oomp_test_rand
+    - we get: U rand@GLIBC_2.2.5, U - symbol is undefined
+
+- then we try to find in: nm libc.a | grep "T rand" - gives: 0000000000000000 T rand
+    but this doesnt give us much
+
+- from https://stackoverflow.com/questions/5925678/location-of-c-standard-library,
+    we get "Most things DON'T link against libc.a, they link against libc.so", so we
+    check libc.so, it doesnt work, but libc.so.6 does.
+    We do: nm -D ./libc.so.6 | grep "T rand" -> 0000000000040790 T rand@@GLIBC_2.2.5 
+
+- we check our executable, so we use ldd - prints shared object dependencies: 
+    ldd -r ./oomp_test_rand 
+    - it gives: 0000000000040790 T rand@@GLIBC_2.2.5, 0000000000040790 = 0x40790
+
+- now we have the offset: 0x40790 of rand that we will use in our uprobe, we also 
+    have path to libc binary in which rand sits: /usr/lib/x86_64-linux-gnu/libc.so.6
+
+- attaching uprobe based on: https://github.com/libbpf/libbpf-bootstrap/pull/6/changes/37b7fffd5e3993608c00181b800454d67cb3d618
+---------------------------------------------------------------------------------
+- LINKS I also used: 
+    - hands-on example with nm: https://www.collabora.com/news-and-blog/blog/2019/05/14/an-ebpf-overview-part-5-tracing-user-processes/
+    - linux docs: https://docs.kernel.org/trace/uprobetracer.html 
+
+#####################################################################################
+*/
+
+SEC("uretprobe/libc_rand_exit")
+int libc_rand_exit(struct pt_regs *ctx) 
 {
-    // Only when oomp is present in process name we do anything
     if (is_oomp_present())
     {
-        struct info init_value = {.rand_calls_count = 0, .used_fd_count = 0};
-        struct info *read_value;
-        pid_t pid = bpf_get_current_pid_tgid() >> 32;
+        GET_PROC_INFO_OR_RETURN()
 
-        bpf_map_update_elem(&state_map, &pid, &init_value, BPF_NOEXIST);
-
-        read_value = bpf_map_lookup_elem(&state_map, &pid);
-
-        if(!read_value)
-        {
-            return 0;
-        }
-
-        // __sync_fetch_and_add - returns previous value stored in variable, by 
-        // adding 0 we don't change this variable so it works like safe read
-        int i_can_kill = __sync_fetch_and_add(&IS_KILLING_ALLOWED, 0);
-
-        read_value->rand_calls_count += 1;
-        bpf_printk("rand_entry:: rand calls: %u\n", read_value->rand_calls_count);
+        proc_info->rand_calls_count += 1;
 
         if (i_can_kill 
-            && read_value->rand_calls_count > ALLOWED_NUMBER_OF_RAND_CALLS)
+            && proc_info->rand_calls_count > ALLOWED_NUMBER_OF_RAND_CALLS)
         {
-            bpf_printk("rand_entry:: I CAN KILL\n");
             int ret = bpf_send_signal(SIGKILL);
-            // we could check proc_exit probe/tracepoint and see if killing was 
-            // successful and if it was we can remove elem from our map by hand 
+            bpf_map_delete_elem(&state_map, &pid);
         }
     }
-
     return 0;
 }
 
