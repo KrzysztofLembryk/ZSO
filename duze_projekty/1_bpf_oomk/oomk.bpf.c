@@ -100,7 +100,7 @@ static bool is_oomp_present()
 
 /* ####################### MAPS and STRUCTDS DEFS #######################*/
 
-struct info {
+struct proc_info {
     __u32 rand_calls_count;
     __u32 used_fd_count;
     __u32 fcntl_op;
@@ -109,9 +109,9 @@ struct info {
     __u32 spawned_threads_count;
 };
 
-static struct info new_info()
+static struct proc_info proc_info_new()
 {
-    struct info init_value = {
+    struct proc_info init_value = {
         .rand_calls_count = 0, 
         .used_fd_count = 0,
         .fcntl_op = 0,
@@ -121,6 +121,21 @@ static struct info new_info()
     };
     
     return init_value;
+}
+
+static bool proc_should_be_killed(struct proc_info *ctx)
+{
+    if (
+        ctx->rand_calls_count > ALLOWED_NUMBER_OF_RAND_CALLS
+        || ctx->used_fd_count > ALLOWED_NUMBER_OF_OPENED_FD
+        || ctx->write_count > ALLOWED_NUMBER_OF_WRITES
+        || ctx->read_mb_count > ALLOWED_NUMBER_OF_MB_TO_READ
+        || ctx->spawned_threads_count > ALLOWED_NUMBER_OF_THREADS
+    )
+    {
+        return true;
+    }
+    return false;
 }
 
 struct sys_exit_funcs_args {
@@ -133,18 +148,17 @@ struct sys_exit_funcs_args {
 // should be killed or not
 // We use LRU map since number of processes's data we can store is limited, and 
 // set at the start of the programme, so if we hit our limit LRU will remove least
-// used entry (i.e. process already ended and we still have its data in our map) 
+// used entry 
 struct {
     __uint(type, BPF_MAP_TYPE_LRU_HASH); 
     __type(key, __u32);
-    __type(value, struct info);
+    __type(value, struct proc_info);
     __uint(max_entries, MAX_ENTRIES);
 } state_map SEC(".maps");
 
 
 struct {
     __uint(type, BPF_MAP_TYPE_HASH); 
-    // We dont expect many processes to run sys_info
     __uint(max_entries, 16);
     __type(key, __u32);
     __type(value, __u64);
@@ -156,8 +170,8 @@ struct {
 //###################################################################################
 
 #define GET_PROC_INFO_OR_RETURN()                                       \
-    struct info init_value = new_info();                                \
-    struct info *proc_info;                                             \
+    struct proc_info init_value = proc_info_new();                      \
+    struct proc_info *proc_info;                                        \
     pid_t pid = bpf_get_current_pid_tgid() >> 32;                       \
                                                                         \
     bpf_map_update_elem(&state_map, &pid, &init_value, BPF_NOEXIST);    \
@@ -181,7 +195,7 @@ static int handle_opening_new_fd(struct sys_exit_funcs_args *ctx)
             proc_info->used_fd_count += 1;
 
             if (i_can_kill 
-                && proc_info->used_fd_count > ALLOWED_NUMBER_OF_OPENED_FD)
+                && proc_should_be_killed(proc_info))
             {
                 bpf_map_delete_elem(&state_map, &pid);
                 int ret = bpf_send_signal(SIGKILL);
@@ -204,7 +218,7 @@ static int handle_writes(struct sys_exit_funcs_args *ctx)
             proc_info->write_count += 1;
 
             if (i_can_kill 
-                && proc_info->write_count > ALLOWED_NUMBER_OF_WRITES)
+                && proc_should_be_killed(proc_info))
             {
                 bpf_map_delete_elem(&state_map, &pid);
                 int ret = bpf_send_signal(SIGKILL);
@@ -224,7 +238,7 @@ static int handle_counting_read_bytes(struct sys_exit_funcs_args *ctx)
             proc_info->read_mb_count += ctx->ret;
 
             if (i_can_kill 
-                && proc_info->read_mb_count > ALLOWED_NUMBER_OF_MB_TO_READ)
+                && proc_should_be_killed(proc_info))
             {
                 bpf_map_delete_elem(&state_map, &pid);
                 int ret = bpf_send_signal(SIGKILL);
@@ -244,7 +258,7 @@ static int handle_spawning_threads(struct sys_exit_funcs_args *ctx)
             proc_info->spawned_threads_count += 1;
 
             if (i_can_kill 
-                && proc_info->read_mb_count > ALLOWED_NUMBER_OF_THREADS)
+                && proc_should_be_killed(proc_info))
             {
                 bpf_map_delete_elem(&state_map, &pid);
                 int ret = bpf_send_signal(SIGKILL);
@@ -281,7 +295,7 @@ int name##_exit(struct sys_exit_funcs_args *ctx) { \
 //###################################################################################
 // sched_process_exit - we need to check it so that if process exits and we still 
 // have its pid in our map, we want to remove this entry from our map since if 
-// another process gets this pid, we will have wrong data for it in our map
+// another process gets this pid, we will have corrupted data for it in our map
 //###################################################################################
 
 struct sched_proc_exit_args {
@@ -299,7 +313,7 @@ int check_if_proc_exited(struct sched_proc_exit_args *ctx)
     {
         pid_t pid = ctx->pid;
 
-        struct info *proc_info = bpf_map_lookup_elem(
+        struct proc_info *proc_info = bpf_map_lookup_elem(
             &state_map, 
             &pid);                  
                                                                             
@@ -318,7 +332,6 @@ int check_if_proc_exited(struct sched_proc_exit_args *ctx)
     }
     return 0;
 }
-
 
 //###################################################################################
 // 1) Do not kill any program unless at least 1 GB of RAM is being used. 
@@ -430,8 +443,8 @@ int fcntl_enter(struct sys_enter_fcntl_args *ctx)
 {
     if (is_oomp_present())
     {
-        struct info init_value = new_info();
-        struct info *proc_info;
+        struct proc_info init_value = proc_info_new();
+        struct proc_info *proc_info;
         pid_t pid = bpf_get_current_pid_tgid() >> 32;
 
         bpf_map_update_elem(&state_map, &pid, &init_value, BPF_NOEXIST);
@@ -455,8 +468,8 @@ int fcntl_exit(struct sys_exit_funcs_args *ctx)
 {
     if (is_oomp_present())
     {
-        struct info init_value = new_info();
-        struct info *proc_info;
+        struct proc_info init_value = proc_info_new();
+        struct proc_info *proc_info;
         pid_t pid = bpf_get_current_pid_tgid() >> 32;
 
         bpf_map_update_elem(&state_map, &pid, &init_value, BPF_NOEXIST);
@@ -495,8 +508,8 @@ int close_fd_exit(struct sys_exit_funcs_args *ctx)
 {
     if (is_oomp_present())
     {
-        struct info init_value = new_info();
-        struct info *proc_info;
+        struct proc_info init_value = proc_info_new();
+        struct proc_info *proc_info;
         pid_t pid = bpf_get_current_pid_tgid() >> 32;
 
         bpf_map_update_elem(&state_map, &pid, &init_value, BPF_NOEXIST);
