@@ -61,7 +61,7 @@ int main()
     uint16_t src_port = htons(44444);
     uint16_t dst_port = htons(55555);
 
-    for (int i = 0; i < 2000; i++) {
+    for (int i = 0; i < 1/*2000*/; i++) {
         char pkt[sizeof(struct iphdr) + sizeof(struct tcphdr_min)] = {0};
         struct iphdr *ip       = (struct iphdr *)pkt;
         struct tcphdr_min *tcp = (struct tcphdr_min *)(pkt + sizeof(struct iphdr));

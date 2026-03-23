@@ -3,6 +3,7 @@
 #include <bpf/bpf_tracing.h>
 #include <bpf/bpf_core_read.h>
 
+
 /*
                                 -------------------
                                 --USEFUL COMMANDS--
@@ -128,6 +129,9 @@ struct sys_exit_funcs_args {
 
 // STATE_MAP - in it we will store all information about whether given process
 // should be killed or not
+// We use LRU map since number of processes's data we can store is limited, and 
+// set at the start of the programme, so if we hit our limit LRU will remove least
+// used entry (i.e. process already ended and we still have its data in our map) 
 struct {
     __uint(type, BPF_MAP_TYPE_LRU_HASH); 
     __type(key, __u32);
@@ -190,6 +194,8 @@ static int handle_writes(struct sys_exit_funcs_args *ctx)
     if (is_oomp_present())
     {
         GET_PROC_INFO_OR_RETURN()
+
+        struct stat statbuf;
 
         if (ctx->ret >= 0)
         {
@@ -553,5 +559,23 @@ int libc_rand_exit(struct pt_regs *ctx)
     return 0;
 }
 
+/* 
+#####################################################################################
+7) Programs that send 1000 or more TCP packets should be killed.
+
+- after checkign test_packets I saw that it uses sendto, however checking sendto is
+    not good enough since udp also may use sendto/send, send without flags is the 
+    same as write, so it might also not transmit tcp packets.
+- then I realised I should trace exact moment when IP packet is being sent:
+    firstly I skimmed through: https://developer.ibm.com/articles/au-tcpsystemcalls/#receive, 
+- than I used grep on provided by our lecturer kprobes file in search of words like: 
+    tcp, tcp_output, output... And I found kprobe: ip_output, 
+- then I looked at linux source code and found kprobes that are used by ip_output:
+    ip_local_out, __ip_local_out, (idk if needed nf_hook)
+
+
+- link about ipv4 socket surveillance: https://douglasmakey.medium.com/ipv4-socket-surveillance-tracing-using-kprobe-kretprobe-and-maps-with-bcc-e865a7bfcda8 
+#####################################################################################
+*/
 
 char LICENSE[] SEC("license") = "GPL";
