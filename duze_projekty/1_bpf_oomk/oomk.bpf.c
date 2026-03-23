@@ -501,7 +501,9 @@ SPAWN_THREAD_EXIT_HANDLER(clone3)
     anything (we have loop in our programme, but strace stops showing anything new
     after executing prlimit and munmap)
 
-- rand() is in libc, cmd: gcc --print-file-name=libc.a
+- firstly I found below exmaple: https://getanteon.com/blog/exploring-function-tracing-with-ebpf-and-uprobes/
+
+- thus rand() is in libc, cmd: gcc --print-file-name=libc.a
     - location: /usr/lib/gcc/x86_64-linux-gnu/12/../../../x86_64-linux-gnu/libc.a
 
 - first we find rand symbol from our programme: nm ./oomp_test_rand
@@ -524,9 +526,10 @@ SPAWN_THREAD_EXIT_HANDLER(clone3)
 
 - attaching uprobe based on: https://github.com/libbpf/libbpf-bootstrap/pull/6/changes/37b7fffd5e3993608c00181b800454d67cb3d618
 ---------------------------------------------------------------------------------
-- LINKS I also used: 
-    - hands-on example with nm: https://www.collabora.com/news-and-blog/blog/2019/05/14/an-ebpf-overview-part-5-tracing-user-processes/
+- LINKS found while searching: 
+    - good bpf examples: https://github.com/libbpf/libbpf-bootstrap/tree/master/examples/c
     - linux docs: https://docs.kernel.org/trace/uprobetracer.html 
+    - https://www.collabora.com/news-and-blog/blog/2019/05/14/an-ebpf-overview-part-5-tracing-user-processes/
 
 #####################################################################################
 */

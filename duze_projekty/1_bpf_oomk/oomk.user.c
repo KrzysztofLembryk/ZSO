@@ -15,7 +15,7 @@
 */
 int find_libc_path(char *result, size_t size)
 {
-    // in terminal run: find "/usr/lib" -name "libc.so.6"
+    // in terminal to get it run: find "/usr/lib" -name "libc.so.6"
 
     FILE *f = fopen("/proc/self/maps", "r");
     if (!f) 
@@ -45,7 +45,6 @@ int find_libc_path(char *result, size_t size)
 long find_rand_offset(char *libc_path)
 {
     // Getting offset as string
-    // nm -D ./libc.so.6 | grep "T rand@@"
     char bash_cmd[256];
     strcpy(bash_cmd, "nm -D ");
     strcat(bash_cmd, libc_path);
@@ -121,9 +120,14 @@ long find_rand_offset(char *libc_path)
 int main(void)
 {
     char libc_path[256];
-    find_libc_path(libc_path, 256);
-    long rand_uprobe_offset = find_rand_offset(libc_path);
 
+    if (find_libc_path(libc_path, 256) == -1)
+    {
+        fprintf(stderr, "Couldn't find libc.so.6 path\n");
+        return 1;
+    }
+
+    long rand_func_offset = find_rand_offset(libc_path);
     int err = 0;
     struct oomk *skel = oomk__open_and_load();
 
@@ -138,7 +142,7 @@ int main(void)
 							true /* uretprobe */,
 						    -1 /* any pid */,
 							libc_path, // points to the executable file of the rand func 
-							rand_uprobe_offset);
+							rand_func_offset);
 
     err = libbpf_get_error(skel->links.libc_rand_exit);
 	if (err) {
