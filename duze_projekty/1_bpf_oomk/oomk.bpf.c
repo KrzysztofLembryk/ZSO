@@ -2,6 +2,7 @@
 #include <bpf/bpf_helpers.h>
 #include <bpf/bpf_tracing.h>
 #include <bpf/bpf_core_read.h>
+#include <bpf/bpf_endian.h>
 
 
 /*
@@ -22,22 +23,24 @@
 */
 
 /* ####################### CONSTANTS DEFS #######################*/
+// TCP protocol
+#define IPPROTO_TCP 6
 // fcntl constants
 #define F_DUPFD 0	
 #define F_DUPFD_CLOEXEC 1030
 // Signals
 #define SIGKILL 9
 
-
 #define KILLING_ENABLED 1
 #define KILLING_DISABLED 0
 #define MAX_ENTRIES 4096
 #define ONE_GB (1024ULL * 1024 * 1024)
-#define ALLOWED_NUMBER_OF_RAND_CALLS 99
-#define ALLOWED_NUMBER_OF_OPENED_FD 99
-#define ALLOWED_NUMBER_OF_WRITES 99
-#define ALLOWED_NUMBER_OF_MB_TO_READ (10U * 1024 * 1024 - 1)
-#define ALLOWED_NUMBER_OF_THREADS 99
+#define THRESHOLD_NUMBER_OF_RAND_CALLS 100
+#define THRESHOLD_NUMBER_OF_OPENED_FD 100
+#define THRESHOLD_NUMBER_OF_WRITES 100
+#define THRESHOLD_NUMBER_OF_MB_TO_READ (10U * 1024 * 1024)
+#define THRESHOLD_NUMBER_OF_THREADS 100
+#define THRESHOLD_NUMBER_OF_SENT_TCP_PACKETS 1000
 
 // Global variable (translated into one elem array by compiler) that tells us if we 
 // can kill processes (if memory usage is >= 1GB)
@@ -49,10 +52,7 @@ int IS_KILLING_ALLOWED = 0;
 //###################################################################################
 
 // Function checks if inside str1 there is 'oomp' substr
-static bool oomp_substr_exists_in(
-    const char *str, 
-    size_t str_len
-)
+static bool oomp_substr_exists_in(const char *str, size_t str_len)
 {
     static const char *oomp_str = "oomp";
     static const size_t oomp_len = 4;
@@ -107,6 +107,8 @@ struct proc_info {
     __u32 write_count;
     __u32 read_mb_count;
     __u32 spawned_threads_count;
+    __u8 is_tcp_packet;
+    __u32 tcp_packet_sent_count;
 };
 
 static struct proc_info proc_info_new()
@@ -117,7 +119,9 @@ static struct proc_info proc_info_new()
         .fcntl_op = 0,
         .write_count = 0,
         .read_mb_count = 0,
-        .spawned_threads_count = 0
+        .spawned_threads_count = 0,
+        .is_tcp_packet = 0,
+        .tcp_packet_sent_count = 0,
     };
     
     return init_value;
@@ -126,11 +130,12 @@ static struct proc_info proc_info_new()
 static bool proc_should_be_killed(struct proc_info *ctx)
 {
     if (
-        ctx->rand_calls_count > ALLOWED_NUMBER_OF_RAND_CALLS
-        || ctx->used_fd_count > ALLOWED_NUMBER_OF_OPENED_FD
-        || ctx->write_count > ALLOWED_NUMBER_OF_WRITES
-        || ctx->read_mb_count > ALLOWED_NUMBER_OF_MB_TO_READ
-        || ctx->spawned_threads_count > ALLOWED_NUMBER_OF_THREADS
+        ctx->rand_calls_count >= THRESHOLD_NUMBER_OF_RAND_CALLS
+        || ctx->used_fd_count >= THRESHOLD_NUMBER_OF_OPENED_FD
+        || ctx->write_count >= THRESHOLD_NUMBER_OF_WRITES
+        || ctx->read_mb_count >= THRESHOLD_NUMBER_OF_MB_TO_READ
+        || ctx->spawned_threads_count >= THRESHOLD_NUMBER_OF_THREADS
+        || ctx->tcp_packet_sent_count >= THRESHOLD_NUMBER_OF_SENT_TCP_PACKETS
     )
     {
         return true;
@@ -151,7 +156,7 @@ struct sys_exit_funcs_args {
 // used entry 
 struct {
     __uint(type, BPF_MAP_TYPE_LRU_HASH); 
-    __type(key, __u32);
+    __type(key, __u64);
     __type(value, struct proc_info);
     __uint(max_entries, MAX_ENTRIES);
 } state_map SEC(".maps");
@@ -172,10 +177,10 @@ struct {
 #define GET_PROC_INFO_OR_RETURN()                                       \
     struct proc_info init_value = proc_info_new();                      \
     struct proc_info *proc_info;                                        \
-    pid_t pid = bpf_get_current_pid_tgid() >> 32;                       \
+    __u64 pid_tgid = bpf_get_current_pid_tgid();                        \
                                                                         \
-    bpf_map_update_elem(&state_map, &pid, &init_value, BPF_NOEXIST);    \
-    proc_info = bpf_map_lookup_elem(&state_map, &pid);                  \
+    bpf_map_update_elem(&state_map, &pid_tgid, &init_value, BPF_NOEXIST);    \
+    proc_info = bpf_map_lookup_elem(&state_map, &pid_tgid);                  \
                                                                         \
     if (!proc_info) {                                                   \
         return 0;                                                       \
@@ -197,7 +202,7 @@ static int handle_opening_new_fd(struct sys_exit_funcs_args *ctx)
             if (i_can_kill 
                 && proc_should_be_killed(proc_info))
             {
-                bpf_map_delete_elem(&state_map, &pid);
+                bpf_map_delete_elem(&state_map, &pid_tgid);
                 int ret = bpf_send_signal(SIGKILL);
             }
         }
@@ -220,7 +225,7 @@ static int handle_writes(struct sys_exit_funcs_args *ctx)
             if (i_can_kill 
                 && proc_should_be_killed(proc_info))
             {
-                bpf_map_delete_elem(&state_map, &pid);
+                bpf_map_delete_elem(&state_map, &pid_tgid);
                 int ret = bpf_send_signal(SIGKILL);
             }
         }
@@ -240,7 +245,7 @@ static int handle_counting_read_bytes(struct sys_exit_funcs_args *ctx)
             if (i_can_kill 
                 && proc_should_be_killed(proc_info))
             {
-                bpf_map_delete_elem(&state_map, &pid);
+                bpf_map_delete_elem(&state_map, &pid_tgid);
                 int ret = bpf_send_signal(SIGKILL);
             }
         }
@@ -260,7 +265,7 @@ static int handle_spawning_threads(struct sys_exit_funcs_args *ctx)
             if (i_can_kill 
                 && proc_should_be_killed(proc_info))
             {
-                bpf_map_delete_elem(&state_map, &pid);
+                bpf_map_delete_elem(&state_map, &pid_tgid);
                 int ret = bpf_send_signal(SIGKILL);
             }
         }
@@ -396,11 +401,6 @@ int check_ram_usage_exit(void *ctx)
             &IS_KILLING_ALLOWED, 
             KILLING_ENABLED
         );
-
-        // if (!was_killing_allowed)
-        // {
-        //     bpf_printk("We should check if there is anyone that should be killed, since when last checking killing was not allowed");
-        // }
     }
     else 
     {
@@ -443,17 +443,7 @@ int fcntl_enter(struct sys_enter_fcntl_args *ctx)
 {
     if (is_oomp_present())
     {
-        struct proc_info init_value = proc_info_new();
-        struct proc_info *proc_info;
-        pid_t pid = bpf_get_current_pid_tgid() >> 32;
-
-        bpf_map_update_elem(&state_map, &pid, &init_value, BPF_NOEXIST);
-        proc_info = bpf_map_lookup_elem(&state_map, &pid);
-
-        if(!proc_info)
-        {
-            return 0;
-        }
+        GET_PROC_INFO_OR_RETURN()
 
         // We need to remember fcntl command here so that in exit tracepoint we will
         // whether it was F_DUPFD or F_DUPFD_CLOEXEC - they create new fd - other 
@@ -468,19 +458,7 @@ int fcntl_exit(struct sys_exit_funcs_args *ctx)
 {
     if (is_oomp_present())
     {
-        struct proc_info init_value = proc_info_new();
-        struct proc_info *proc_info;
-        pid_t pid = bpf_get_current_pid_tgid() >> 32;
-
-        bpf_map_update_elem(&state_map, &pid, &init_value, BPF_NOEXIST);
-        proc_info = bpf_map_lookup_elem(&state_map, &pid);
-
-        if(!proc_info)
-        {
-            return 0;
-        }
-
-        int i_can_kill = __sync_fetch_and_add(&IS_KILLING_ALLOWED, 0);
+        GET_PROC_INFO_OR_RETURN()
 
         if (ctx->ret >= 0)
         {
@@ -490,10 +468,10 @@ int fcntl_exit(struct sys_exit_funcs_args *ctx)
                 proc_info->used_fd_count += 1;
 
                 if (i_can_kill 
-                    && proc_info->used_fd_count > ALLOWED_NUMBER_OF_OPENED_FD)
+                    && proc_should_be_killed(proc_info))
                 {
+                    bpf_map_delete_elem(&state_map, &pid_tgid);
                     int ret = bpf_send_signal(SIGKILL);
-                    bpf_map_delete_elem(&state_map, &pid);
                 }
             }
         }
@@ -508,17 +486,7 @@ int close_fd_exit(struct sys_exit_funcs_args *ctx)
 {
     if (is_oomp_present())
     {
-        struct proc_info init_value = proc_info_new();
-        struct proc_info *proc_info;
-        pid_t pid = bpf_get_current_pid_tgid() >> 32;
-
-        bpf_map_update_elem(&state_map, &pid, &init_value, BPF_NOEXIST);
-        proc_info = bpf_map_lookup_elem(&state_map, &pid);
-
-        if(!proc_info)
-        {
-            return 0;
-        }
+        GET_PROC_INFO_OR_RETURN()
 
         if (ctx->ret >= 0 && proc_info->used_fd_count > 0)
         {
@@ -610,10 +578,10 @@ int libc_rand_exit(struct pt_regs *ctx)
         proc_info->rand_calls_count += 1;
 
         if (i_can_kill 
-            && proc_info->rand_calls_count > ALLOWED_NUMBER_OF_RAND_CALLS)
+            && proc_should_be_killed(proc_info))
         {
+            bpf_map_delete_elem(&state_map, &pid_tgid);
             int ret = bpf_send_signal(SIGKILL);
-            bpf_map_delete_elem(&state_map, &pid);
         }
     }
     return 0;
@@ -629,9 +597,26 @@ int libc_rand_exit(struct pt_regs *ctx)
 - then I realised I should trace exact moment when IP packet is being sent:
     firstly I skimmed through: https://developer.ibm.com/articles/au-tcpsystemcalls/#receive, saw tcp_output
 - than I used grep on provided by our lecturer kprobes file in search of words like: 
-    tcp, tcp_output, output... And I found kprobe: ip_output, 
-- then I looked at linux source code and found kprobes that are used by ip_output:
-    ip_local_out, __ip_local_out, (idk if needed: nf_hook)
+    tcp, tcp_output, output... And I found kprobes: ip_output, ip_local_out,
+    __ip_local_out
+- then I found yt video: https://www.youtube.com/watch?v=8UmPwVFswvY in which at 
+    around 14 min I saw the following stack:
+    ip_finish_output2
+    __ip_finish_output
+    ip_finish_output
+    ip_output
+    ip_local_out
+- then I inspected linux source code and saw that indeed ip_output invokes ip_finish:
+    ret_val = NF_HOOK_COND(NFPROTO_IPV4, NF_INET_POST_ROUTING,
+				net, sk, skb, indev, dev,
+				ip_finish_output,
+				!(IPCB(skb)->flags & IPSKB_REROUTED));
+- and realised that ip_finish_output2 is invoked last, so its a final point before 
+    sending ONE packet; fortunately there is a kprobe:ip_finish_output2
+
+- ip_finish_output2(struct net *net, struct sock *sk, struct sk_buff *skb)
+    we will check if packet is TCP in skb->header (first I tried skb->protocol but 
+    protocol here means i.e. IPv4, so not the one I'm looking for)
 
 
 - link about ipv4 socket surveillance: https://douglasmakey.medium.com/ipv4-socket-surveillance-tracing-using-kprobe-kretprobe-and-maps-with-bcc-e865a7bfcda8 
@@ -639,5 +624,60 @@ int libc_rand_exit(struct pt_regs *ctx)
 - perf tool for tracing stack of calls: https://www.youtube.com/watch?v=8UmPwVFswvY
 #####################################################################################
 */
+
+
+SEC("kprobe/ip_finish_output2")
+int ip_finish_output2_entry(void *ctx)
+{
+    if (is_oomp_present())
+    {
+        GET_PROC_INFO_OR_RETURN()
+
+        struct sk_buff *skb = (struct sk_buff *)PT_REGS_PARM3((struct pt_regs*)ctx);
+
+        void *head = BPF_CORE_READ(skb, head); 
+        __u16 net_header_offset = BPF_CORE_READ(skb, network_header);
+
+        struct iphdr ip_header = {};
+
+        if (bpf_probe_read_kernel(
+                &ip_header, 
+                sizeof(ip_header), 
+                head + net_header_offset) < 0) 
+        {
+            return 0;
+        }
+
+        proc_info->is_tcp_packet = (ip_header.protocol == IPPROTO_TCP);
+    }
+
+    return 0;
+}
+
+SEC("kretprobe/ip_finish_output2")
+int ip_finish_output2_exit(void *ctx)
+{
+    if (is_oomp_present())
+    {
+        GET_PROC_INFO_OR_RETURN()
+
+        if (proc_info->is_tcp_packet)
+        {
+            int ret_val = PT_REGS_RC((struct pt_regs*)ctx);
+            if (ret_val >= 0) /* success */
+            {
+                proc_info->tcp_packet_sent_count += 1;
+                if (i_can_kill 
+                    && proc_should_be_killed(proc_info))
+                {
+                    bpf_map_delete_elem(&state_map, &pid_tgid);
+                    bpf_send_signal(SIGKILL);
+                }
+            }
+        }
+    }
+
+    return 0;
+}
 
 char LICENSE[] SEC("license") = "GPL";

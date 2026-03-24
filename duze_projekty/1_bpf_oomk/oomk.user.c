@@ -161,8 +161,6 @@ int main(void)
 
     sysinfo(&info);
 
-    printf("user sysinfo: %lu / %lu\n", info.freeram, info.totalram);
-
     /* Keep the process alive so our probes work */
     for (;;)
     {
