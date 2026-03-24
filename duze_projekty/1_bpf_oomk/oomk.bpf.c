@@ -6,6 +6,7 @@
 
 
 /*
+Author: Krzysztof Lembryk
                                 -------------------
                                 --USEFUL COMMANDS--
                                 -------------------
@@ -316,11 +317,11 @@ int check_if_proc_exited(struct sched_proc_exit_args *ctx)
 {
     if (is_oomp_present())
     {
-        pid_t pid = ctx->pid;
+        __u64 pid_tgid = bpf_get_current_pid_tgid();;
 
         struct proc_info *proc_info = bpf_map_lookup_elem(
             &state_map, 
-            &pid);                  
+            &pid_tgid);                  
                                                                             
         // If there is no entry in map, this means either we killed this process and
         // removed its entry from map or LRU removed it from map so we dont need to
@@ -333,7 +334,7 @@ int check_if_proc_exited(struct sched_proc_exit_args *ctx)
         // Otherwise this process ends its execution but he is still in our map, so
         // we need to delete value for this pid from our map, so that if new process
         // with the same pid comes, our map will create a new entry for it
-        bpf_map_delete_elem(&state_map, &pid);
+        bpf_map_delete_elem(&state_map, &pid_tgid);
     }
     return 0;
 }
