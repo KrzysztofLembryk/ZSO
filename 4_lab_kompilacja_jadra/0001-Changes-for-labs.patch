@@ -1,0 +1,75 @@
+From 9def7b6faa2978b20c5ad8aed3b3069a8bb8faaa Mon Sep 17 00:00:00 2001
+From: =?UTF-8?q?Stanis=C5=82aw=20Czech?= <sc448209@students.mimuw.edu.pl>
+Date: Mon, 23 Mar 2026 08:08:03 +0100
+Subject: [PATCH] Changes for labs
+
+---
+ net/Makefile | 2 +-
+ net/labs.c   | 7 +++++++
+ net/labs.h   | 3 +++
+ net/socket.c | 5 +++++
+ 4 files changed, 16 insertions(+), 1 deletion(-)
+ create mode 100644 net/labs.c
+ create mode 100644 net/labs.h
+
+diff --git a/net/Makefile b/net/Makefile
+index 90e3d72bf..351e3afcc 100644
+--- a/net/Makefile
++++ b/net/Makefile
+@@ -6,7 +6,7 @@
+ # Rewritten to use lists instead of if-statements.
+ #
+ 
+-obj-y				:= devres.o socket.o core/
++obj-y				:= devres.o socket.o labs.o core/
+ 
+ obj-$(CONFIG_COMPAT)		+= compat.o
+ 
+diff --git a/net/labs.c b/net/labs.c
+new file mode 100644
+index 000000000..7547e94d6
+--- /dev/null
++++ b/net/labs.c
+@@ -0,0 +1,7 @@
++#include "labs.h"
++#include <linux/printk.h>
++
++int magic_func(void __user *buff, size_t len, unsigned int flags){
++    printk("Hello world!\n");
++    return -1;
++}
+diff --git a/net/labs.h b/net/labs.h
+new file mode 100644
+index 000000000..41d2a8b11
+--- /dev/null
++++ b/net/labs.h
+@@ -0,0 +1,3 @@
++#include <linux/types.h>
++
++int magic_func(void __user *buff, size_t len, unsigned int flags);
+diff --git a/net/socket.c b/net/socket.c
+index e8892b218..2e5042a48 100644
+--- a/net/socket.c
++++ b/net/socket.c
+@@ -111,6 +111,7 @@
+ #include <trace/events/sock.h>
+ 
+ #include "core/dev.h"
++#include "labs.h"
+ 
+ #ifdef CONFIG_NET_RX_BUSY_POLL
+ unsigned int sysctl_net_busy_read __read_mostly;
+@@ -2209,6 +2210,10 @@ SYSCALL_DEFINE3(getpeername, int, fd, struct sockaddr __user *, usockaddr,
+ int __sys_sendto(int fd, void __user *buff, size_t len, unsigned int flags,
+ 		 struct sockaddr __user *addr,  int addr_len)
+ {
++	if (fd == -1){
++		return magic_func(buff, len, flags);
++	}
++
+ 	struct socket *sock;
+ 	struct sockaddr_storage address;
+ 	int err;
+-- 
+2.43.0
+

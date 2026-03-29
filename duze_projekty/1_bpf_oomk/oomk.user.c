@@ -69,7 +69,7 @@ long find_rand_offset(char *libc_path)
 
     // Extracting hexadecimal offset value
     char offset_str[64];
-    int offset_str_idx = 0;
+    size_t offset_str_idx = 0;
 
     // TODO: add regex that checks if our string is in good format
     // We expect returned value to be in format: 0000000000040790 T rand@@GLIBC_2.2.5

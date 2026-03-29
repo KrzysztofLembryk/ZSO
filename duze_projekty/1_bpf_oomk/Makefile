@@ -13,7 +13,7 @@ BPFTOOL ?= bpftool
 CC ?= gcc
 
 # Compiler flags
-CFLAGS := -g -O2 -Wall
+CFLAGS := -g -O2 -Wall -Wextra
 # BPF flags: enable BPFv3 for atomic operations support
 BPF_CFLAGS := -g -O2 -target bpf -D__TARGET_ARCH_x86 -mcpu=v3
 
