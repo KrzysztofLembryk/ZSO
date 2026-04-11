@@ -15,6 +15,23 @@ zwracamy ZAWSZE MINUS WARTOĆŚÐ BŁĘDU
 
 - znalezc odpowiedniego structa i dodac nowe pole i dodac obsluge go w syscallu
 
+- gdzie jest struct_file: ```fs.h```
+- gdzie jest init i free dla file: 
+    - plik: ```file_table.c``` 
+    - funkcje: ```static inline void file_free()``` i ```static int init_file(struct file *f, int flags, const struct cred *cred) ```
+- llseek: definicja w ```fs.h```, impl: ```read_write.c```
+
+- llseek implementacja: ```loff_t generic_file_llseek(struct file *file, loff_t offset, int whence)```
+    - ona używa: ```generic_file_llseek_size```
+    - który używa: ```	ret = must_set_pos(file, &offset, whence, eof);```
+    - w którym robimy switch case na flagach: SEEK_END, SEEK_CUR, ..., SEEK_BOOKMARK 
+
+# Jak uzywac list w kernelu (np. do zaimplementowania stacka)
+
+- **WAŻNY** przykłady z docsów: https://docs.kernel.org/core-api/list.html#traversing-the-list 
+- ok przykład z linkedin: https://www.linkedin.com/pulse/comprehensive-guide-struct-listhead-listforeachentry-linux-david-zhu-2gcrc
+
+
 # WAŻNE komendy do bootwania linuxa
 
 ```bash
