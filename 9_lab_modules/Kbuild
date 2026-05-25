@@ -1,0 +1,1 @@
+obj-m := zso1_hello.o zso2_base.o zso2_call_base.o zso3_params.o zso4_kmalloc.o
