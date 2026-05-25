@@ -1,0 +1,1 @@
+obj-m   := adlerdev.o adlerdev_mmap.o
