@@ -55,6 +55,24 @@ module-objs := module_p1.o module_p2.o
 make -C /usr/src/linux-<version> M=/path/to/the/module
 ```
 
+### Example of Makefile
+
+```bash
+# path to linux SOURCE (cloned from repo or downloaded as tar.gz)
+# Remember to run: make oldconfig && make prepare and make -jn on the source 
+KDIR ?= /root/zso_linux_kernel
+
+default:
+	$(MAKE) -Wall -Wextra -C $(KDIR) M=$$PWD
+
+install:
+	$(MAKE) -C $(KDIR) M=$$PWD modules_install
+
+clean:
+	$(MAKE) -C $(KDIR) M=$$PWD clean
+
+```
+
 ## Module's metadata
 ```c
 MODULE_LICENSE("GPL"); // needed if we want to use kernel functions

@@ -68,6 +68,7 @@ static inline uint32_t adlerdev_ior(struct adlerdev_device *dev, uint32_t reg)
 
 /* IRQ handler.  */
 
+// IRQ = Interrupt request
 static irqreturn_t adlerdev_isr(int irq, void *opaque)
 {
 	struct adlerdev_device *dev = opaque;

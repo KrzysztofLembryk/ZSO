@@ -1,18 +1,18 @@
 #ifndef TAPEDEV_H
 #define TAPEDEV_H
 
-#define PCI_VENDOR_ID_TAPEDEV				0x664e
+#define PCI_VENDOR_ID_TAPEDEV				    0x664e
 #define PCI_DEVICE_ID_TAPEDEV		    		0x7ea
 
-#define TAPEDEV_ENABLE_ADDR		    		0x00
-#define TAPEDEV_STATUS_ADDR		    		0x04
+#define TAPEDEV_ENABLE_ADDR		    		    0x00
+#define TAPEDEV_STATUS_ADDR		    		    0x04
 #define TAPEDEV_IRQ_STATUS_ADDR		    		0x08
 #define TAPEDEV_IRQ_MASK_ADDR		    		0x0c
 #define TAPEDEV_IRQ_CLEAR_ADDR		    		0x10
 #define TAPEDEV_SECTIONS_ADDR		    		0x14
 
 #define TAPEDEV_STATUS_DISABLED		    		0
-#define TAPEDEV_STATUS_IDLE		    		1
+#define TAPEDEV_STATUS_IDLE		    		    1
 #define TAPEDEV_STATUS_ERROR		    		2
 
 #define TAPEDEV_IRQ_INIT_DONE		    		0
@@ -36,11 +36,11 @@
 
 #define TAPEDEV_SECT_CMD_ADDR		    		0x00
 #define TAPEDEV_SECT_STATUS_ADDR	    		0x04
-#define TAPEDEV_SECT_BUFFER_PTR_ADDR		        0x08
+#define TAPEDEV_SECT_BUFFER_PTR_ADDR		    0x08
 #define TAPEDEV_SECT_TAPE_NO_ADDR		    	0x0C
 #define TAPEDEV_SECT_TAPES_ADDR		    		0x10
 #define TAPEDEV_SECT_TAPE_SIZE_ADDR	    		0x14
-#define TAPEDEV_SECT_TAPE_BLOCKSIZE_ADDR	        0x18
+#define TAPEDEV_SECT_TAPE_BLOCKSIZE_ADDR	    0x18
 
 #define TAPEDEV_SECT_PTR_SHIFT		    		9
 

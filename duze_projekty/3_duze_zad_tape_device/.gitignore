@@ -1,3 +1,9 @@
 hshare/
 data/
 zso2026*.qcow2
+*.cmd
+*.symvers
+*.order
+*.ko
+*.mod*
+.clangd
