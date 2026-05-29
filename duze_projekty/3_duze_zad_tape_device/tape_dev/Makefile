@@ -1,4 +1,4 @@
-KDIR ?= /root/zso_linux_kernel
+KDIR ?= /root/linux-6.18.5
 
 default:
 	$(MAKE) -Wall -Wextra -C $(KDIR) M=$$PWD
