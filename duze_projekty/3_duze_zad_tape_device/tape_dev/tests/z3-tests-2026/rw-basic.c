@@ -73,7 +73,7 @@ int main(int argc, char** argv)
 
             result = read(fd, result_buf, size);
             if (result < 0) {
-                perror("failed to write");
+                perror("failed to read");
                 return -1;
             }
 

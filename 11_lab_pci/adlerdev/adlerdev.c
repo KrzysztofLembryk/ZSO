@@ -89,6 +89,8 @@ static irqreturn_t adlerdev_isr(int irq, void *opaque)
 		buf->ctx->sum = adlerdev_ior(dev, ADLERDEV_SUM);
 		buf->ctx = 0;
 		list_add(&buf->lh, &dev->buffers_free);
+		// dev->free_wq is a wait queue for threads waiting for a free buffer.
+		// When a buffer is added to the free list, wake_up(&dev->free_wq); is called to notify any waiting threads that a buffer is now available.
 		wake_up(&dev->free_wq);
 		if (list_empty(&dev->buffers_running)) {
 			/* No more buffers to run.  */
