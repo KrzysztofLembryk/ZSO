@@ -277,7 +277,6 @@ static int tapedev_probe(
 	// have modified QEMU installed) it invokes this function and passes tape 
 	// device's struct (which holds all info about the device) which is pdev
 	int err;
-	int i;
 
 	// ### Allocate our structure ###
 	// So now is the time to allocate our internal device structure in which we will 
@@ -304,6 +303,7 @@ static int tapedev_probe(
 	// We allow many tapedev devices, but every such device we need to store 
 	// somewhere, so now we find first free index for our newly created device
 	mutex_lock(&tapedev_devices_lock);
+	int i;
 	for (i = 0; i < MAX_DEVICES_TAPEDEV; i++)
 	{
 		// given spot is free so we break
@@ -380,7 +380,7 @@ static int tapedev_probe(
 
 	tapedev_iow(tape_dev, TAPEDEV_ENABLE_ADDR, 1);
 
-	// After enabling device we need to read section data from it
+	// After enabling device we need to read num_sections data from it
 	uint32_t num_sections = tapedev_ior(tape_dev, TAPEDEV_SECTIONS_ADDR);
 
 	if (num_sections <= 0 || num_sections > 8)
@@ -391,8 +391,13 @@ static int tapedev_probe(
 	}
 
 	tape_dev->n_sections = num_sections;
-	// We count sections from id = 1
+	// We count sections from id = 1, so we will have space for section at 0 idx but 
+	// it will never be allocated but, I chose this instead of remembering to always 
+	// subtract 1 from section_id
 	tape_dev->sections = kzalloc(sizeof(struct section*) * (num_sections + 1), GFP_KERNEL);
+
+	// TODO: check if sections allocation was successful!!!
+
 	int first_minor = 0;
 
 	// Create all sections for this device
@@ -405,8 +410,6 @@ static int tapedev_probe(
 
 		if (err < 0)
 		{
-			// section at 0 idx is never used
-			kfree(tape_dev->sections[0]);
 			for (int i = 1; i <= s_id; i++)
 			{
 				// put_disk decrements gendisk refcount, if it reaches 0 gendisk is 
@@ -451,13 +454,13 @@ static void tapedev_remove(struct pci_dev *pdev)
 	tapedev_iow(tape_dev, TAPEDEV_ENABLE_ADDR, 0);
 	free_irq(pdev->irq, tape_dev);
 
-	kfree(tape_dev->sections[0]);
 	for (int s_id = 1; s_id <= tape_dev->n_sections; s_id++)
 	{
 		del_gendisk(tape_dev->sections[s_id]->gdisk);
 		put_disk(tape_dev->sections[s_id]->gdisk);
 		kfree(tape_dev->sections[s_id]);
 	}
+	kfree(tape_dev->sections);
 	// blk dev free
 	pci_iounmap(pdev, tape_dev->bar);
 	pci_release_regions(pdev);
