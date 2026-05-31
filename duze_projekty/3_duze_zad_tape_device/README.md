@@ -1,5 +1,10 @@
 # Q&A
 
+## Data flow
+```text
+When userspace does read()/write() on /dev/tapedev0s2, the kernel block layer queues a struct request, your driver's queue handler picks it up, translates it into a command for the PCI card (via MMIO/DMA), the PCI card drives the tape library hardware, and completion triggers an IRQ that calls your blk_mq_end_request().
+```
+
 ## Debbugging/releasing inserted module
 
 ```bash

@@ -252,7 +252,7 @@ static inline int init_tag_set(struct blk_mq_tag_set *set, void *data)
 	set->nr_maps = 1;
 	set->queue_depth = 128;
 	set->numa_node = NUMA_NO_NODE;
-	set->flags = BLK_MQ_F_SHOULD_MERGE | BLK_MQ_F_STACKING;
+	set->flags = BLK_MQ_F_STACKING;
 
 	set->cmd_size = 0;
 	set->driver_data = data;

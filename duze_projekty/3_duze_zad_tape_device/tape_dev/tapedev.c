@@ -1,5 +1,6 @@
 #include "tapedev.h"
 #include "asm-generic/errno-base.h"
+#include "linux/blk_types.h"
 #include "linux/gfp_types.h"
 #include "linux/slab.h"
 #include <linux/atomic.h>
@@ -22,8 +23,10 @@
 #define BAR_MAXLEN 0
 
 #define GET_SECTION_ADDR(s_id) ((s_id) * 0x100)
+#define PHYSICAL_BLOCK_SIZE 8192
 #define BASE_TAPE_SIZE (32 * 8192)
 #define SIZE_OF_TAPE(s_type) ((1 << s_type) * BASE_TAPE_SIZE)
+#define GET_NBR_OF_SECTORS(s_type, n_tapes) ((SIZE_OF_TAPE(s_type) / 512) * n_tapes)
 
 // Blk dev example impl
 // https://github.com/CodeImp/sblkdev/blob/master/device.c
@@ -38,12 +41,16 @@ struct section
 	uint32_t n_tapes;
 	// 0 to 4, to calc size of tape for this section use SIZE_OF_TAPE macro
 	uint32_t section_type; 	
+	sector_t n_sectors;
 	/*
 		gendisk is kernel's representation of of an individual DISK DEVICE
 	*/
 	struct gendisk *gdisk;
 	spinlock_t lock; /* For mutual exclusion */
-	struct request_queue *queue; /* The device request queue */
+	// struct request_queue *queue; /* The device request queue */
+	
+	u8 *data;			/* The data in virtual memory, dont know for what yet */
+	struct blk_mq_tag_set tag_set; /* multi queue */
 };
 
 // We will make an array of tapedev_devices, each will have its own gdisk etc
@@ -54,7 +61,7 @@ struct tapedev_device {
 	spinlock_t s_lock;
 	// An array of sections, from 1 to 8 sections
 	uint32_t n_sections;
-	struct gendisk *parent_gdisk;
+	// struct gendisk *parent_gdisk;
 	struct section **sections;
 	// struct list_head buffers_free;
 	// struct list_head buffers_running;
@@ -210,10 +217,73 @@ static const struct block_device_operations tapedev_ops = {
 	.ioctl = tapedev_ioctl
 };
 
+static inline int process_request(struct request *rq, unsigned int *nr_bytes)
+{
+	int ret = 0;
+	struct bio_vec bvec;
+	struct req_iterator iter;
+	struct section *s = rq->q->queuedata;
+	loff_t pos = blk_rq_pos(rq) << SECTOR_SHIFT;
+	loff_t dev_size = (s->n_sectors << SECTOR_SHIFT);
+
+	rq_for_each_segment(bvec, rq, iter) {
+		unsigned long len = bvec.bv_len;
+		void *buf = page_address(bvec.bv_page) + bvec.bv_offset;
+
+		if ((pos + len) > dev_size)
+			len = (unsigned long)(dev_size - pos);
+
+		if (rq_data_dir(rq))
+			memcpy(s->data + pos, buf, len); /* WRITE */
+		else
+			memcpy(buf, s->data + pos, len); /* READ */
+
+		pos += len;
+		*nr_bytes += len;
+	}
+
+	return ret;
+}
+
+static blk_status_t _queue_rq(struct blk_mq_hw_ctx *hctx, const struct blk_mq_queue_data *bd)
+{
+	unsigned int nr_bytes = 0;
+	blk_status_t status = BLK_STS_OK;
+	struct request *rq = bd->rq;
+
+	//might_sleep();
+	cant_sleep(); /* cannot use any locks that make the thread sleep */
+
+	blk_mq_start_request(rq);
+
+	if (process_request(rq, &nr_bytes))
+		status = BLK_STS_IOERR;
+
+	pr_debug("request %llu:%d processed\n", blk_rq_pos(rq), nr_bytes);
+
+	blk_mq_end_request(rq, status);
+
+	return status;
+}
 
 static struct blk_mq_ops mq_ops = {
 	.queue_rq = _queue_rq,
 };
+
+static inline int init_tag_set(struct blk_mq_tag_set *set, void *data)
+{
+	set->ops = &mq_ops;
+	set->nr_hw_queues = 1;
+	set->nr_maps = 1;
+	set->queue_depth = 128;
+	set->numa_node = NUMA_NO_NODE;
+	// set->flags = no flags I think are needed;
+
+	set->cmd_size = 0;
+	set->driver_data = data;
+
+	return blk_mq_alloc_tag_set(set);
+}
 
 // Each gdisk will be our block device, i.e. for:
 // tape_types":[0,1,2,3,4],"tapes":[50,40,30,20,10]}
@@ -229,17 +299,16 @@ static int create_section(
 	struct tapedev_device *tape_dev
 )
 {
-	// DONT KNOW IF NEEDED
-	// struct queue_limits lim = {
-	// 	.logical_block_size		= 512, // TODO - should be based on some tape type
-	// 	/*
-	// 		* To ensure that we always get PAGE_SIZE aligned and
-	// 		* n*PAGE_SIZED sized I/O requests.
-	// 		*/
-	// 	// .physical_block_size		= PAGE_SIZE,
-	// 	// .io_min				= PAGE_SIZE,
-	// 	// .io_opt				= PAGE_SIZE,
-	// };
+	struct queue_limits lim = {
+		.logical_block_size		= SECTOR_SIZE, 
+		/*
+			* To ensure that we always get PAGE_SIZE aligned and
+			* n*PAGE_SIZED sized I/O requests.
+			*/
+		.physical_block_size		= PHYSICAL_BLOCK_SIZE,
+		// .io_min				= PAGE_SIZE,
+		// .io_opt				= PAGE_SIZE,
+	};
 
     int err;
 	struct section *s = kzalloc(sizeof(struct section), GFP_KERNEL);
@@ -255,13 +324,30 @@ static int create_section(
 	s->idx = section_id;
 	s->section_type = sec_type;
 	s->n_tapes = n_tapes;
-	s->gdisk = blk_alloc_disk(NULL, NUMA_NO_NODE);
+	s->n_sectors = GET_NBR_OF_SECTORS(sec_type, n_tapes);
+
+	err = init_tag_set(&s->tag_set, s);
+	if (err) {
+		pr_err("%s:%u: Failed to allocate tag set\n", __func__, __LINE__);
+		goto free_alloc_s;
+	}
+
+
+	s->gdisk = blk_mq_alloc_disk(&s->tag_set, &lim, s);
 	if (IS_ERR_OR_NULL(s->gdisk)) 
 	{
 		err = s->gdisk ? PTR_ERR(s->gdisk) : -ENOMEM;
-		pr_err("%s :: blk_alloc_disk failed with error: %d\n", __func__, err);
-		goto free_alloc_s;
+		pr_err("%s :: blk_mq_alloc_disk failed with error: %d\n", __func__, err);
+		goto free_tag_set;
 	}
+
+	// s->gdisk = blk_alloc_disk(NULL, NUMA_NO_NODE);
+	// if (IS_ERR_OR_NULL(s->gdisk)) 
+	// {
+	// 	err = s->gdisk ? PTR_ERR(s->gdisk) : -ENOMEM;
+	// 	pr_err("%s :: blk_alloc_disk failed with error: %d\n", __func__, err);
+	// 	goto free_alloc_s;
+	// }
 
 	// Should not be done by us as gendisk struct says
 	// s->gdisk->major = tapedev_major;
@@ -290,70 +376,59 @@ static int create_section(
 
 	return 0;
 
+free_tag_set:
+	blk_mq_free_tag_set(&s->tag_set);
 free_alloc_s:
 	kfree(s);
 fail:
 	return err;
 }
 
-static int create_parent_dev(
-	struct tapedev_device *tape_dev,
-	uint32_t n_sections,
-	int device_id
-)
-{
-	// Currently dont know whats the point of creating /dev/tapedevX since all 
-	// operations will be done at SECTION devices, and this device will just exist
-	int err;
-	uint32_t total_nbr_of_sectors = 0;
-	struct gendisk *gdisk = blk_alloc_disk(NULL, NUMA_NO_NODE);
-
-	if (IS_ERR_OR_NULL(gdisk)) 
-	{
-		err = gdisk ? PTR_ERR(gdisk) : -ENOMEM;
-		pr_err("%s:%u :: blk_alloc_disk failed with error: %d\n", __func__, __LINE__,err);
-		return err;
-	}
-
-	gdisk->fops = &tapedev_ops;
-	gdisk->private_data = tape_dev;
-
-	snprintf(gdisk->disk_name, 15, "tapedev%d", tape_dev->idx);
-
-	for (u32 s_id = 1; s_id <= n_sections; s_id++) 
-	{
-        u32 n_tapes = section_ior(tape_dev, GET_SECTION_ADDR(s_id), TAPEDEV_SECT_TAPES_ADDR);
-        u32 sec_type = section_ior(tape_dev, GET_SECTION_ADDR(s_id), TAPEDEV_SECT_TAPE_SIZE_ADDR);
-
-        total_nbr_of_sectors += (SIZE_OF_TAPE(sec_type) / 512) * n_tapes;
-    }
-
-    set_capacity(gdisk, total_nbr_of_sectors);
-
-    err = device_add_disk(&tape_dev->pdev->dev, gdisk, NULL);
-    if (err < 0) {
-        put_disk(gdisk);
-        return err;
-    }
-
-    tape_dev->parent_gdisk = gdisk;
-    return 0;
-}
-
-// static inline int init_mq_tag_set(struct blk_mq_tag_set *set, void *data)
+// static int create_parent_dev(
+// 	struct tapedev_device *tape_dev,
+// 	uint32_t n_sections,
+// 	int device_id
+// )
 // {
-// 	set->ops = &mq_ops;
-// 	set->nr_hw_queues = 1;
-// 	set->nr_maps = 1;
-// 	set->queue_depth = 128;
-// 	set->numa_node = NUMA_NO_NODE;
-// 	set->flags = BLK_MQ_F_SHOULD_MERGE | BLK_MQ_F_STACKING;
+// 	// Currently dont know whats the point of creating /dev/tapedevX since all 
+// 	// operations will be done at SECTION devices, and this device will just exist
+// 	int err;
+// 	uint32_t total_nbr_of_sectors = 0;
+// 	struct gendisk *gdisk = blk_alloc_disk(NULL, NUMA_NO_NODE);
 
-// 	set->cmd_size = 0;
-// 	set->driver_data = data;
+// 	if (IS_ERR_OR_NULL(gdisk)) 
+// 	{
+// 		err = gdisk ? PTR_ERR(gdisk) : -ENOMEM;
+// 		pr_err("%s:%u :: blk_alloc_disk failed with error: %d\n", __func__, __LINE__,err);
+// 		return err;
+// 	}
 
-// 	return blk_mq_alloc_tag_set(set);
+// 	gdisk->fops = &tapedev_ops;
+// 	gdisk->private_data = tape_dev;
+
+// 	snprintf(gdisk->disk_name, 15, "tapedev%d", tape_dev->idx);
+
+// 	for (u32 s_id = 1; s_id <= n_sections; s_id++) 
+// 	{
+//         u32 n_tapes = section_ior(tape_dev, GET_SECTION_ADDR(s_id), TAPEDEV_SECT_TAPES_ADDR);
+//         u32 sec_type = section_ior(tape_dev, GET_SECTION_ADDR(s_id), TAPEDEV_SECT_TAPE_SIZE_ADDR);
+
+//         total_nbr_of_sectors += (SIZE_OF_TAPE(sec_type) / 512) * n_tapes;
+//     }
+
+//     set_capacity(gdisk, total_nbr_of_sectors);
+
+//     // err = device_add_disk(&tape_dev->pdev->dev, gdisk, NULL);
+//     err = add_disk(gdisk);
+//     if (err < 0) {
+//         put_disk(gdisk);
+//         return err;
+//     }
+
+//     tape_dev->parent_gdisk = gdisk;
+//     return 0;
 // }
+
 
 /* PCI driver.  */
 
@@ -491,13 +566,13 @@ static int tapedev_probe(
 		goto sections_alloc_fail;
 	}
 
-	err = create_parent_dev(tape_dev, num_sections, tape_dev->idx);
+	// err = create_parent_dev(tape_dev, num_sections, tape_dev->idx);
 
-	if (err < 0)
-	{
-		pr_warn("%s:%u: create_parent_dev failed, err: %d\n", __func__, __LINE__, err);
-		goto free_sections;
-	}
+	// if (err < 0)
+	// {
+	// 	pr_warn("%s:%u: create_parent_dev failed, err: %d\n", __func__, __LINE__, err);
+	// 	goto free_sections;
+	// }
 
 
 	int first_minor = 0;
@@ -531,7 +606,9 @@ static int tapedev_probe(
 	// Adding all section disks
 	for (s_id = 1; s_id <= num_sections; s_id++)
 	{
-		err = device_add_disk(&tape_dev->pdev->dev, tape_dev->sections[s_id]->gdisk, NULL);
+		// err = device_add_disk(&tape_dev->pdev->dev, tape_dev->sections[s_id]->gdisk, NULL);
+		pr_info("%s:%u: adding disk for section: %d \n", __func__, __LINE__, s_id);
+		err = add_disk(tape_dev->sections[s_id]->gdisk);
 
 		if (err < 0)
 		{
@@ -554,8 +631,8 @@ static int tapedev_probe(
 
 	return 0;
 free_parent_dev:
-	put_disk(tape_dev->parent_gdisk);
-free_sections:
+	// put_disk(tape_dev->parent_gdisk);
+// free_sections:
 	kfree(tape_dev->sections);
 sections_alloc_fail:
 out_bad_num_sec:
