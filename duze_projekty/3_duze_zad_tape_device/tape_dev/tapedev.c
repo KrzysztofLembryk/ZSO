@@ -7,6 +7,7 @@
 #include <linux/module.h>
 #include <linux/kernel.h>
 #include <linux/printk.h>
+#include <linux/blk-mq.h>
 #include <linux/fs.h>
 #include <linux/types.h>
 #include <linux/blkdev.h>
@@ -23,6 +24,9 @@
 #define GET_SECTION_ADDR(s_id) ((s_id) * 0x100)
 #define BASE_TAPE_SIZE (32 * 8192)
 #define SIZE_OF_TAPE(s_type) ((1 << s_type) * BASE_TAPE_SIZE)
+
+// Blk dev example impl
+// https://github.com/CodeImp/sblkdev/blob/master/device.c
 
 static dev_t tapedev_major;
 // Our workflow will be like that, in init we only allocate major nbr, create class 
@@ -45,12 +49,12 @@ struct section
 // We will make an array of tapedev_devices, each will have its own gdisk etc
 struct tapedev_device {
 	int idx;
-	struct device *dev; // used to store device_create(...) return value
 	struct pci_dev *pdev;
 	void __iomem *bar;
 	spinlock_t s_lock;
 	// An array of sections, from 1 to 8 sections
 	uint32_t n_sections;
+	struct gendisk *parent_gdisk;
 	struct section **sections;
 	// struct list_head buffers_free;
 	// struct list_head buffers_running;
@@ -93,8 +97,6 @@ static inline uint32_t section_ior(struct tapedev_device *dev, uint32_t offset, 
 	// printk(KERN_ALERT "tapedev_ior :: tapedev %03x -> %08x (res)\n", reg, res);
 	return res;
 }
-
-
 
 // #################################################################################
 // ############################## HANDLING INTERRUPTS ##############################
@@ -179,10 +181,38 @@ static void tapedev_disk_release(struct gendisk *gd)
     return;
 }
 
+#define TAPEDEV_IOCTL_GET_INFO             _IOR('~', 0, struct tapedev_sect_info)
+
+struct tapedev_sect_info {
+    uint32_t tapes;
+    uint32_t tape_type;
+    uint32_t current_tape;
+};
+
+static int tapedev_ioctl(struct block_device *bdev, blk_mode_t mode, unsigned cmd, unsigned long arg)
+{
+	struct tapedev_device *dev = bdev->bd_disk->private_data;
+
+	pr_info("%s:%u: contol command [0x%x] received, for device: %d\n\n", __func__, __LINE__, cmd, dev->idx);
+
+	switch (cmd) {
+	case TAPEDEV_IOCTL_GET_INFO:
+		return 0;
+	default:
+		return -ENOTTY;
+	}
+}
+
 static const struct block_device_operations tapedev_ops = {
 	.owner	= THIS_MODULE,
 	.open = tapedev_disk_open,
 	.release = tapedev_disk_release,
+	.ioctl = tapedev_ioctl
+};
+
+
+static struct blk_mq_ops mq_ops = {
+	.queue_rq = _queue_rq,
 };
 
 // Each gdisk will be our block device, i.e. for:
@@ -195,7 +225,8 @@ static int create_section(
 	int sec_type, 
 	int n_tapes,
 	int device_id,
-	int *first_minor
+	int *first_minor,
+	struct tapedev_device *tape_dev
 )
 {
 	// DONT KNOW IF NEEDED
@@ -225,7 +256,6 @@ static int create_section(
 	s->section_type = sec_type;
 	s->n_tapes = n_tapes;
 	s->gdisk = blk_alloc_disk(NULL, NUMA_NO_NODE);
-
 	if (IS_ERR_OR_NULL(s->gdisk)) 
 	{
 		err = s->gdisk ? PTR_ERR(s->gdisk) : -ENOMEM;
@@ -233,12 +263,16 @@ static int create_section(
 		goto free_alloc_s;
 	}
 
-	s->gdisk->major = tapedev_major;
-	s->gdisk->first_minor = *first_minor;
-	s->gdisk->minors = n_tapes;
+	// Should not be done by us as gendisk struct says
+	// s->gdisk->major = tapedev_major;
+	// s->gdisk->first_minor = *first_minor;
+	// *first_minor += n_tapes;
+	// s->gdisk->minors = n_tapes;
 	s->gdisk->fops = &tapedev_ops;
 	// s or maybe tape_dev??
-	s->gdisk->private_data = s;
+	s->gdisk->private_data = tape_dev;
+	// disk_name shows up in /proc/partitions and sysfs and /dev/
+	snprintf(s->gdisk->disk_name, 15, "tapedev%ds%d", device_id, section_id - 1);
 
 	// We should set capacity of the disk by using set_capacity, to this function 
 	// we pass HOW MANY 512 byte SECTORS our disk has; 8192 / 512 = 16, so by using 
@@ -248,10 +282,7 @@ static int create_section(
 	// need 50 minors.
 	// Each tape has SIZE_OF_TAPE so every tape will have SIZE_OF_TAPE / 512 sectors
 	set_capacity(s->gdisk, (SIZE_OF_TAPE(sec_type) / 512) * n_tapes);
-	*first_minor += n_tapes;
 
-	// disk_name shows up in /proc/partitions and sysfs and /dev/
-	snprintf(s->gdisk->disk_name, 15, "tapedev%ds%d", device_id, section_id);
 
 	*new_section = s;
 
@@ -265,6 +296,65 @@ fail:
 	return err;
 }
 
+static int create_parent_dev(
+	struct tapedev_device *tape_dev,
+	uint32_t n_sections,
+	int device_id
+)
+{
+	// Currently dont know whats the point of creating /dev/tapedevX since all 
+	// operations will be done at SECTION devices, and this device will just exist
+	int err;
+	uint32_t total_nbr_of_sectors = 0;
+	struct gendisk *gdisk = blk_alloc_disk(NULL, NUMA_NO_NODE);
+
+	if (IS_ERR_OR_NULL(gdisk)) 
+	{
+		err = gdisk ? PTR_ERR(gdisk) : -ENOMEM;
+		pr_err("%s:%u :: blk_alloc_disk failed with error: %d\n", __func__, __LINE__,err);
+		return err;
+	}
+
+	gdisk->fops = &tapedev_ops;
+	gdisk->private_data = tape_dev;
+
+	snprintf(gdisk->disk_name, 15, "tapedev%d", tape_dev->idx);
+
+	for (u32 s_id = 1; s_id <= n_sections; s_id++) 
+	{
+        u32 n_tapes = section_ior(tape_dev, GET_SECTION_ADDR(s_id), TAPEDEV_SECT_TAPES_ADDR);
+        u32 sec_type = section_ior(tape_dev, GET_SECTION_ADDR(s_id), TAPEDEV_SECT_TAPE_SIZE_ADDR);
+
+        total_nbr_of_sectors += (SIZE_OF_TAPE(sec_type) / 512) * n_tapes;
+    }
+
+    set_capacity(gdisk, total_nbr_of_sectors);
+
+    err = device_add_disk(&tape_dev->pdev->dev, gdisk, NULL);
+    if (err < 0) {
+        put_disk(gdisk);
+        return err;
+    }
+
+    tape_dev->parent_gdisk = gdisk;
+    return 0;
+}
+
+// static inline int init_mq_tag_set(struct blk_mq_tag_set *set, void *data)
+// {
+// 	set->ops = &mq_ops;
+// 	set->nr_hw_queues = 1;
+// 	set->nr_maps = 1;
+// 	set->queue_depth = 128;
+// 	set->numa_node = NUMA_NO_NODE;
+// 	set->flags = BLK_MQ_F_SHOULD_MERGE | BLK_MQ_F_STACKING;
+
+// 	set->cmd_size = 0;
+// 	set->driver_data = data;
+
+// 	return blk_mq_alloc_tag_set(set);
+// }
+
 /* PCI driver.  */
 
 static int tapedev_probe(
@@ -272,13 +362,11 @@ static int tapedev_probe(
 	const struct pci_device_id *pci_id
 )
 {
-	// ### Vars declaration ###
 	// When OS discovers that tape device is connect to PCI BUS (and it is since we
 	// have modified QEMU installed) it invokes this function and passes tape 
 	// device's struct (which holds all info about the device) which is pdev
 	int err;
 
-	// ### Allocate our structure ###
 	// So now is the time to allocate our internal device structure in which we will 
 	// store all information about this tape device we need for our driver to work
 	struct tapedev_device *tape_dev = kzalloc(sizeof *tape_dev, GFP_KERNEL);
@@ -396,17 +484,32 @@ static int tapedev_probe(
 	// subtract 1 from section_id
 	tape_dev->sections = kzalloc(sizeof(struct section*) * (num_sections + 1), GFP_KERNEL);
 
-	// TODO: check if sections allocation was successful!!!
+	if (IS_ERR_OR_NULL(tape_dev->sections))
+	{
+		err = -ENOMEM;
+		pr_warn("%s:%u: sections = kzalloc failed, err: %d\n", __func__, __LINE__, err);
+		goto sections_alloc_fail;
+	}
+
+	err = create_parent_dev(tape_dev, num_sections, tape_dev->idx);
+
+	if (err < 0)
+	{
+		pr_warn("%s:%u: create_parent_dev failed, err: %d\n", __func__, __LINE__, err);
+		goto free_sections;
+	}
+
 
 	int first_minor = 0;
+	int s_id;
 
 	// Create all sections for this device
-	for (int s_id = 1; s_id <= num_sections; s_id++)
+	for (s_id = 1; s_id <= num_sections; s_id++)
 	{
 		int n_tapes = section_ior(tape_dev, GET_SECTION_ADDR(s_id),TAPEDEV_SECT_TAPES_ADDR);
 		int sec_type = section_ior(tape_dev, GET_SECTION_ADDR(s_id),TAPEDEV_SECT_TAPE_SIZE_ADDR);
 
-		err = create_section(&(tape_dev->sections[s_id]), s_id, sec_type, n_tapes, tape_dev->idx, &first_minor);
+		err = create_section(&(tape_dev->sections[s_id]), s_id, sec_type, n_tapes, tape_dev->idx, &first_minor, tape_dev);
 
 		if (err < 0)
 		{
@@ -415,19 +518,46 @@ static int tapedev_probe(
 				// put_disk decrements gendisk refcount, if it reaches 0 gendisk is 
 				// freed, since we've just allocated gendisk struct there might at 
 				// most 1 ref to it thus put_disk will free dev.gendisk
-				del_gendisk(tape_dev->sections[i]->gdisk);
+				// We didnt use add_disk yet so we dont need to use del_gendisk
+				// del_gendisk(tape_dev->sections[i]->gdisk);
 				put_disk(tape_dev->sections[i]->gdisk);
 				kfree(tape_dev->sections[i]);
 			}
-			goto free_sections;
+			goto free_parent_dev;
 		}
 
+	}
+
+	// Adding all section disks
+	for (s_id = 1; s_id <= num_sections; s_id++)
+	{
+		err = device_add_disk(&tape_dev->pdev->dev, tape_dev->sections[s_id]->gdisk, NULL);
+
+		if (err < 0)
+		{
+			pr_info("%s:%u: add_disk failed for device: %d, s_id: %d, err: '%d'\n", __func__, __LINE__, tape_dev->idx, s_id, err);
+			for (int i = 1; i <= num_sections; i++)
+			{
+				// where add_disk was successful we need to call del_gendisk
+				// del_gendisk needed only when __device_add_disk was invoked, but we
+				// used only add_disk
+				// if (i < s_id)
+				// 	del_gendisk(tape_dev->sections[i]->gdisk);
+				// for the rest put_disk and kfree is enough
+				put_disk(tape_dev->sections[i]->gdisk);
+				kfree(tape_dev->sections[i]);
+			}
+			goto free_parent_dev;
+		}
 	}
 	// TODO: add blk dev impl
 
 	return 0;
+free_parent_dev:
+	put_disk(tape_dev->parent_gdisk);
 free_sections:
 	kfree(tape_dev->sections);
+sections_alloc_fail:
 out_bad_num_sec:
 	tapedev_iow(tape_dev, TAPEDEV_ENABLE_ADDR, 0);
 out_irq:
@@ -451,6 +581,9 @@ fail:
 static void tapedev_remove(struct pci_dev *pdev)
 {
 	struct tapedev_device *tape_dev = pci_get_drvdata(pdev);
+
+	pr_info("%s:%u: removing tape device: '%d'\n", __func__, __LINE__, tape_dev->idx);
+
 	tapedev_iow(tape_dev, TAPEDEV_ENABLE_ADDR, 0);
 	free_irq(pdev->irq, tape_dev);
 
@@ -463,8 +596,13 @@ static void tapedev_remove(struct pci_dev *pdev)
 	kfree(tape_dev->sections);
 	// blk dev free
 	pci_iounmap(pdev, tape_dev->bar);
-	pci_release_regions(pdev);
+
+	// (docs) Drivers should call pci_release_region() AFTER calling 
+	// pci_disable_device(). The idea is to prevent two devices colliding on the 
+	// same address range
 	pci_disable_device(pdev);
+	pci_release_regions(pdev);
+
 	mutex_lock(&tapedev_devices_lock);
 	tapedev_devices[tape_dev->idx] = NULL;
 	mutex_unlock(&tapedev_devices_lock);
@@ -489,7 +627,6 @@ static struct pci_driver tapedev_pci_driver = {
 
 static int init_tapedev(void)
 {
-	pr_info("init_tapedev\n");
 	int err;
 
 	// After register_blkdev, kernel will display TAPEDEV_NAME in /proc/devices  
@@ -505,8 +642,7 @@ static int init_tapedev(void)
 
     tapedev_major = err;
 
-	pr_info("%s:%u: registered block device major %d\n", __func__,
-		__LINE__, tapedev_major);
+	pr_info("%s:%u: registered block device major %d\n", __func__, __LINE__, tapedev_major);
 
 	if ((err = class_register(&tapedev_class)))
 	{
@@ -531,6 +667,7 @@ fail:
 
 static void cleanup_tapedev(void)
 {
+	pr_info("%s:%u: cleaning up tape device\n", __func__, __LINE__);
 	pci_unregister_driver(&tapedev_pci_driver);
 	class_unregister(&tapedev_class);
 	unregister_blkdev(tapedev_major, TAPEDEV_NAME);

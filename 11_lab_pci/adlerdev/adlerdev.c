@@ -9,6 +9,7 @@
 #include <linux/interrupt.h>
 
 #include "adlerdev.h"
+#include "linux/printk.h"
 
 #define ADLERDEV_MAX_DEVICES 256
 #define ADLERDEV_NUM_BUFFERS 16
@@ -98,7 +99,7 @@ static irqreturn_t adlerdev_isr(int irq, void *opaque)
 		} else {
 			/* Run the next buffer.  */
 			buf = list_entry(dev->buffers_running.next, struct adlerdev_buffer, lh);
-			adlerdev_iow(dev, ADLERDEV_DATA_PTR, buf->data_dma);
+			adlerdev_iow(dev, ADLERDEV_DATA_PTR, buf->data_dma);init_tag_set
 			adlerdev_iow(dev, ADLERDEV_SUM, buf->ctx->sum);
 			adlerdev_iow(dev, ADLERDEV_DATA_SIZE, buf->fill_size);
 		}
