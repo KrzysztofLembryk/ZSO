@@ -24,8 +24,6 @@
 #define BASE_TAPE_SIZE (32 * 8192)
 #define SIZE_OF_TAPE(s_type) ((1 << s_type) * BASE_TAPE_SIZE)
 
-int allowed_msg_count = 6;
-int allowed_msg_count_remove = 6;
 static dev_t tapedev_major;
 // Our workflow will be like that, in init we only allocate major nbr, create class 
 // and init PCI -- adding DISKS for our blkd dev will happen inside PROBE function
@@ -120,7 +118,8 @@ static irqreturn_t tapedev_interrupt_handler(int irq, void *opaque_dev)
 	struct tapedev_device *dev = opaque_dev;
 	unsigned long flags;
 	uint32_t istatus;
-	uint32_t num_sections, loaded_tape_id, num_tapes;
+	uint32_t num_sections;
+	uint32_t dev_status;
 	
 
 	// saves the interrupt state before taking the spin lock
@@ -129,24 +128,36 @@ static irqreturn_t tapedev_interrupt_handler(int irq, void *opaque_dev)
 	// We check if initialization of device ended by checking interrupt status value 
 	// in our device and if it is TAPEDEV_IRQ_INIT_DONE 
 	istatus = tapedev_ior(dev, TAPEDEV_IRQ_STATUS_ADDR);
+
+	uint32_t is_init_done = istatus & (1 << TAPEDEV_IRQ_INIT_DONE);
+	uint32_t is_hardware_error = istatus & (1 << TAPEDEV_IRQ_HW_ERROR);
+
+	dev_status = tapedev_ior(dev, TAPEDEV_STATUS_ADDR);
 	num_sections = tapedev_ior(dev, TAPEDEV_SECTIONS_ADDR);
-	loaded_tape_id = tapedev_ior(dev, TAPEDEV_SECT_TAPE_NO_ADDR);
-	num_tapes = tapedev_ior(dev, TAPEDEV_SECT_TAPES_ADDR);
 
-	if (allowed_msg_count)
+	// We always need to clear interrupt flag for given interrupt, so that this 
+	// interrupt is not fired endlessly
+	if (is_init_done)
 	{
-		pr_warn("tapedev_interrupt_handler :: device has: %u sections\n", num_sections);
-		pr_warn("tapedev_interrupt_handler :: loaded tape id: %u \n", loaded_tape_id);
-		pr_warn("tapedev_interrupt_handler :: nbr of tapes in section: %u \n", num_tapes);
-		allowed_msg_count--;
-
-		// TAPEDEV_IRQ_INIT_DONE is bit idx at which information is stored,
-		// so we check if its 1 meaning init is indeed done
-		if ((istatus & (1 << TAPEDEV_IRQ_INIT_DONE)) == 1)
-		{
-			pr_warn("tapedev_interrupt_handler :: device started successfully\n");
-		}
+		tapedev_iow(dev, TAPEDEV_IRQ_CLEAR_ADDR, (1 << TAPEDEV_IRQ_INIT_DONE));
+		pr_warn("%s:%u: init done\n", __func__, __LINE__);
 	}
+	if (is_hardware_error)
+	{
+		tapedev_iow(dev, TAPEDEV_IRQ_CLEAR_ADDR, (1 << TAPEDEV_IRQ_HW_ERROR));
+		pr_warn("%s:%u: hardware error\n", __func__, __LINE__);
+	}
+
+	pr_warn("%s:%u: device status: %u\n", __func__, __LINE__, dev_status);
+	pr_warn("%s:%u: nums sections: %u\n", __func__, __LINE__, num_sections);
+
+	for (int s_id = 1; s_id <= num_sections; s_id++)
+	{
+		uint32_t n_tapes = section_ior(dev, GET_SECTION_ADDR(s_id),TAPEDEV_SECT_TAPES_ADDR);
+		uint32_t sec_type = section_ior(dev, GET_SECTION_ADDR(s_id),TAPEDEV_SECT_TAPE_SIZE_ADDR);
+		pr_warn("%s:%u: section type: %u, num of tapes: %u\n", __func__, __LINE__, sec_type, n_tapes);
+	}
+
 	spin_unlock_irqrestore(&dev->s_lock, flags);
 
 	return IRQ_RETVAL(istatus);
@@ -363,7 +374,8 @@ static int tapedev_probe(
 	// We clear all interrupts, by setting all bits to 1
 	tapedev_iow(tape_dev, TAPEDEV_IRQ_CLEAR_ADDR, 0xffffffff);
 	// 0xffffffff in binary consists of only ones, we are xoring here so that 
-	// INIT_DONE and HW_ERROR bits are zeroed, meaning they will be enabled
+	// INIT_DONE and HW_ERROR bits are zeroed, meaning these intrpts will be enabled
+	// others are disabled
 	tapedev_iow(tape_dev, TAPEDEV_IRQ_MASK_ADDR, (0xffffffff ^ TAPEDEV_IRQ_INIT_DONE) ^ TAPEDEV_IRQ_HW_ERROR);
 
 	tapedev_iow(tape_dev, TAPEDEV_ENABLE_ADDR, 1);
@@ -379,11 +391,12 @@ static int tapedev_probe(
 	}
 
 	tape_dev->n_sections = num_sections;
-	tape_dev->sections = kzalloc(sizeof(struct section*) * num_sections, GFP_KERNEL);
+	// We count sections from id = 1
+	tape_dev->sections = kzalloc(sizeof(struct section*) * (num_sections + 1), GFP_KERNEL);
 	int first_minor = 0;
 
 	// Create all sections for this device
-	for (int s_id = 0; s_id < num_sections; s_id++)
+	for (int s_id = 1; s_id <= num_sections; s_id++)
 	{
 		int n_tapes = section_ior(tape_dev, GET_SECTION_ADDR(s_id),TAPEDEV_SECT_TAPES_ADDR);
 		int sec_type = section_ior(tape_dev, GET_SECTION_ADDR(s_id),TAPEDEV_SECT_TAPE_SIZE_ADDR);
@@ -392,7 +405,9 @@ static int tapedev_probe(
 
 		if (err < 0)
 		{
-			for (int i = 0; i <= s_id; i++)
+			// section at 0 idx is never used
+			kfree(tape_dev->sections[0]);
+			for (int i = 1; i <= s_id; i++)
 			{
 				// put_disk decrements gendisk refcount, if it reaches 0 gendisk is 
 				// freed, since we've just allocated gendisk struct there might at 
@@ -433,29 +448,22 @@ fail:
 static void tapedev_remove(struct pci_dev *pdev)
 {
 	struct tapedev_device *tape_dev = pci_get_drvdata(pdev);
-	for (int s_id = 0; s_id <= tape_dev->n_sections; s_id++)
+	tapedev_iow(tape_dev, TAPEDEV_ENABLE_ADDR, 0);
+	free_irq(pdev->irq, tape_dev);
+
+	kfree(tape_dev->sections[0]);
+	for (int s_id = 1; s_id <= tape_dev->n_sections; s_id++)
 	{
 		del_gendisk(tape_dev->sections[s_id]->gdisk);
 		put_disk(tape_dev->sections[s_id]->gdisk);
 		kfree(tape_dev->sections[s_id]);
 	}
-	int idx = tape_dev->idx;
-	if (tape_dev->dev) {
-		device_destroy(&tapedev_class, tapedev_major + tape_dev->idx);
-	}
 	// blk dev free
-	tapedev_iow(tape_dev, TAPEDEV_ENABLE_ADDR, 0);
-	free_irq(pdev->irq, tape_dev);
 	pci_iounmap(pdev, tape_dev->bar);
 	pci_release_regions(pdev);
 	pci_disable_device(pdev);
 	mutex_lock(&tapedev_devices_lock);
 	tapedev_devices[tape_dev->idx] = NULL;
-	if (allowed_msg_count_remove)
-	{
-		pr_warn("tapedev_remove :: removing device: %u \n", idx);
-		allowed_msg_count_remove--;
-	}
 	mutex_unlock(&tapedev_devices_lock);
 	kfree(tape_dev);
 }
@@ -523,9 +531,6 @@ static void cleanup_tapedev(void)
 	pci_unregister_driver(&tapedev_pci_driver);
 	class_unregister(&tapedev_class);
 	unregister_blkdev(tapedev_major, TAPEDEV_NAME);
-
-	// del_gendisk(dev.gdisk);
-	// put_disk(dev.gdisk);
 }
 module_init(init_tapedev);
 module_exit(cleanup_tapedev);
