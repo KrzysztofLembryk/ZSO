@@ -13,7 +13,18 @@ static inline int process_request(struct request *rq, unsigned int *nr_bytes)
 	struct bio_vec bvec;
 	struct req_iterator iter;
 	struct sblkdev_device *dev = rq->q->queuedata;
+
+	// blk_rq_pos() returns id of current sector (i.e. sector 1, or 5), but our
+	// dev->data is just an array that stores num_sectors * sector_size bytes, so in
+	// order to write/read data of our current_sector we need to have correct offset.
+	// Since all sectors have the same size 2^SECTOR_SHIFT, we can get this offset
+	// simply by multiplying sector_id * sector_size.
+	// i.e. sector_id = 0, thus pos = secotr_id << SECTOR_SHIFT = 0, 
+	// and indeed we want to start reading/writing from 0 in our dev->data
 	loff_t pos = blk_rq_pos(rq) << SECTOR_SHIFT;
+
+	// capacity - nbr of sectors, << SECTOR_SHIFT for capacity does basically this:
+	// capacity * sector_size, so we get whole size of the device
 	loff_t dev_size = (dev->capacity << SECTOR_SHIFT);
 
 	rq_for_each_segment(bvec, rq, iter) {

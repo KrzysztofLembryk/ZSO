@@ -99,7 +99,7 @@ static irqreturn_t adlerdev_isr(int irq, void *opaque)
 		} else {
 			/* Run the next buffer.  */
 			buf = list_entry(dev->buffers_running.next, struct adlerdev_buffer, lh);
-			adlerdev_iow(dev, ADLERDEV_DATA_PTR, buf->data_dma);init_tag_set
+			adlerdev_iow(dev, ADLERDEV_DATA_PTR, buf->data_dma);
 			adlerdev_iow(dev, ADLERDEV_SUM, buf->ctx->sum);
 			adlerdev_iow(dev, ADLERDEV_DATA_SIZE, buf->fill_size);
 		}
@@ -367,14 +367,32 @@ static void adlerdev_remove(struct pci_dev *pdev)
 static int adlerdev_suspend(struct pci_dev *pdev, pm_message_t state)
 {
 	unsigned long flags;
+	// We retrieve dev that we attached in probe function (by pci_set_drvdata)
 	struct adlerdev_device *dev = pci_get_drvdata(pdev);
+	// We acquire lock to protect the internal data structures (buffer lists) from 
+	// concurrent access across threads and interrupt handlers. irqsave disables 
+	// local interrupts and saves their prior state into flags to prevent deadlocks.
 	spin_lock_irqsave(&dev->slock, flags);
 	while (list_empty(&dev->buffers_free)) {
+
+		// Begins a loop that asks: "Are there NO free buffers?"
+		// If buffers_free is empty, it means the device is currently busy doing 
+		// work (all buffers are in use / in the buffers_running list). 
+		// The driver must wait for the hardware to finish before turning it off.
+		// We release lock before waiting.
 		spin_unlock_irqrestore(&dev->slock, flags);
+
+		// We wait, we put our current thread to sleep on the idle_wq, it will sleep
+		// until !list_empty(&dev->buffers_free) is TRUE, then interrupt handler will
+		// wake up idle queue
 		wait_event(dev->idle_wq, !list_empty(&dev->buffers_free));
+
+		// After we wake-up we take the lock again and check if while is done
+		// While is needed since there might be some random wake-ups
 		spin_lock_irqsave(&dev->slock, flags);
 	}
 	spin_unlock_irqrestore(&dev->slock, flags);
+	// We can finally suspend our device
 	adlerdev_iow(dev, ADLERDEV_INTR_ENABLE, 0);
 	return 0;
 }

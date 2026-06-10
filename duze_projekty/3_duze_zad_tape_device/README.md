@@ -1,4 +1,49 @@
+# Notes
+## DMA
+- yt vid with dma: https://www.youtube.com/watch?v=kl9c6DrDnHo
+- docs (api, how to alloc buffer): https://kernel-internals.org/mm/dma/
+- linux kernel dma docs: https://docs.kernel.org/core-api/dma-api.html
+- dma exmpl: https://blakerain.com/blog/allocating-memory-for-dma-in-linux/
+## bvec
+```c
+/**
+ * struct bio_vec - a contiguous range of physical memory addresses
+ * @bv_page:   First page associated with the address range.
+ * @bv_len:    Number of bytes in the address range.
+ * @bv_offset: Start of the address range relative to the start of @bv_page.
+ *			in bv_page might be data we dont want, thus we start reading from offset
+ *			to read only specific data we want from this page
+ *			
+ *			  page 
+ *		-------------
+ *		|			      |
+ *		| some data	|
+ *		|			      |
+ *		-------------  --
+ *		|  offset		|   |
+ *		|				    |   |
+ *		| our data	|	  | bv_len
+ *		|			      |	  |
+ *		|			      |	  |
+ *		-------------  --
+ *		|			      |
+ *		| some data |
+ *		|			      |
+ *		-------------
+ *
+ * All pages within a bio_vec starting from @bv_page are contiguous and
+ * can simply be iterated (see bvec_advance()).
+ */
+struct bio_vec {
+	struct page	*bv_page;
+	unsigned int	bv_len;
+	unsigned int	bv_offset;
+};
+
+```
 # Q&A
+
+##
 
 ## Data flow
 ```text

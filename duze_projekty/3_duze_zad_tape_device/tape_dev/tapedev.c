@@ -14,6 +14,8 @@
 #include <linux/blkdev.h>
 #include <linux/interrupt.h>
 #include <linux/pci.h>
+#include <linux/dma-mapping.h>
+#include <linux/mmzone.h>
 
 #define MAX_DEVICES_TAPEDEV 256
 #define BASE_MINOR 0
@@ -28,8 +30,12 @@
 #define SIZE_OF_TAPE(s_type) ((1 << s_type) * BASE_TAPE_SIZE)
 #define GET_NBR_OF_SECTORS(s_type, n_tapes) ((SIZE_OF_TAPE(s_type) / 512) * n_tapes)
 
+
 // Blk dev example impl
 // https://github.com/CodeImp/sblkdev/blob/master/device.c
+// 
+// place worth looking at in linux src is ps3disk.c, ps3vram.c
+// for queue_limits exmpl: zram_drv.c, really short blk dev impl: nfblock
 
 static dev_t tapedev_major;
 // Our workflow will be like that, in init we only allocate major nbr, create class 
@@ -49,8 +55,11 @@ struct section
 	spinlock_t lock; /* For mutual exclusion */
 	// struct request_queue *queue; /* The device request queue */
 	
-	u8 *data;			/* The data in virtual memory, dont know for what yet */
+	dma_addr_t data_dma;
+	void *data_cpu;
 	struct blk_mq_tag_set tag_set; /* multi queue */
+
+	void *private_data;
 };
 
 // We will make an array of tapedev_devices, each will have its own gdisk etc
@@ -69,8 +78,6 @@ struct tapedev_device {
 	wait_queue_head_t wq_idle;
 }; 
 
-// place worth looking at in linux src is ps3disk.c, ps3vram.c
-// for queue_limits exmpl: zram_drv.c, really short blk dev impl: nfblock
 // Global static variables are initialized to NULL, so now we have array of NULLs
 static struct tapedev_device *tapedev_devices[MAX_DEVICES_TAPEDEV]; 
 static DEFINE_MUTEX(tapedev_devices_lock);
@@ -78,6 +85,10 @@ static DEFINE_MUTEX(tapedev_devices_lock);
 static struct class tapedev_class = {
 	.name = "tapedev",
 };
+
+// helpers pre-decl
+int create_sections(struct tapedev_device *tape_dev, int num_sections);
+int add_section_disks(struct tapedev_device *tape_dev, int num_sections);
 
 static inline void tapedev_iow(struct tapedev_device *dev, uint32_t reg, uint32_t val)
 {
@@ -92,15 +103,15 @@ static inline uint32_t tapedev_ior(struct tapedev_device *dev, uint32_t reg)
 	return res;
 }
 
-static inline void section_iow(struct tapedev_device *dev, uint32_t offset, uint32_t reg, uint32_t val)
+static inline void section_iow(struct tapedev_device *dev, uint32_t section_offset, uint32_t reg, uint32_t val)
 {
-	iowrite32(val, dev->bar + offset + reg);
+	iowrite32(val, dev->bar + section_offset + reg);
 	// printk(KERN_ALERT "tapedev_iow :: tapedev %03x <- %08x\n", reg, val);
 }
 
-static inline uint32_t section_ior(struct tapedev_device *dev, uint32_t offset, uint32_t reg)
+static inline uint32_t section_ior(struct tapedev_device *dev, uint32_t section_offset, uint32_t reg)
 {
-	uint32_t res = ioread32(dev->bar + offset + reg);
+	uint32_t res = ioread32(dev->bar + section_offset + reg);
 	// printk(KERN_ALERT "tapedev_ior :: tapedev %03x -> %08x (res)\n", reg, res);
 	return res;
 }
@@ -126,7 +137,7 @@ static irqreturn_t tapedev_interrupt_handler(int irq, void *opaque_dev)
 	// so we need to cast it back
 	struct tapedev_device *dev = opaque_dev;
 	unsigned long flags;
-	uint32_t istatus;
+	uint32_t ir_status;
 	uint32_t num_sections;
 	uint32_t dev_status;
 	
@@ -136,10 +147,10 @@ static irqreturn_t tapedev_interrupt_handler(int irq, void *opaque_dev)
 
 	// We check if initialization of device ended by checking interrupt status value 
 	// in our device and if it is TAPEDEV_IRQ_INIT_DONE 
-	istatus = tapedev_ior(dev, TAPEDEV_IRQ_STATUS_ADDR);
+	ir_status = tapedev_ior(dev, TAPEDEV_IRQ_STATUS_ADDR);
 
-	uint32_t is_init_done = istatus & (1 << TAPEDEV_IRQ_INIT_DONE);
-	uint32_t is_hardware_error = istatus & (1 << TAPEDEV_IRQ_HW_ERROR);
+	uint32_t is_init_done = ir_status & (1 << TAPEDEV_IRQ_INIT_DONE);
+	uint32_t is_hardware_error = ir_status & (1 << TAPEDEV_IRQ_HW_ERROR);
 
 	dev_status = tapedev_ior(dev, TAPEDEV_STATUS_ADDR);
 	num_sections = tapedev_ior(dev, TAPEDEV_SECTIONS_ADDR);
@@ -169,7 +180,7 @@ static irqreturn_t tapedev_interrupt_handler(int irq, void *opaque_dev)
 
 	spin_unlock_irqrestore(&dev->s_lock, flags);
 
-	return IRQ_RETVAL(istatus);
+	return IRQ_RETVAL(ir_status);
 }
 
 // good link with blk dev: https://olegkutkov.me/2020/02/10/linux-block-device-driver/
@@ -177,6 +188,7 @@ static irqreturn_t tapedev_interrupt_handler(int irq, void *opaque_dev)
 static int tapedev_disk_open(struct gendisk *disk, fmode_t mode)
 {
     //...
+	pr_info("tapedev_disk_open\n");
 
     return 0;
 }
@@ -184,17 +196,18 @@ static int tapedev_disk_open(struct gendisk *disk, fmode_t mode)
 static void tapedev_disk_release(struct gendisk *gd)
 {
     //...
-
+	pr_info("tapedev_disk_release\n");
     return;
 }
 
-#define TAPEDEV_IOCTL_GET_INFO             _IOR('~', 0, struct tapedev_sect_info)
 
 struct tapedev_sect_info {
     uint32_t tapes;
     uint32_t tape_type;
     uint32_t current_tape;
 };
+
+#define TAPEDEV_IOCTL_GET_INFO             _IOR('~', 0, struct tapedev_sect_info)
 
 static int tapedev_ioctl(struct block_device *bdev, blk_mode_t mode, unsigned cmd, unsigned long arg)
 {
@@ -285,9 +298,8 @@ static inline int init_tag_set(struct blk_mq_tag_set *set, void *data)
 	return blk_mq_alloc_tag_set(set);
 }
 
-// Each gdisk will be our block device, i.e. for:
+// Each tape type is a separate section with gdisk which is our block device, 
 // tape_types":[0,1,2,3,4],"tapes":[50,40,30,20,10]}
-// We will have one gdisk, which will have file /dev/tapedevX
 // Each minor of this gdisk is a SECTION, each section will have file /dev/tapedevXsN
 static int create_section(
 	struct section **new_section,
@@ -325,11 +337,23 @@ static int create_section(
 	s->section_type = sec_type;
 	s->n_tapes = n_tapes;
 	s->n_sectors = GET_NBR_OF_SECTORS(sec_type, n_tapes);
+	s->private_data = tape_dev;
+	// s->data_buf = kzalloc(SIZE_OF_TAPE(s->section_type) * s->n_sectors, GFP_KERNEL);
+
+	// TODO: currently for each section we have only one such dma buff, but probably
+	// 	we will need many for one section?
+	if (!(s->data_cpu = dma_alloc_coherent(&tape_dev->pdev->dev,
+			PAGE_SIZE,
+			&s->data_dma, GFP_KERNEL))) 
+	{
+		pr_err("%s:%u: Failed to dma_alloc_coherent\n", __func__, __LINE__);
+		goto free_alloc_s;
+	}
 
 	err = init_tag_set(&s->tag_set, s);
 	if (err) {
 		pr_err("%s:%u: Failed to allocate tag set\n", __func__, __LINE__);
-		goto free_alloc_s;
+		goto free_dma_alloc;
 	}
 
 
@@ -367,7 +391,7 @@ static int create_section(
 	// gendisk, minors in these gendisk will be our tapes i.e. we get 50 tapes, we 
 	// need 50 minors.
 	// Each tape has SIZE_OF_TAPE so every tape will have SIZE_OF_TAPE / 512 sectors
-	set_capacity(s->gdisk, (SIZE_OF_TAPE(sec_type) / 512) * n_tapes);
+	set_capacity(s->gdisk, GET_NBR_OF_SECTORS(sec_type, n_tapes));
 
 
 	*new_section = s;
@@ -378,6 +402,8 @@ static int create_section(
 
 free_tag_set:
 	blk_mq_free_tag_set(&s->tag_set);
+free_dma_alloc:
+	dma_free_coherent(&tape_dev->pdev->dev, PAGE_SIZE, s->data_cpu, s->data_dma);
 free_alloc_s:
 	kfree(s);
 fail:
@@ -438,8 +464,9 @@ static int tapedev_probe(
 )
 {
 	// When OS discovers that tape device is connect to PCI BUS (and it is since we
-	// have modified QEMU installed) it invokes this function and passes tape 
-	// device's struct (which holds all info about the device) which is pdev
+	// have modified QEMU installed) it invokes this function and passes pdev struct 
+	// which holds all info about the device
+
 	int err;
 
 	// So now is the time to allocate our internal device structure in which we will 
@@ -494,7 +521,7 @@ static int tapedev_probe(
 	// state.
 	// We must enable our device BEFORE accessing its registers/memory
 	if ((err = pci_enable_device(pdev)))
-		goto out_enable;
+		goto out_pci_enable;
 
 	// DMA
 	// We inform the DMA subsystem about the address size supported by the device 
@@ -539,7 +566,11 @@ static int tapedev_probe(
 	// 0xffffffff in binary consists of only ones, we are xoring here so that 
 	// INIT_DONE and HW_ERROR bits are zeroed, meaning these intrpts will be enabled
 	// others are disabled
-	tapedev_iow(tape_dev, TAPEDEV_IRQ_MASK_ADDR, (0xffffffff ^ TAPEDEV_IRQ_INIT_DONE) ^ TAPEDEV_IRQ_HW_ERROR);
+	tapedev_iow(
+		tape_dev, 
+		TAPEDEV_IRQ_MASK_ADDR, 
+		(0xffffffff ^ (1 << TAPEDEV_IRQ_INIT_DONE)) ^ (1 << TAPEDEV_IRQ_HW_ERROR)
+	);
 
 	tapedev_iow(tape_dev, TAPEDEV_ENABLE_ADDR, 1);
 
@@ -574,59 +605,12 @@ static int tapedev_probe(
 	// 	goto free_sections;
 	// }
 
+	err = create_sections(tape_dev, num_sections);
+	if (err) goto free_parent_dev;
 
-	int first_minor = 0;
-	int s_id;
+	err = add_section_disks(tape_dev, num_sections);
+	if (err) goto free_parent_dev;
 
-	// Create all sections for this device
-	for (s_id = 1; s_id <= num_sections; s_id++)
-	{
-		int n_tapes = section_ior(tape_dev, GET_SECTION_ADDR(s_id),TAPEDEV_SECT_TAPES_ADDR);
-		int sec_type = section_ior(tape_dev, GET_SECTION_ADDR(s_id),TAPEDEV_SECT_TAPE_SIZE_ADDR);
-
-		err = create_section(&(tape_dev->sections[s_id]), s_id, sec_type, n_tapes, tape_dev->idx, &first_minor, tape_dev);
-
-		if (err < 0)
-		{
-			for (int i = 1; i <= s_id; i++)
-			{
-				// put_disk decrements gendisk refcount, if it reaches 0 gendisk is 
-				// freed, since we've just allocated gendisk struct there might at 
-				// most 1 ref to it thus put_disk will free dev.gendisk
-				// We didnt use add_disk yet so we dont need to use del_gendisk
-				// del_gendisk(tape_dev->sections[i]->gdisk);
-				put_disk(tape_dev->sections[i]->gdisk);
-				kfree(tape_dev->sections[i]);
-			}
-			goto free_parent_dev;
-		}
-
-	}
-
-	// Adding all section disks
-	for (s_id = 1; s_id <= num_sections; s_id++)
-	{
-		// err = device_add_disk(&tape_dev->pdev->dev, tape_dev->sections[s_id]->gdisk, NULL);
-		pr_info("%s:%u: adding disk for section: %d \n", __func__, __LINE__, s_id);
-		err = add_disk(tape_dev->sections[s_id]->gdisk);
-
-		if (err < 0)
-		{
-			pr_info("%s:%u: add_disk failed for device: %d, s_id: %d, err: '%d'\n", __func__, __LINE__, tape_dev->idx, s_id, err);
-			for (int i = 1; i <= num_sections; i++)
-			{
-				// where add_disk was successful we need to call del_gendisk
-				// del_gendisk needed only when __device_add_disk was invoked, but we
-				// used only add_disk
-				// if (i < s_id)
-				// 	del_gendisk(tape_dev->sections[i]->gdisk);
-				// for the rest put_disk and kfree is enough
-				put_disk(tape_dev->sections[i]->gdisk);
-				kfree(tape_dev->sections[i]);
-			}
-			goto free_parent_dev;
-		}
-	}
 	// TODO: add blk dev impl
 
 	return 0;
@@ -644,7 +628,7 @@ out_bar:
 out_regions:
 out_dma_mask:
 	pci_disable_device(pdev);
-out_enable:
+out_pci_enable:
 	mutex_lock(&tapedev_devices_lock);
 	tapedev_devices[i] = NULL;
 	mutex_unlock(&tapedev_devices_lock);
@@ -666,7 +650,7 @@ static void tapedev_remove(struct pci_dev *pdev)
 
 	for (int s_id = 1; s_id <= tape_dev->n_sections; s_id++)
 	{
-		del_gendisk(tape_dev->sections[s_id]->gdisk);
+		// del_gendisk(tape_dev->sections[s_id]->gdisk);
 		put_disk(tape_dev->sections[s_id]->gdisk);
 		kfree(tape_dev->sections[s_id]);
 	}
@@ -751,6 +735,77 @@ static void cleanup_tapedev(void)
 }
 module_init(init_tapedev);
 module_exit(cleanup_tapedev);
+
+
+
+int create_sections(struct tapedev_device *tape_dev, int num_sections)
+{
+	int err;
+	int first_minor = 0;
+	int s_id;
+
+	// Create all sections for this device
+	for (s_id = 1; s_id <= num_sections; s_id++)
+	{
+		int n_tapes = section_ior(tape_dev, GET_SECTION_ADDR(s_id),TAPEDEV_SECT_TAPES_ADDR);
+		int sec_type = section_ior(tape_dev, GET_SECTION_ADDR(s_id),TAPEDEV_SECT_TAPE_SIZE_ADDR);
+
+		err = create_section(&(tape_dev->sections[s_id]), s_id, sec_type, n_tapes, tape_dev->idx, &first_minor, tape_dev);
+
+		if (err < 0)
+		{
+			pr_err("%s:%u: failed to create_section for id: %d\n", __func__, __LINE__, s_id);
+			for (int i = 1; i <= s_id; i++)
+			{
+				// put_disk decrements gendisk refcount, if it reaches 0 gendisk is 
+				// freed, since we've just allocated gendisk struct there might at 
+				// most 1 ref to it thus put_disk will free dev.gendisk
+				// We didnt use add_disk yet so we dont need to use del_gendisk
+				// del_gendisk(tape_dev->sections[i]->gdisk);
+				put_disk(tape_dev->sections[i]->gdisk);
+				kfree(tape_dev->sections[i]);
+			}
+			return err;
+		}
+	}
+	return 0;
+}
+
+int add_section_disks(struct tapedev_device *tape_dev, int num_sections)
+{
+	int s_id, err;
+	// Adding all section disks
+	for (s_id = 1; s_id <= num_sections; s_id++)
+	{
+		// err = device_add_disk(&tape_dev->pdev->dev, tape_dev->sections[s_id]->gdisk, NULL);
+		pr_info("%s:%u: adding disk for section: %d \n", __func__, __LINE__, s_id);
+		err = add_disk(tape_dev->sections[s_id]->gdisk);
+
+		if (err < 0)
+		{
+			pr_info("%s:%u: add_disk failed for device: %d, s_id: %d, err: '%d'\n", __func__, __LINE__, tape_dev->idx, s_id, err);
+			for (int i = 1; i <= num_sections; i++)
+			{
+				struct section *s = tape_dev->sections[i];
+				// where add_disk was successful we need to call del_gendisk
+				// del_gendisk needed only when __device_add_disk was invoked, but we
+				// used only add_disk
+				// if (i < s_id)
+				// 	del_gendisk(tape_dev->sections[i]->gdisk);
+				// for the rest put_disk and kfree is enough
+
+				blk_mq_free_tag_set(&s->tag_set);
+				dma_free_coherent(&tape_dev->pdev->dev, PAGE_SIZE, s->data_cpu, s->data_dma);
+				put_disk(s->gdisk);
+				kfree(s);
+			}
+			return err;	
+		}
+	}
+	return 0;
+}
+
+
 
 MODULE_LICENSE("GPL");
 MODULE_AUTHOR("Krzysztof Lembryk");
