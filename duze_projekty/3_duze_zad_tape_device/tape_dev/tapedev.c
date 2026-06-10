@@ -16,6 +16,7 @@
 #include <linux/pci.h>
 #include <linux/dma-mapping.h>
 #include <linux/mmzone.h>
+#include <linux/delay.h>
 
 #define MAX_DEVICES_TAPEDEV 256
 #define BASE_MINOR 0
@@ -43,11 +44,12 @@ static dev_t tapedev_major;
 
 struct section
 {
-	int idx;
+	uint32_t idx;
 	uint32_t n_tapes;
 	// 0 to 4, to calc size of tape for this section use SIZE_OF_TAPE macro
 	uint32_t section_type; 	
 	sector_t n_sectors;
+	uint32_t current_tape;
 	/*
 		gendisk is kernel's representation of of an individual DISK DEVICE
 	*/
@@ -64,7 +66,7 @@ struct section
 
 // We will make an array of tapedev_devices, each will have its own gdisk etc
 struct tapedev_device {
-	int idx;
+	uint32_t idx;
 	struct pci_dev *pdev;
 	void __iomem *bar;
 	spinlock_t s_lock;
@@ -76,6 +78,7 @@ struct tapedev_device {
 	// struct list_head buffers_running;
 	wait_queue_head_t wq_free;
 	wait_queue_head_t wq_idle;
+	int init_status;
 }; 
 
 // Global static variables are initialized to NULL, so now we have array of NULLs
@@ -84,6 +87,46 @@ static DEFINE_MUTEX(tapedev_devices_lock);
 
 static struct class tapedev_class = {
 	.name = "tapedev",
+};
+
+// https://medium.com/@emanuele.santini.88/sysfs-in-linux-kernel-a-complete-guide-part-1-c3629470fc84
+static ssize_t tape_type_show(struct device *dev, struct device_attribute *attr, char *buf)
+{
+	struct gendisk *disk = dev_to_disk(dev);
+	struct section *s = disk->private_data;
+	pr_info("tape_type_show -- section_type: %u\n", s->section_type);
+	return sysfs_emit(buf, "%u\n", s->section_type);
+}
+
+static ssize_t tapes_show(struct device *dev, struct device_attribute *attr, char *buf)
+{
+	struct gendisk *disk = dev_to_disk(dev);
+	struct section *s = disk->private_data;
+	pr_info("tapes_show -- tapes: %u\n", s->n_tapes);
+	return sysfs_emit(buf, "%u\n", s->n_tapes);
+}
+
+static ssize_t current_tape_show(struct device *dev, struct device_attribute *attr, char *buf)
+{
+	struct gendisk *disk = dev_to_disk(dev);
+	struct section *s = disk->private_data;
+	return sysfs_emit(buf, "%u\n", s->current_tape);
+}
+
+static DEVICE_ATTR_RO(tape_type);
+static DEVICE_ATTR_RO(tapes);
+static DEVICE_ATTR_RO(current_tape);
+
+static struct attribute *tape_attrs[] = {
+ &dev_attr_tape_type.attr,
+ &dev_attr_tapes.attr,
+ &dev_attr_current_tape.attr,
+ NULL,
+};
+
+static const struct attribute_group tape_attr_group = {
+	.name = "tape",
+	.attrs = tape_attrs
 };
 
 // helpers pre-decl
@@ -141,7 +184,6 @@ static irqreturn_t tapedev_interrupt_handler(int irq, void *opaque_dev)
 	uint32_t num_sections;
 	uint32_t dev_status;
 	
-
 	// saves the interrupt state before taking the spin lock
 	spin_lock_irqsave(&dev->s_lock, flags);
 
@@ -171,13 +213,17 @@ static irqreturn_t tapedev_interrupt_handler(int irq, void *opaque_dev)
 	pr_warn("%s:%u: device status: %u\n", __func__, __LINE__, dev_status);
 	pr_warn("%s:%u: nums sections: %u\n", __func__, __LINE__, num_sections);
 
-	for (int s_id = 1; s_id <= num_sections; s_id++)
+	for (uint32_t s_id = 1; s_id <= num_sections; s_id++)
 	{
 		uint32_t n_tapes = section_ior(dev, GET_SECTION_ADDR(s_id),TAPEDEV_SECT_TAPES_ADDR);
 		uint32_t sec_type = section_ior(dev, GET_SECTION_ADDR(s_id),TAPEDEV_SECT_TAPE_SIZE_ADDR);
 		pr_warn("%s:%u: section type: %u, num of tapes: %u\n", __func__, __LINE__, sec_type, n_tapes);
 	}
 
+
+	pr_info("Init successfully done, we set this information in our tape_dev and free waiting thread\n");
+	dev->init_status = 1;
+	wake_up(&dev->wq_idle);
 	spin_unlock_irqrestore(&dev->s_lock, flags);
 
 	return IRQ_RETVAL(ir_status);
@@ -230,8 +276,51 @@ static const struct block_device_operations tapedev_ops = {
 	.ioctl = tapedev_ioctl
 };
 
+// 
+
 static inline int process_request(struct request *rq, unsigned int *nr_bytes)
 {
+	/*
+		struct request has the following interesting us fields:
+			- blk_opf_t cmd_flags -- type of request described by the struct 
+				request, we allow only REQ_OP_READ and REQ_OP_WRITE;
+			- struct request_queue *q -- from it we can get queuedata (our section*),
+				also it stores next requests
+			- struct bio *bio -- field indicating the first bio structure included 
+				in the request 
+			- struct request *rq_next -- points to the next struct request structure 
+				in the request queue
+	
+		What is struct bio_vec - a contiguous range of physical memory addresses
+		@bv_page:   First page associated with the address range.
+		@bv_len:    Number of bytes in the address range.
+		@bv_offset: Start of the address range relative to the start of @bv_page.
+				in bv_page might be data we dont want, thus we start reading from offset to read only specific data we want from this page
+				
+				page 
+			-------------
+			|			|
+			| some data	|
+			|			|
+			-------------  --
+			|  offset	|   |
+			|			|   |
+			| our data	|	| bv_len
+			|			|	|
+			|			|	|
+			-------------  --
+			|			|
+			| some data |
+			|			|
+			-------------
+	
+		All pages within a bio_vec starting from @bv_page are contiguous and
+		can simply be iterated.
+
+		Basically one request stores a list of bio, each bio stores a list of 
+		bio_vecs, and each bio_vec knows which part of given page we want to 
+		read/write
+	*/
 	int ret = 0;
 	struct bio_vec bvec;
 	struct req_iterator iter;
@@ -239,17 +328,34 @@ static inline int process_request(struct request *rq, unsigned int *nr_bytes)
 	loff_t pos = blk_rq_pos(rq) << SECTOR_SHIFT;
 	loff_t dev_size = (s->n_sectors << SECTOR_SHIFT);
 
+
 	rq_for_each_segment(bvec, rq, iter) {
-		unsigned long len = bvec.bv_len;
+		// bvec is populated with current memory segment we want to read/write
+		// so from bv_page number we get page_addres, and jump to offset we want to
+		// read from this page. We read bv_len bytes 
 		void *buf = page_address(bvec.bv_page) + bvec.bv_offset;
+		unsigned long len = bvec.bv_len;
+
+		pr_warn("%s:%u: %u sectors from %llu\n",
+			__func__, __LINE__, bio_sectors(iter.bio),
+			iter.bio->bi_iter.bi_sector);
 
 		if ((pos + len) > dev_size)
 			len = (unsigned long)(dev_size - pos);
 
-		if (rq_data_dir(rq))
-			memcpy(s->data + pos, buf, len); /* WRITE */
-		else
-			memcpy(buf, s->data + pos, len); /* READ */
+		switch (req_op(rq)) {
+		case REQ_OP_READ:
+			pr_info("process_request READ");
+			memcpy(buf, s->data_cpu + pos, len); /* READ */
+			return 0;
+		case REQ_OP_WRITE:
+			memcpy(s->data_cpu + pos, buf, len); /* WRITE */
+			pr_info("process_request WRITE");
+			return 0;
+		default:
+			blk_dump_rq_flags(rq, TAPEDEV_NAME " bad request");
+			return BLK_STS_IOERR;
+		}
 
 		pos += len;
 		*nr_bytes += len;
@@ -260,6 +366,10 @@ static inline int process_request(struct request *rq, unsigned int *nr_bytes)
 
 static blk_status_t _queue_rq(struct blk_mq_hw_ctx *hctx, const struct blk_mq_queue_data *bd)
 {
+	// struct request_queue *q = hctx->queue;
+	// struct section *s = q->queuedata;
+	// struct tapedev_device *dev = s->private_data;
+
 	unsigned int nr_bytes = 0;
 	blk_status_t status = BLK_STS_OK;
 	struct request *rq = bd->rq;
@@ -303,10 +413,10 @@ static inline int init_tag_set(struct blk_mq_tag_set *set, void *data)
 // Each minor of this gdisk is a SECTION, each section will have file /dev/tapedevXsN
 static int create_section(
 	struct section **new_section,
-	int section_id,
-	int sec_type, 
-	int n_tapes,
-	int device_id,
+	uint32_t section_id,
+	uint32_t sec_type, 
+	uint32_t n_tapes,
+	uint32_t device_id,
 	int *first_minor,
 	struct tapedev_device *tape_dev
 )
@@ -347,6 +457,7 @@ static int create_section(
 			&s->data_dma, GFP_KERNEL))) 
 	{
 		pr_err("%s:%u: Failed to dma_alloc_coherent\n", __func__, __LINE__);
+		err = -ENOMEM;
 		goto free_alloc_s;
 	}
 
@@ -357,6 +468,7 @@ static int create_section(
 	}
 
 
+	// inside blk_mq_alloc_disk we set queuedata to s
 	s->gdisk = blk_mq_alloc_disk(&s->tag_set, &lim, s);
 	if (IS_ERR_OR_NULL(s->gdisk)) 
 	{
@@ -380,9 +492,14 @@ static int create_section(
 	// s->gdisk->minors = n_tapes;
 	s->gdisk->fops = &tapedev_ops;
 	// s or maybe tape_dev??
-	s->gdisk->private_data = tape_dev;
+	s->gdisk->private_data = s;
+
+	pr_warn("s->gdisk->private_data->n_tapes: %u\n",((struct section*)(s->gdisk->private_data))->n_tapes);
+
+	pr_warn("s->gdisk->private_data->section_type: %u\n",((struct section*)(s->gdisk->private_data))->section_type);
+
 	// disk_name shows up in /proc/partitions and sysfs and /dev/
-	snprintf(s->gdisk->disk_name, 15, "tapedev%ds%d", device_id, section_id - 1);
+	snprintf(s->gdisk->disk_name, 15, "tapedev%us%u", device_id, section_id - 1);
 
 	// We should set capacity of the disk by using set_capacity, to this function 
 	// we pass HOW MANY 512 byte SECTORS our disk has; 8192 / 512 = 16, so by using 
@@ -483,6 +600,7 @@ static int tapedev_probe(
 	pci_set_drvdata(pdev, tape_dev);
 	// In our dev struct we also need to remember pdev for the same reasons
 	tape_dev->pdev = pdev;
+	tape_dev->init_status = 0;
 
 	// init locks mutexes etc
 	spin_lock_init(&tape_dev->s_lock);
@@ -493,7 +611,7 @@ static int tapedev_probe(
 	// We allow many tapedev devices, but every such device we need to store 
 	// somewhere, so now we find first free index for our newly created device
 	mutex_lock(&tapedev_devices_lock);
-	int i;
+	uint32_t i;
 	for (i = 0; i < MAX_DEVICES_TAPEDEV; i++)
 	{
 		// given spot is free so we break
@@ -574,6 +692,27 @@ static int tapedev_probe(
 
 	tapedev_iow(tape_dev, TAPEDEV_ENABLE_ADDR, 1);
 
+	// After enabling device we NEED TO WAIT for it to SUCCESSFULLY INIT, before 
+	// doing anything
+
+	unsigned long flags;
+	spin_lock_irqsave(&tape_dev->s_lock, flags);
+	while (!tape_dev->init_status) 
+	{
+		spin_unlock_irqrestore(&tape_dev->s_lock, flags);
+		if (wait_event_interruptible(tape_dev->wq_idle, tape_dev->init_status))
+			return -ERESTARTSYS;
+		spin_lock_irqsave(&tape_dev->s_lock, flags);
+	}
+
+	spin_unlock_irqrestore(&tape_dev->s_lock, flags);
+	if (tape_dev->init_status < 0)
+	{
+		pr_err("Device init Failed\n");
+		// TODO: add goto that frees resources
+		return -1;
+	}
+
 	// After enabling device we need to read num_sections data from it
 	uint32_t num_sections = tapedev_ior(tape_dev, TAPEDEV_SECTIONS_ADDR);
 
@@ -604,6 +743,7 @@ static int tapedev_probe(
 	// 	pr_warn("%s:%u: create_parent_dev failed, err: %d\n", __func__, __LINE__, err);
 	// 	goto free_sections;
 	// }
+
 
 	err = create_sections(tape_dev, num_sections);
 	if (err) goto free_parent_dev;
@@ -650,7 +790,8 @@ static void tapedev_remove(struct pci_dev *pdev)
 
 	for (int s_id = 1; s_id <= tape_dev->n_sections; s_id++)
 	{
-		// del_gendisk(tape_dev->sections[s_id]->gdisk);
+		sysfs_remove_group(&disk_to_dev(tape_dev->sections[s_id]->gdisk)->kobj, &tape_attr_group);
+		del_gendisk(tape_dev->sections[s_id]->gdisk);
 		put_disk(tape_dev->sections[s_id]->gdisk);
 		kfree(tape_dev->sections[s_id]);
 	}
@@ -742,13 +883,15 @@ int create_sections(struct tapedev_device *tape_dev, int num_sections)
 {
 	int err;
 	int first_minor = 0;
-	int s_id;
+	uint32_t s_id;
 
 	// Create all sections for this device
 	for (s_id = 1; s_id <= num_sections; s_id++)
 	{
-		int n_tapes = section_ior(tape_dev, GET_SECTION_ADDR(s_id),TAPEDEV_SECT_TAPES_ADDR);
-		int sec_type = section_ior(tape_dev, GET_SECTION_ADDR(s_id),TAPEDEV_SECT_TAPE_SIZE_ADDR);
+		uint32_t n_tapes = section_ior(tape_dev, GET_SECTION_ADDR(s_id),TAPEDEV_SECT_TAPES_ADDR);
+		uint32_t sec_type = section_ior(tape_dev, GET_SECTION_ADDR(s_id),TAPEDEV_SECT_TAPE_SIZE_ADDR);
+
+		pr_info("create_sections :: s_id: %u, n_tapes: %u, sec_type: %u\n", s_id, n_tapes, sec_type);
 
 		err = create_section(&(tape_dev->sections[s_id]), s_id, sec_type, n_tapes, tape_dev->idx, &first_minor, tape_dev);
 
@@ -773,25 +916,56 @@ int create_sections(struct tapedev_device *tape_dev, int num_sections)
 
 int add_section_disks(struct tapedev_device *tape_dev, int num_sections)
 {
-	int s_id, err;
+	int err;
+	uint32_t s_id;
 	// Adding all section disks
 	for (s_id = 1; s_id <= num_sections; s_id++)
 	{
 		// err = device_add_disk(&tape_dev->pdev->dev, tape_dev->sections[s_id]->gdisk, NULL);
-		pr_info("%s:%u: adding disk for section: %d \n", __func__, __LINE__, s_id);
+		// pr_info("%s:%u: adding disk for section: %d \n", __func__, __LINE__, s_id);
 		err = add_disk(tape_dev->sections[s_id]->gdisk);
+        if (err < 0) {
+            pr_err("failed to create sysfs group for tapedevXsN\n");
+            // Optional: delete disk and handle error
+        }
 
+		// TODO: remove code duplication
 		if (err < 0)
 		{
-			pr_info("%s:%u: add_disk failed for device: %d, s_id: %d, err: '%d'\n", __func__, __LINE__, tape_dev->idx, s_id, err);
+			pr_err("%s:%u: add_disk failed for device: %d, s_id: %d, err: '%d'\n", __func__, __LINE__, tape_dev->idx, s_id, err);
 			for (int i = 1; i <= num_sections; i++)
 			{
 				struct section *s = tape_dev->sections[i];
 				// where add_disk was successful we need to call del_gendisk
 				// del_gendisk needed only when __device_add_disk was invoked, but we
 				// used only add_disk
-				// if (i < s_id)
-				// 	del_gendisk(tape_dev->sections[i]->gdisk);
+				if (i < s_id)
+					del_gendisk(tape_dev->sections[i]->gdisk);
+				// for the rest put_disk and kfree is enough
+
+				blk_mq_free_tag_set(&s->tag_set);
+				dma_free_coherent(&tape_dev->pdev->dev, PAGE_SIZE, s->data_cpu, s->data_dma);
+				put_disk(s->gdisk);
+				kfree(s);
+			}
+			return err;	
+		}
+
+		err = sysfs_create_group(
+			&disk_to_dev(tape_dev->sections[s_id]->gdisk)->kobj, 
+			&tape_attr_group
+		);
+
+		if (err < 0)
+		{
+			for (uint32_t i = 1; i <= num_sections; i++)
+			{
+				struct section *s = tape_dev->sections[i];
+				// where add_disk was successful we need to call del_gendisk
+				// del_gendisk needed only when __device_add_disk was invoked, but we
+				// used only add_disk
+				if (i <= s_id)
+					del_gendisk(tape_dev->sections[i]->gdisk);
 				// for the rest put_disk and kfree is enough
 
 				blk_mq_free_tag_set(&s->tag_set);
