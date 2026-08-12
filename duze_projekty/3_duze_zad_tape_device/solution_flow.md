@@ -2,7 +2,7 @@
 We insert our module into the kernel, then:
 
 - ```init_tapedev``` is invoked
-    - we register our block device by calling ```register_blkdev()```, it gives us major number and creates TAPEDEV_NAME in ```/proc/devices```, it doesn't create any device yet
+    - we register our block device by calling ```register_blkdev()```, it gives us major number and creates TAPEDEV_NAME in ```/proc/devices```, it doesn't create any device yet. Major number means that our driver will be used to handle all of tapedev devices.
 
     - then we ```class_register()``` our tapedev_class, it creates a class entry in ```/sys/class/tapedev``` and lets kernel track devices that belong to this class
 

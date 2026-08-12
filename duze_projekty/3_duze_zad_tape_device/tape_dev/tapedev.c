@@ -1,4 +1,5 @@
 #include "tapedev.h"
+#include "linux/irqreturn.h"
 #include "tapedev_defs.h"
 #include "tapedev_sysfs.h"
 #include "tapedev_iow_ior.h"
@@ -16,6 +17,7 @@
 #include <linux/interrupt.h>
 #include <linux/mmzone.h>
 #include <linux/delay.h>
+#include <stdint.h>
 
 #define MAX_DEVICES_TAPEDEV 256
 #define BASE_MINOR 0
@@ -29,6 +31,8 @@
 #define BASE_TAPE_SIZE (32 * 8192)
 #define SIZE_OF_TAPE(s_type) ((1 << s_type) * BASE_TAPE_SIZE)
 #define GET_NBR_OF_SECTORS(s_type, n_tapes) ((SIZE_OF_TAPE(s_type) / 512) * n_tapes)
+#define TAPEDEV_IRQ_SECT_X_DONE(i)  (TAPEDEV_IRQ_SECT_0_DONE  + (i))
+#define TAPEDEV_IRQ_SECT_X_ERROR(i) (TAPEDEV_IRQ_SECT_0_ERROR + (i))
 
 // Blk dev example impl
 // https://github.com/CodeImp/sblkdev/blob/master/device.c
@@ -38,7 +42,8 @@
 
 static dev_t tapedev_major;
 
-// Global static variables are initialized to NULL, so now we have array of NULLs
+// We probably should make a list of queues to store commands for sections
+// Global static variables are initialized to NULL, so now we have an array of NULLs
 static struct tapedev_device *tapedev_devices[MAX_DEVICES_TAPEDEV]; 
 
 // Needed to exclusively modify tapedev_devices array
@@ -76,47 +81,102 @@ static irqreturn_t tapedev_interrupt_handler(int irq, void *opaque_dev)
 	uint32_t ir_status;
 	uint32_t num_sections;
 	uint32_t dev_status;
+
+	// TOdo:
+	// We must add here an if else statement checking if tapedev already initialized
+	// if intiialized we skip checking init_done flag
+	// And only check HW_ERROR, TAPEDEV_IRQ_SECT_X_DONE and TAPEDEV_IRQ_SECT_X_ERROR
+	// We should do this in a loop and add macros (that make substitution for x with 
+	// 0, 1, ... in TAPEDEV_IRQ_SECT_X_DONE) to this loop so that all done 
+	// sections are handled in this interrupt, and after all sections are done, and 
+	// we save its data or sth we take next command from some queue and make our 
+	// tapedev do another command
+
 	
 	// saves the interrupt state before taking the spin lock
 	spin_lock_irqsave(&dev->s_lock, flags);
 
-	// We check if initialization of device ended by checking interrupt status value 
-	// in our device and if it is TAPEDEV_IRQ_INIT_DONE 
 	ir_status = tapedev_ior(dev, TAPEDEV_IRQ_STATUS_ADDR);
 
-	uint32_t is_init_done = ir_status & (1 << TAPEDEV_IRQ_INIT_DONE);
-	uint32_t is_hardware_error = ir_status & (1 << TAPEDEV_IRQ_HW_ERROR);
+	if (!dev->init_done)
+	{
+		uint32_t is_init_done = ir_status & (1 << TAPEDEV_IRQ_INIT_DONE);
 
-	dev_status = tapedev_ior(dev, TAPEDEV_STATUS_ADDR);
-	num_sections = tapedev_ior(dev, TAPEDEV_SECTIONS_ADDR);
+		if (is_init_done)
+		{
+			tapedev_iow(dev, TAPEDEV_IRQ_CLEAR_ADDR, (1 << TAPEDEV_IRQ_INIT_DONE));
+			pr_info("%s:%u: init done\n", __func__, __LINE__);
+			dev->init_done = 1;
 
+			// Some debug printing for now
+			dev_status = tapedev_ior(dev, TAPEDEV_STATUS_ADDR);
+			num_sections = tapedev_ior(dev, TAPEDEV_SECTIONS_ADDR);
+
+			pr_info("%s:%u: device status: %u\n", __func__, __LINE__, dev_status);
+			pr_info("%s:%u: nums sections: %u\n", __func__, __LINE__, num_sections);
+
+			for (uint32_t s_id = 1; s_id <= num_sections; s_id++)
+			{
+				uint32_t n_tapes = section_ior(dev, GET_SECTION_ADDR(s_id),TAPEDEV_SECT_TAPES_ADDR);
+				// Todo: add checking if section type is within allowed range
+				uint32_t sec_type = section_ior(dev, GET_SECTION_ADDR(s_id),TAPEDEV_SECT_TAPE_SIZE_ADDR);
+				pr_info("%s:%u: section type: %u, num of tapes: %u\n", __func__, __LINE__, sec_type, n_tapes);
+			}
+
+			// TODO: maybe we should check if any HW error happened? But if init was
+			// successful, maybe we don't have to do it.
+			wake_up(&dev->wq_idle);
+			spin_unlock_irqrestore(&dev->s_lock, flags);
+			return IRQ_HANDLED;
+		}
+		else
+		{
+			// We got interrupt for the device but device is not initialized yet, 
+			// sth went wrong, creating this device should fail
+			dev->init_done = -1;
+			pr_err("Init failed\n");
+			wake_up(&dev->wq_idle);
+			spin_unlock_irqrestore(&dev->s_lock, flags);
+			return IRQ_NONE;
+		}
+	}
+
+	// #############################################################################
+	// 	We know for sure our device is INITIALIZED, so we can check other flags
+	// #############################################################################
+
+	uint32_t is_hw_error = ir_status & (1 << TAPEDEV_IRQ_HW_ERROR);
 	// We always need to clear interrupt flag for given interrupt, so that this 
 	// interrupt is not fired endlessly
-	if (is_init_done)
-	{
-		tapedev_iow(dev, TAPEDEV_IRQ_CLEAR_ADDR, (1 << TAPEDEV_IRQ_INIT_DONE));
-		pr_warn("%s:%u: init done\n", __func__, __LINE__);
-	}
-	if (is_hardware_error)
+	if (is_hw_error)
 	{
 		tapedev_iow(dev, TAPEDEV_IRQ_CLEAR_ADDR, (1 << TAPEDEV_IRQ_HW_ERROR));
 		pr_warn("%s:%u: hardware error\n", __func__, __LINE__);
+		dev->status = -1;
+
+		wake_up(&dev->wq_idle);
+		spin_unlock_irqrestore(&dev->s_lock, flags);
+		return IRQ_NONE;
 	}
 
-	pr_warn("%s:%u: device status: %u\n", __func__, __LINE__, dev_status);
-	pr_warn("%s:%u: nums sections: %u\n", __func__, __LINE__, num_sections);
+	// #############################################################################
+	// 	We know there was NO HARDWARE ERROR in device
+	// 	We can check all TAPEDEV_IRQ_SECT_X_DONE and TAPEDEV_IRQ_SECT_X_ERROR 
+	// #############################################################################
 
-	for (uint32_t s_id = 1; s_id <= num_sections; s_id++)
+	// Max allowed number of sections is 8, we should check this
+	num_sections = tapedev_ior(dev, TAPEDEV_SECTIONS_ADDR);
+
+	int section_done = 0; 
+	int section_error = 0;
+	for (int sec_id = 0; sec_id < num_sections; sec_id++)
 	{
-		uint32_t n_tapes = section_ior(dev, GET_SECTION_ADDR(s_id),TAPEDEV_SECT_TAPES_ADDR);
-		// Todo: add checking if section type is within allowed range
-		uint32_t sec_type = section_ior(dev, GET_SECTION_ADDR(s_id),TAPEDEV_SECT_TAPE_SIZE_ADDR);
-		pr_warn("%s:%u: section type: %u, num of tapes: %u\n", __func__, __LINE__, sec_type, n_tapes);
+		section_done = tapedev_ior(dev, TAPEDEV_IRQ_SECT_X_DONE(sec_id));
+		section_error = tapedev_ior(dev, TAPEDEV_IRQ_SECT_X_ERROR(sec_id));
+
+		pr_info("%s:%u: section: %d, done: %d, error: %d\n", __func__, __LINE__, sec_id, section_done, section_error);
 	}
 
-
-	pr_info("Init successfully done, we set this information in our tape_dev and free waiting thread\n");
-	dev->init_status = 1;
 	wake_up(&dev->wq_idle);
 	spin_unlock_irqrestore(&dev->s_lock, flags);
 
@@ -147,18 +207,51 @@ struct tapedev_sect_info {
     uint32_t current_tape;
 };
 
+// #define cmd_name 	_IOX (type, nr, dataitem)
 #define TAPEDEV_IOCTL_GET_INFO             _IOR('~', 0, struct tapedev_sect_info)
+#define TAPEDEV_IOCTL_EJECT_TAPE           _IO('~', 1)
 
+// drivers/block/swim.c has floppy_ioctl impl for blk_dev
+// We assume that under variable: arg, user supplied ptr to buffer to which he wants
+// data to be written
 static int tapedev_ioctl(struct block_device *bdev, blk_mode_t mode, unsigned cmd, unsigned long arg)
 {
 	// bd_disk is gendisk
-	struct tapedev_device *dev = bdev->bd_disk->private_data;
+	struct section *sec = bdev->bd_disk->private_data;
+	struct tapedev_device *dev = sec->private_data;
 
-	pr_info("%s:%u: contol command [0x%x] received, for device: %d\n\n", __func__, __LINE__, cmd, dev->idx);
+	pr_info("%s:%u: ioctl command [0x%x] received, for device: %d, for section: %u\n\n", __func__, __LINE__, cmd, dev->idx, sec->idx);
+
+	unsigned long flags;
+	spin_lock_irqsave(&sec->lock, flags);
+
+	struct tapedev_sect_info sec_info = {
+		.tapes = sec->n_tapes,
+		.tape_type = sec->section_type,
+		.current_tape = sec->current_tape
+	};
+
+	spin_unlock_irqrestore(&sec->lock, flags);
 
 	switch (cmd) {
-	case TAPEDEV_IOCTL_GET_INFO:
+	case TAPEDEV_IOCTL_GET_INFO: {
+		pr_info("%s:%u: got TAPEDEV_IOCTL_GET_INFO ioctl cmd. sec_info = {\ntapes = %u,\ntape_type = %u,\ncurrent_tape = %u\n} \n", __func__, __LINE__, sec_info.tapes, sec_info.tape_type, sec_info.current_tape);
+
+		if (copy_to_user((void __user *) arg, (void *) &sec_info, sizeof(struct tapedev_sect_info)))
+			return -EFAULT;
 		return 0;
+	}
+	case TAPEDEV_IOCTL_EJECT_TAPE:
+	{
+		// wait until driver stops processing current read/write request, eject tape (if inserted).
+		pr_info("%s:%u: got TAPEDEV_IOCTL_EJECT_TAPE ioctl cmd. Current tape: %u  \n", __func__, __LINE__, sec_info.current_tape);
+
+		// TODO: add ejecting tape
+
+		if (copy_to_user((void __user *) arg, (void *) &sec_info.current_tape, sizeof(sec_info.current_tape)))
+			return -EFAULT;
+		return 0;
+	}
 	default:
 		return -ENOTTY;
 	}
@@ -171,7 +264,7 @@ static const struct block_device_operations tapedev_ops = {
 	.ioctl = tapedev_ioctl
 };
 
-// 
+// Multi queue and request processing functions
 
 static inline int process_request(struct request *rq, unsigned int *nr_bytes)
 {
@@ -303,121 +396,6 @@ static inline int init_tag_set(struct blk_mq_tag_set *set, void *data)
 	return blk_mq_alloc_tag_set(set);
 }
 
-// Each tape type is a separate section with gdisk which is our block device, 
-// tape_types":[0,1,2,3,4],"tapes":[50,40,30,20,10]}
-// Each minor of this gdisk is a SECTION, each section will have file /dev/tapedevXsN
-static int create_section(
-	struct section **new_section,
-	uint32_t section_id,
-	uint32_t sec_type, 
-	uint32_t n_tapes,
-	uint32_t device_id,
-	int *first_minor,
-	struct tapedev_device *tape_dev
-)
-{
-	struct queue_limits lim = {
-		.logical_block_size		= SECTOR_SIZE, 
-		/*
-			* To ensure that we always get PAGE_SIZE aligned and
-			* n*PAGE_SIZED sized I/O requests.
-			*/
-		.physical_block_size		= PHYSICAL_BLOCK_SIZE,
-		// .io_min				= PAGE_SIZE,
-		// .io_opt				= PAGE_SIZE,
-	};
-
-    int err;
-	struct section *s = kzalloc(sizeof(struct section), GFP_KERNEL);
-
-	if (!s)
-	{
-		pr_err("%s:%u: kzalloc failed\n", __func__, __LINE__);
-		err = -ENOMEM;
-		goto fail;
-	}
-
-	spin_lock_init(&s->lock);
-	s->idx = section_id;
-	s->section_type = sec_type;
-	s->n_tapes = n_tapes;
-	s->n_sectors = GET_NBR_OF_SECTORS(sec_type, n_tapes);
-	s->private_data = tape_dev;
-	// s->data_buf = kzalloc(SIZE_OF_TAPE(s->section_type) * s->n_sectors, GFP_KERNEL);
-
-	// TODO: currently for each section we have only one such dma buff, but probably
-	// 	we will need many for one section?
-	if (!(s->data_cpu = dma_alloc_coherent(&tape_dev->pdev->dev,
-			PAGE_SIZE,
-			&s->data_dma, GFP_KERNEL))) 
-	{
-		pr_err("%s:%u: Failed to dma_alloc_coherent\n", __func__, __LINE__);
-		err = -ENOMEM;
-		goto free_alloc_s;
-	}
-
-	// we set private driver_data to s
-	err = init_tag_set(&s->tag_set, s);
-	if (err) {
-		pr_err("%s:%u: Failed to allocate tag set\n", __func__, __LINE__);
-		goto free_dma_alloc;
-	}
-
-
-	// inside blk_mq_alloc_disk we set queuedata to s
-	s->gdisk = blk_mq_alloc_disk(&s->tag_set, &lim, s);
-	if (IS_ERR_OR_NULL(s->gdisk)) 
-	{
-		err = s->gdisk ? PTR_ERR(s->gdisk) : -ENOMEM;
-		pr_err("%s :: blk_mq_alloc_disk failed with error: %d\n", __func__, err);
-		goto free_tag_set;
-	}
-
-	// s->gdisk = blk_alloc_disk(NULL, NUMA_NO_NODE);
-	// if (IS_ERR_OR_NULL(s->gdisk)) 
-	// {
-	// 	err = s->gdisk ? PTR_ERR(s->gdisk) : -ENOMEM;
-	// 	pr_err("%s :: blk_alloc_disk failed with error: %d\n", __func__, err);
-	// 	goto free_alloc_s;
-	// }
-
-	// Should not be done by us as gendisk struct says
-	// s->gdisk->major = tapedev_major;
-	// s->gdisk->first_minor = *first_minor;
-	// *first_minor += n_tapes;
-	// s->gdisk->minors = n_tapes;
-	s->gdisk->fops = &tapedev_ops;
-	// s or maybe tape_dev??
-	s->gdisk->private_data = s;
-
-	// disk_name shows up in /proc/partitions and sysfs and /dev/
-	snprintf(s->gdisk->disk_name, 15, "tapedev%us%u", device_id, section_id - 1);
-
-	// We should set capacity of the disk by using set_capacity, to this function 
-	// we pass HOW MANY 512 byte SECTORS our disk has; 8192 / 512 = 16, so by using 
-	// TAPEDEV_SECT_TAPE_SIZE we can calculate how many sectors our tape has
-	// So this probably mean that each section in our tapedev needs to be a separate 
-	// gendisk, minors in these gendisk will be our tapes i.e. we get 50 tapes, we 
-	// need 50 minors.
-	// Each tape has SIZE_OF_TAPE so every tape will have SIZE_OF_TAPE / 512 sectors
-	set_capacity(s->gdisk, GET_NBR_OF_SECTORS(sec_type, n_tapes));
-
-
-	*new_section = s;
-
-	// We dont add_disk here yet, we will do that once all of them are ready
-
-	return 0;
-
-free_tag_set:
-	blk_mq_free_tag_set(&s->tag_set);
-free_dma_alloc:
-	dma_free_coherent(&tape_dev->pdev->dev, PAGE_SIZE, s->data_cpu, s->data_dma);
-free_alloc_s:
-	kfree(s);
-fail:
-	return err;
-}
 
 // static int create_parent_dev(
 // 	struct tapedev_device *tape_dev,
@@ -492,7 +470,8 @@ static int tapedev_probe(
 	pci_set_drvdata(pdev, tape_dev);
 	// In our dev struct we also need to remember pdev for the same reasons
 	tape_dev->pdev = pdev;
-	tape_dev->init_status = 0;
+	tape_dev->init_done = 0;
+	tape_dev->status = 0;
 
 	// init locks mutexes etc
 	spin_lock_init(&tape_dev->s_lock);
@@ -554,8 +533,8 @@ static int tapedev_probe(
 	// communicate with our device, send commands to it, read config data etc
 	// --> we can access BAR by using ioread*() and iowrite*(), these functions hide 
 	// 	the details if this is a MMIO or PIO address space and will just work
-	// --> maxlen specifies the maximum length to map. If you want to get access to 
-	// 	the complete BAR without checking for its length first, pass 0 here.
+	// --> maxlen specifies the maximum length to map. If we want to get access to 
+	// 	the complete BAR without checking for its length first, we pass 0 here.
 	if (!(tape_dev->bar = pci_iomap(pdev, BAR_ID, BAR_MAXLEN))) {
 		err = -ENOMEM;
 		goto out_bar;
@@ -591,20 +570,29 @@ static int tapedev_probe(
 	// doing anything
 	unsigned long flags;
 	spin_lock_irqsave(&tape_dev->s_lock, flags);
-	while (!tape_dev->init_status) 
+
+	while (!tape_dev->init_done) 
 	{
 		spin_unlock_irqrestore(&tape_dev->s_lock, flags);
-		if (wait_event_interruptible(tape_dev->wq_idle, tape_dev->init_status))
+		if (wait_event_interruptible(tape_dev->wq_idle, tape_dev->init_done))
 			return -ERESTARTSYS;
 		spin_lock_irqsave(&tape_dev->s_lock, flags);
 	}
 
-	if (tape_dev->init_status < 0)
+	if (tape_dev->init_done < 0)
 	{
-		pr_err("Device init Failed\n");
+		pr_err("Device: %u init Failed\n", tape_dev->idx);
 		spin_unlock_irqrestore(&tape_dev->s_lock, flags);
-		// TODO: add goto that frees resources
-		return -1;
+		err = -ENODEV;
+		goto init_fail;
+	}
+
+	if (tape_dev->status < 0)
+	{
+		pr_err("Device %u encountered error: %d\n", tape_dev->idx, tape_dev->status);
+		spin_unlock_irqrestore(&tape_dev->s_lock, flags);
+		err = -EIO;
+		goto init_fail;
 	}
 
 	spin_unlock_irqrestore(&tape_dev->s_lock, flags);
@@ -614,21 +602,21 @@ static int tapedev_probe(
 
 	if (num_sections <= 0 || num_sections > 8)
 	{
-		pr_warn("%s:%u: provided num_sections (%d) is not in [1,8] interval\n", __func__, __LINE__, num_sections);
+		pr_err("%s:%u: provided num_sections (%d) is not in [1,8] interval\n", __func__, __LINE__, num_sections);
 		err = -EINVAL;
 		goto out_bad_num_sec;
 	}
 
 	tape_dev->n_sections = num_sections;
 	// We count sections from id = 1, so we will have space for section at 0 idx but 
-	// it will never be allocated but, I chose this instead of remembering to always 
+	// it will never be allocated, I chose this instead of remembering to always 
 	// subtract 1 from section_id
 	tape_dev->sections = kzalloc(sizeof(struct section*) * (num_sections + 1), GFP_KERNEL);
 
 	if (IS_ERR_OR_NULL(tape_dev->sections))
 	{
 		err = -ENOMEM;
-		pr_warn("%s:%u: sections = kzalloc failed, err: %d\n", __func__, __LINE__, err);
+		pr_err("%s:%u: sections = kzalloc failed, err: %d\n", __func__, __LINE__, err);
 		goto sections_alloc_fail;
 	}
 
@@ -642,19 +630,36 @@ static int tapedev_probe(
 
 
 	err = create_sections(tape_dev, num_sections);
-	if (err) goto free_parent_dev;
+	if (err) goto free_sections;
 
 	err = add_section_disks(tape_dev, num_sections);
-	if (err) goto free_parent_dev;
+	if (err) goto free_sections;
+
+	// now we can enable section interrupts
+	// TODO: Or maybe we can check how many sections dev has before creating sections
+	// ?
+	uint32_t mask = (0xffffffff ^ (1 << TAPEDEV_IRQ_INIT_DONE)) ^ (1 << TAPEDEV_IRQ_HW_ERROR);
+
+	// Now we enable interrupts for this device's sections
+	for (int sec_id = 0; i < num_sections; i++)
+	{
+		mask = mask ^ (1 << TAPEDEV_IRQ_SECT_X_DONE(sec_id));
+		mask = mask ^ (1 << TAPEDEV_IRQ_SECT_X_ERROR(sec_id));
+	}
+	tapedev_iow(
+		tape_dev, 
+		TAPEDEV_IRQ_MASK_ADDR, 
+		mask	
+	);
 
 	// TODO: add blk dev impl
 
 	return 0;
-free_parent_dev:
 	// put_disk(tape_dev->parent_gdisk);
-// free_sections:
+free_sections:
 	kfree(tape_dev->sections);
 sections_alloc_fail:
+init_fail:
 out_bad_num_sec:
 	tapedev_iow(tape_dev, TAPEDEV_ENABLE_ADDR, 0);
 out_irq:
@@ -774,6 +779,121 @@ module_init(init_tapedev);
 module_exit(cleanup_tapedev);
 
 
+// Each tape type is a separate section with gdisk which is our block device, 
+// tape_types":[0,1,2,3,4],"tapes":[50,40,30,20,10]}
+// Each minor of this gdisk is a SECTION, each section will have file /dev/tapedevXsN
+static int create_section(
+	struct section **new_section,
+	uint32_t section_id,
+	uint32_t sec_type, 
+	uint32_t n_tapes,
+	uint32_t device_id,
+	int *first_minor,
+	struct tapedev_device *tape_dev
+)
+{
+	struct queue_limits lim = {
+		.logical_block_size		= SECTOR_SIZE, 
+		/*
+			* To ensure that we always get PAGE_SIZE aligned and
+			* n*PAGE_SIZED sized I/O requests.
+			*/
+		.physical_block_size		= PHYSICAL_BLOCK_SIZE,
+		// .io_min				= PAGE_SIZE,
+		// .io_opt				= PAGE_SIZE,
+	};
+
+    int err;
+	struct section *s = kzalloc(sizeof(struct section), GFP_KERNEL);
+
+	if (!s)
+	{
+		pr_err("%s:%u: kzalloc failed\n", __func__, __LINE__);
+		err = -ENOMEM;
+		goto fail;
+	}
+
+	spin_lock_init(&s->lock);
+	s->idx = section_id;
+	s->section_type = sec_type;
+	s->n_tapes = n_tapes;
+	s->n_sectors = GET_NBR_OF_SECTORS(sec_type, n_tapes);
+	s->private_data = tape_dev;
+	// s->data_buf = kzalloc(SIZE_OF_TAPE(s->section_type) * s->n_sectors, GFP_KERNEL);
+
+	// TODO: currently for each section we have only one such dma buff, but probably
+	// 	we will need many for one section?
+	if (!(s->data_cpu = dma_alloc_coherent(&tape_dev->pdev->dev,
+			PAGE_SIZE,
+			&s->data_dma, GFP_KERNEL))) 
+	{
+		pr_err("%s:%u: Failed to dma_alloc_coherent\n", __func__, __LINE__);
+		err = -ENOMEM;
+		goto free_alloc_s;
+	}
+
+	// we set private driver_data to s
+	err = init_tag_set(&s->tag_set, s);
+	if (err) {
+		pr_err("%s:%u: Failed to allocate tag set\n", __func__, __LINE__);
+		goto free_dma_alloc;
+	}
+
+
+	// inside blk_mq_alloc_disk we set queuedata (which is private data) to s
+	s->gdisk = blk_mq_alloc_disk(&s->tag_set, &lim, s);
+	if (IS_ERR_OR_NULL(s->gdisk)) 
+	{
+		err = s->gdisk ? PTR_ERR(s->gdisk) : -ENOMEM;
+		pr_err("%s :: blk_mq_alloc_disk failed with error: %d\n", __func__, err);
+		goto free_tag_set;
+	}
+
+	// s->gdisk = blk_alloc_disk(NULL, NUMA_NO_NODE);
+	// if (IS_ERR_OR_NULL(s->gdisk)) 
+	// {
+	// 	err = s->gdisk ? PTR_ERR(s->gdisk) : -ENOMEM;
+	// 	pr_err("%s :: blk_alloc_disk failed with error: %d\n", __func__, err);
+	// 	goto free_alloc_s;
+	// }
+
+	// Should not be done by us as gendisk struct says
+	// s->gdisk->major = tapedev_major;
+	// s->gdisk->first_minor = *first_minor;
+	// *first_minor += n_tapes;
+	// s->gdisk->minors = n_tapes;
+	s->gdisk->fops = &tapedev_ops;
+	// s or maybe tape_dev??
+	s->gdisk->private_data = s;
+
+	// disk_name shows up in /proc/partitions and sysfs and /dev/
+	snprintf(s->gdisk->disk_name, 15, "tapedev%us%u", device_id, section_id - 1);
+
+	// We should set capacity of the disk by using set_capacity, to this function 
+	// we pass HOW MANY 512 byte SECTORS our disk has; 8192 / 512 = 16, so by using 
+	// TAPEDEV_SECT_TAPE_SIZE we can calculate how many sectors our tape has
+	// So this probably mean that each section in our tapedev needs to be a separate 
+	// gendisk, minors in these gendisk will be our tapes i.e. we get 50 tapes, we 
+	// need 50 minors.
+	// Each tape has SIZE_OF_TAPE so every tape will have SIZE_OF_TAPE / 512 sectors
+	set_capacity(s->gdisk, GET_NBR_OF_SECTORS(sec_type, n_tapes));
+
+
+	*new_section = s;
+
+	// We dont add_disk here yet, we will do that once all of them are ready
+
+	return 0;
+
+free_tag_set:
+	blk_mq_free_tag_set(&s->tag_set);
+free_dma_alloc:
+	dma_free_coherent(&tape_dev->pdev->dev, PAGE_SIZE, s->data_cpu, s->data_dma);
+free_alloc_s:
+	kfree(s);
+fail:
+	return err;
+}
 
 int create_sections(struct tapedev_device *tape_dev, int num_sections)
 {
