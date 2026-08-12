@@ -134,7 +134,7 @@ static irqreturn_t tapedev_interrupt_handler(int irq, void *opaque_dev)
 			// We got interrupt for the device but device is not initialized yet, 
 			// sth went wrong, creating this device should fail
 			dev->init_done = -1;
-			pr_err("Init failed\n");
+			pr_err("Init failed, we got other interrupt before init interrupt\n");
 			wake_up(&dev->wq_idle);
 			spin_unlock_irqrestore(&dev->s_lock, flags);
 			return IRQ_NONE;
@@ -169,12 +169,23 @@ static irqreturn_t tapedev_interrupt_handler(int irq, void *opaque_dev)
 
 	int section_done = 0; 
 	int section_error = 0;
+	// We need ejection queue, and once command for given section is done we take 
+	// spinlock, check if anyone wants to eject tape, if so we send command to eject 
+	// it, set variable in struct, wake up ejector, release spinlock, and end 
+	// handling this very section (once eject command is done it will raise an 
+	// interrupt and we will come back here)  
+
+	// In below loop we check if any section is DONE if so we can start next command.
+	// If given section is IDLE we firstly check if there are any new commands, if 
+	// there are we start new command, if not, we do nothing.
+
+	// We need a queue of 32-bit commands for every section
 	for (int sec_id = 0; sec_id < num_sections; sec_id++)
 	{
 		section_done = tapedev_ior(dev, TAPEDEV_IRQ_SECT_X_DONE(sec_id));
 		section_error = tapedev_ior(dev, TAPEDEV_IRQ_SECT_X_ERROR(sec_id));
-
-		pr_info("%s:%u: section: %d, done: %d, error: %d\n", __func__, __LINE__, sec_id, section_done, section_error);
+		uint32_t section_status = section_ior(dev, GET_SECTION_ADDR(sec_id + 1),TAPEDEV_SECT_STATUS_ADDR);
+		pr_info("%s:%u: section: %d, done: %d, error: %d, STATUS: %u\n", __func__, __LINE__, sec_id, section_done, section_error, section_status);
 	}
 
 	wake_up(&dev->wq_idle);
@@ -839,7 +850,6 @@ static int create_section(
 		goto free_dma_alloc;
 	}
 
-
 	// inside blk_mq_alloc_disk we set queuedata (which is private data) to s
 	s->gdisk = blk_mq_alloc_disk(&s->tag_set, &lim, s);
 	if (IS_ERR_OR_NULL(s->gdisk)) 
@@ -863,7 +873,6 @@ static int create_section(
 	// *first_minor += n_tapes;
 	// s->gdisk->minors = n_tapes;
 	s->gdisk->fops = &tapedev_ops;
-	// s or maybe tape_dev??
 	s->gdisk->private_data = s;
 
 	// disk_name shows up in /proc/partitions and sysfs and /dev/
