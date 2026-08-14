@@ -1,5 +1,6 @@
 #include "tapedev.h"
 #include "linux/irqreturn.h"
+#include "linux/wait.h"
 #include "tapedev_defs.h"
 #include "tapedev_sysfs.h"
 #include "tapedev_iow_ior.h"
@@ -26,13 +27,17 @@
 #define BAR_ID 0
 #define BAR_MAXLEN 0
 
-#define GET_SECTION_ADDR(s_id) ((s_id) * 0x100)
+#define GET_SECTION_ADDR(s_id) ((s_id + 1) * 0x100)
 #define PHYSICAL_BLOCK_SIZE 8192
 #define BASE_TAPE_SIZE (32 * 8192)
 #define SIZE_OF_TAPE(s_type) ((1 << s_type) * BASE_TAPE_SIZE)
 #define GET_NBR_OF_SECTORS(s_type, n_tapes) ((SIZE_OF_TAPE(s_type) / 512) * n_tapes)
 #define TAPEDEV_IRQ_SECT_X_DONE(i)  (TAPEDEV_IRQ_SECT_0_DONE  + (i))
 #define TAPEDEV_IRQ_SECT_X_ERROR(i) (TAPEDEV_IRQ_SECT_0_ERROR + (i))
+// Bits 0-7 are the identifier of the command, cmd should have 32 bits.
+#define GET_CMD_TYPE(cmd) ((uint32_t)((cmd) & 0xffU))
+// Bits 8-31 are used to pass command-specific information.
+#define GET_CMD_BODY(cmd) ((uint32_t)((cmd) & 0xffffff00U))
 
 // Blk dev example impl
 // https://github.com/CodeImp/sblkdev/blob/master/device.c
@@ -56,6 +61,7 @@ static struct class tapedev_class = {
 // helpers pre-decl
 int create_sections(struct tapedev_device *tape_dev, int num_sections);
 int add_section_disks(struct tapedev_device *tape_dev, int num_sections);
+int handle_section_interrupt(uint32_t section_done, uint32_t section_error, uint32_t section_status, struct section *sec);
 
 // #################################################################################
 // ############################## HANDLING INTERRUPTS ##############################
@@ -98,6 +104,8 @@ static irqreturn_t tapedev_interrupt_handler(int irq, void *opaque_dev)
 
 	ir_status = tapedev_ior(dev, TAPEDEV_IRQ_STATUS_ADDR);
 
+	// Below if only happens ONCE, when we use probe function for given device. 
+	// TODO: move init handling to the separate function
 	if (!dev->init_done)
 	{
 		uint32_t is_init_done = ir_status & (1 << TAPEDEV_IRQ_INIT_DONE);
@@ -115,7 +123,7 @@ static irqreturn_t tapedev_interrupt_handler(int irq, void *opaque_dev)
 			pr_info("%s:%u: device status: %u\n", __func__, __LINE__, dev_status);
 			pr_info("%s:%u: nums sections: %u\n", __func__, __LINE__, num_sections);
 
-			for (uint32_t s_id = 1; s_id <= num_sections; s_id++)
+			for (uint32_t s_id = 0; s_id < num_sections; s_id++)
 			{
 				uint32_t n_tapes = section_ior(dev, GET_SECTION_ADDR(s_id),TAPEDEV_SECT_TAPES_ADDR);
 				// Todo: add checking if section type is within allowed range
@@ -154,21 +162,23 @@ static irqreturn_t tapedev_interrupt_handler(int irq, void *opaque_dev)
 		pr_warn("%s:%u: hardware error\n", __func__, __LINE__);
 		dev->status = -1;
 
-		wake_up(&dev->wq_idle);
 		spin_unlock_irqrestore(&dev->s_lock, flags);
 		return IRQ_NONE;
 	}
 
+	num_sections = tapedev_ior(dev, TAPEDEV_SECTIONS_ADDR);
+	spin_unlock_irqrestore(&dev->s_lock, flags);
 	// #############################################################################
 	// 	We know there was NO HARDWARE ERROR in device
 	// 	We can check all TAPEDEV_IRQ_SECT_X_DONE and TAPEDEV_IRQ_SECT_X_ERROR 
 	// #############################################################################
 
 	// Max allowed number of sections is 8, we should check this
-	num_sections = tapedev_ior(dev, TAPEDEV_SECTIONS_ADDR);
+	// We have this stored inside section
 
-	int section_done = 0; 
-	int section_error = 0;
+	uint32_t section_done = 0; 
+	uint32_t section_error = 0;
+	uint32_t section_status = 0;
 	// We need ejection queue, and once command for given section is done we take 
 	// spinlock, check if anyone wants to eject tape, if so we send command to eject 
 	// it, set variable in struct, wake up ejector, release spinlock, and end 
@@ -184,12 +194,24 @@ static irqreturn_t tapedev_interrupt_handler(int irq, void *opaque_dev)
 	{
 		section_done = tapedev_ior(dev, TAPEDEV_IRQ_SECT_X_DONE(sec_id));
 		section_error = tapedev_ior(dev, TAPEDEV_IRQ_SECT_X_ERROR(sec_id));
-		uint32_t section_status = section_ior(dev, GET_SECTION_ADDR(sec_id + 1),TAPEDEV_SECT_STATUS_ADDR);
+		section_status = section_ior(dev, GET_SECTION_ADDR(sec_id),TAPEDEV_SECT_STATUS_ADDR);
+
 		pr_info("%s:%u: section: %d, done: %d, error: %d, STATUS: %u\n", __func__, __LINE__, sec_id, section_done, section_error, section_status);
+
+		int err = handle_section_interrupt(
+				section_done, 
+				section_error, 
+				section_status, 
+				dev->sections[sec_id]
+		);
+
+		if (err)
+		{
+			pr_err("Section handler error: %d\n", err);
+		}
+		// if section currently working we do nothing
 	}
 
-	wake_up(&dev->wq_idle);
-	spin_unlock_irqrestore(&dev->s_lock, flags);
 
 	return IRQ_RETVAL(ir_status);
 }
@@ -234,18 +256,20 @@ static int tapedev_ioctl(struct block_device *bdev, blk_mode_t mode, unsigned cm
 	pr_info("%s:%u: ioctl command [0x%x] received, for device: %d, for section: %u\n\n", __func__, __LINE__, cmd, dev->idx, sec->idx);
 
 	unsigned long flags;
-	spin_lock_irqsave(&sec->lock, flags);
-
-	struct tapedev_sect_info sec_info = {
-		.tapes = sec->n_tapes,
-		.tape_type = sec->section_type,
-		.current_tape = sec->current_tape
-	};
-
-	spin_unlock_irqrestore(&sec->lock, flags);
 
 	switch (cmd) {
 	case TAPEDEV_IOCTL_GET_INFO: {
+
+		spin_lock_irqsave(&sec->lock, flags);
+
+		struct tapedev_sect_info sec_info = {
+			.tapes = sec->n_tapes,
+			.tape_type = sec->section_type,
+			.current_tape = sec->current_tape
+		};
+
+		spin_unlock_irqrestore(&sec->lock, flags);
+
 		pr_info("%s:%u: got TAPEDEV_IOCTL_GET_INFO ioctl cmd. sec_info = {\ntapes = %u,\ntape_type = %u,\ncurrent_tape = %u\n} \n", __func__, __LINE__, sec_info.tapes, sec_info.tape_type, sec_info.current_tape);
 
 		if (copy_to_user((void __user *) arg, (void *) &sec_info, sizeof(struct tapedev_sect_info)))
@@ -254,13 +278,32 @@ static int tapedev_ioctl(struct block_device *bdev, blk_mode_t mode, unsigned cm
 	}
 	case TAPEDEV_IOCTL_EJECT_TAPE:
 	{
-		// wait until driver stops processing current read/write request, eject tape (if inserted).
-		pr_info("%s:%u: got TAPEDEV_IOCTL_EJECT_TAPE ioctl cmd. Current tape: %u  \n", __func__, __LINE__, sec_info.current_tape);
+		spin_lock_irqsave(&sec->lock, flags);
 
-		// TODO: add ejecting tape
+		uint32_t current_tape = sec->current_tape;
 
-		if (copy_to_user((void __user *) arg, (void *) &sec_info.current_tape, sizeof(sec_info.current_tape)))
-			return -EFAULT;
+		pr_info("%s:%u: got EJECT_TAPE ioctl cmd. Current tape: %u  \n", __func__, __LINE__, current_tape);
+
+		// No tape, no need to eject
+		if (current_tape == 0)
+		{
+			spin_unlock_irqrestore(&sec->lock, flags);
+			return 0;
+		}
+
+		// There is some tape inserted, so we set information to eject and wait on 
+		// queue
+		sec->ejection_cmds += 1;
+
+		while (sec->current_tape) 
+		{
+			spin_unlock_irqrestore(&sec->lock, flags);
+			if (wait_event_interruptible(sec->ioctl_eject_wait_q, !sec->current_tape))
+				return -ERESTARTSYS;
+			spin_lock_irqsave(&sec->lock, flags);
+		}
+
+		// Once current tape is 0, we return success
 		return 0;
 	}
 	default:
@@ -324,6 +367,7 @@ static inline int process_request(struct request *rq, unsigned int *nr_bytes)
 	struct bio_vec bvec;
 	struct req_iterator iter;
 	struct section *s = rq->q->queuedata;
+	// We should probably use here TAPEDEV_SECT_PTR_SHIFT instead of SECTOR_SHIFT????
 	loff_t pos = blk_rq_pos(rq) << SECTOR_SHIFT;
 	loff_t dev_size = (s->n_sectors << SECTOR_SHIFT);
 
@@ -582,11 +626,19 @@ static int tapedev_probe(
 	unsigned long flags;
 	spin_lock_irqsave(&tape_dev->s_lock, flags);
 
+	// TODO: we shouldn't return here, it skips cleanup path, we should use goto
+	long wait_ret;
 	while (!tape_dev->init_done) 
 	{
 		spin_unlock_irqrestore(&tape_dev->s_lock, flags);
-		if (wait_event_interruptible(tape_dev->wq_idle, tape_dev->init_done))
-			return -ERESTARTSYS;
+		wait_ret = wait_event_interruptible(tape_dev->wq_idle, tape_dev->init_done);
+
+		if (wait_ret < 0)
+		{
+			err = -EINTR;
+			goto init_fail;
+		}
+
 		spin_lock_irqsave(&tape_dev->s_lock, flags);
 	}
 
@@ -600,7 +652,7 @@ static int tapedev_probe(
 
 	if (tape_dev->status < 0)
 	{
-		pr_err("Device %u encountered error: %d\n", tape_dev->idx, tape_dev->status);
+		pr_err("Device %u encountered hw error: %d\n", tape_dev->idx, tape_dev->status);
 		spin_unlock_irqrestore(&tape_dev->s_lock, flags);
 		err = -EIO;
 		goto init_fail;
@@ -619,10 +671,10 @@ static int tapedev_probe(
 	}
 
 	tape_dev->n_sections = num_sections;
-	// We count sections from id = 1, so we will have space for section at 0 idx but 
-	// it will never be allocated, I chose this instead of remembering to always 
-	// subtract 1 from section_id
-	tape_dev->sections = kzalloc(sizeof(struct section*) * (num_sections + 1), GFP_KERNEL);
+	// Section ids are counted from 0, however to use Section Registers we count them
+	// from 1, thus we will count them from 0, but specific functions that will 
+	// communicate with section registers will add 1 to section id
+	tape_dev->sections = kzalloc(sizeof(struct section*) * num_sections, GFP_KERNEL);
 
 	if (IS_ERR_OR_NULL(tape_dev->sections))
 	{
@@ -815,28 +867,39 @@ static int create_section(
 	};
 
     int err;
-	struct section *s = kzalloc(sizeof(struct section), GFP_KERNEL);
+	struct section *sec = kzalloc(sizeof(struct section), GFP_KERNEL);
 
-	if (!s)
+	if (!sec)
 	{
 		pr_err("%s:%u: kzalloc failed\n", __func__, __LINE__);
 		err = -ENOMEM;
 		goto fail;
 	}
 
-	spin_lock_init(&s->lock);
-	s->idx = section_id;
-	s->section_type = sec_type;
-	s->n_tapes = n_tapes;
-	s->n_sectors = GET_NBR_OF_SECTORS(sec_type, n_tapes);
-	s->private_data = tape_dev;
+	spin_lock_init(&sec->lock);
+
+	sec->idx = section_id;
+	sec->n_tapes = n_tapes;
+	sec->section_type = sec_type;
+	sec->n_sectors = GET_NBR_OF_SECTORS(sec_type, n_tapes);
+	sec->current_tape = 0;
+	sec->ejection_cmds = 0;
+
+	init_waitqueue_head(&sec->ioctl_eject_wait_q);
+	init_waitqueue_head(&sec->cmd_wait_q);
+
+	sec->curr_cmd = TAPEDEV_CMD_NONE;
+	sec->next_cmd = TAPEDEV_CMD_NONE;
+	sec->private_data = tape_dev;
+	sec->status = 0;
 	// s->data_buf = kzalloc(SIZE_OF_TAPE(s->section_type) * s->n_sectors, GFP_KERNEL);
 
 	// TODO: currently for each section we have only one such dma buff, but probably
-	// 	we will need many for one section?
-	if (!(s->data_cpu = dma_alloc_coherent(&tape_dev->pdev->dev,
+	// we will need many for one section? Nah probably not, section is one continous
+	// chunk of memory
+	if (!(sec->data_cpu = dma_alloc_coherent(&tape_dev->pdev->dev,
 			PAGE_SIZE,
-			&s->data_dma, GFP_KERNEL))) 
+			&sec->data_dma, GFP_KERNEL))) 
 	{
 		pr_err("%s:%u: Failed to dma_alloc_coherent\n", __func__, __LINE__);
 		err = -ENOMEM;
@@ -844,17 +907,17 @@ static int create_section(
 	}
 
 	// we set private driver_data to s
-	err = init_tag_set(&s->tag_set, s);
+	err = init_tag_set(&sec->tag_set, sec);
 	if (err) {
 		pr_err("%s:%u: Failed to allocate tag set\n", __func__, __LINE__);
 		goto free_dma_alloc;
 	}
 
 	// inside blk_mq_alloc_disk we set queuedata (which is private data) to s
-	s->gdisk = blk_mq_alloc_disk(&s->tag_set, &lim, s);
-	if (IS_ERR_OR_NULL(s->gdisk)) 
+	sec->gdisk = blk_mq_alloc_disk(&sec->tag_set, &lim, sec);
+	if (IS_ERR_OR_NULL(sec->gdisk)) 
 	{
-		err = s->gdisk ? PTR_ERR(s->gdisk) : -ENOMEM;
+		err = sec->gdisk ? PTR_ERR(sec->gdisk) : -ENOMEM;
 		pr_err("%s :: blk_mq_alloc_disk failed with error: %d\n", __func__, err);
 		goto free_tag_set;
 	}
@@ -872,11 +935,11 @@ static int create_section(
 	// s->gdisk->first_minor = *first_minor;
 	// *first_minor += n_tapes;
 	// s->gdisk->minors = n_tapes;
-	s->gdisk->fops = &tapedev_ops;
-	s->gdisk->private_data = s;
+	sec->gdisk->fops = &tapedev_ops;
+	sec->gdisk->private_data = sec;
 
 	// disk_name shows up in /proc/partitions and sysfs and /dev/
-	snprintf(s->gdisk->disk_name, 15, "tapedev%us%u", device_id, section_id - 1);
+	snprintf(sec->gdisk->disk_name, 15, "tapedev%us%u", device_id, section_id);
 
 	// We should set capacity of the disk by using set_capacity, to this function 
 	// we pass HOW MANY 512 byte SECTORS our disk has; 8192 / 512 = 16, so by using 
@@ -885,21 +948,21 @@ static int create_section(
 	// gendisk, minors in these gendisk will be our tapes i.e. we get 50 tapes, we 
 	// need 50 minors.
 	// Each tape has SIZE_OF_TAPE so every tape will have SIZE_OF_TAPE / 512 sectors
-	set_capacity(s->gdisk, GET_NBR_OF_SECTORS(sec_type, n_tapes));
+	set_capacity(sec->gdisk, GET_NBR_OF_SECTORS(sec_type, n_tapes));
 
 
-	*new_section = s;
+	*new_section = sec;
 
 	// We dont add_disk here yet, we will do that once all of them are ready
 
 	return 0;
 
 free_tag_set:
-	blk_mq_free_tag_set(&s->tag_set);
+	blk_mq_free_tag_set(&sec->tag_set);
 free_dma_alloc:
-	dma_free_coherent(&tape_dev->pdev->dev, PAGE_SIZE, s->data_cpu, s->data_dma);
+	dma_free_coherent(&tape_dev->pdev->dev, PAGE_SIZE, sec->data_cpu, sec->data_dma);
 free_alloc_s:
-	kfree(s);
+	kfree(sec);
 fail:
 	return err;
 }
@@ -911,7 +974,7 @@ int create_sections(struct tapedev_device *tape_dev, int num_sections)
 	uint32_t s_id;
 
 	// Create all sections for this device
-	for (s_id = 1; s_id <= num_sections; s_id++)
+	for (s_id = 0; s_id < num_sections; s_id++)
 	{
 		uint32_t n_tapes = section_ior(tape_dev, GET_SECTION_ADDR(s_id),TAPEDEV_SECT_TAPES_ADDR);
 		// Todo: add checking if section type is within allowed range
@@ -924,13 +987,19 @@ int create_sections(struct tapedev_device *tape_dev, int num_sections)
 		if (err < 0)
 		{
 			pr_err("%s:%u: failed to create_section for id: %d, err: %d\n", __func__, __LINE__, s_id, err);
-			for (int i = 1; i <= s_id; i++)
+
+			// We must deallocate all previous ones
+			// TODO: add helper function for this
+			for (int i = 0; i < s_id; i++)
 			{
 				// put_disk decrements gendisk refcount, if it reaches 0 gendisk is 
 				// freed, since we've just allocated gendisk struct there might at 
 				// most 1 ref to it thus put_disk will free dev.gendisk
 				// We didnt use add_disk yet so we dont need to use del_gendisk
 				// del_gendisk(tape_dev->sections[i]->gdisk);
+
+				blk_mq_free_tag_set(&tape_dev->sections[i]->tag_set);
+				dma_free_coherent(&tape_dev->pdev->dev, PAGE_SIZE, tape_dev->sections[i]->data_cpu, tape_dev->sections[i]->data_dma);
 				put_disk(tape_dev->sections[i]->gdisk);
 				kfree(tape_dev->sections[i]);
 			}
@@ -945,7 +1014,7 @@ int add_section_disks(struct tapedev_device *tape_dev, int num_sections)
 	int err, err_add, err_sysfs;
 	uint32_t s_id;
 	// Adding all section disks
-	for (s_id = 1; s_id <= num_sections; s_id++)
+	for (s_id = 0; s_id < num_sections; s_id++)
 	{
 		// err = device_add_disk(&tape_dev->pdev->dev, tape_dev->sections[s_id]->gdisk, NULL);
 		// pr_info("%s:%u: adding disk for section: %d \n", __func__, __LINE__, s_id);
@@ -969,7 +1038,7 @@ int add_section_disks(struct tapedev_device *tape_dev, int num_sections)
 				err = err_sysfs;
 			}
 			
-			for (int i = 1; i <= num_sections; i++)
+			for (int i = 0; i < num_sections; i++)
 			{
 				struct section *s = tape_dev->sections[i];
 				// where add_disk was successful we need to call del_gendisk
@@ -989,6 +1058,203 @@ int add_section_disks(struct tapedev_device *tape_dev, int num_sections)
 }
 
 
+int handle_section_interrupt(uint32_t section_done, uint32_t section_error, uint32_t section_status, struct section *sec)
+{
+	if (section_error)
+	{
+		// We need to clear the interrupt, so that it doesn't fire endlessly
+		tapedev_iow(sec->private_data, TAPEDEV_IRQ_CLEAR_ADDR, 
+			(1 << TAPEDEV_IRQ_SECT_X_ERROR(sec->idx))
+		);
+
+		pr_err("%s:%u: section: %d, we got error for current command: %u\n", __func__, __LINE__, sec->idx, sec->curr_cmd);
+		// TODO: IDK how we should handle these things yet
+		switch (section_status)
+		{
+			case TAPEDEV_SECT_STATUS_ERR_INVALID_CMD:
+				pr_warn("%s:%u: section: %d, error: ERR_INVALID_CMD\n", __func__, __LINE__, sec->idx);
+
+				/* Invalid command received */
+
+				break;
+
+			case TAPEDEV_SECT_STATUS_ERR_TAPE_ACTIVE:
+
+				pr_warn("%s:%u: section: %d, error: ERR_TAPE_ACTIVE\n", __func__, __LINE__, sec->idx);
+				/* Tape is currently active/busy */
+
+				break;
+
+			case TAPEDEV_SECT_STATUS_ERR_NO_TAPE:
+
+				pr_warn("%s:%u: section: %d, error: ERR_NO_TAPE\n", __func__, __LINE__, sec->idx);
+				/* No tape present */
+
+				break;
+
+			case TAPEDEV_SECT_STATUS_ERR_RESET:
+
+				pr_warn("%s:%u: section: %d, error: ERR_RESET\n", __func__, __LINE__, sec->idx);
+				/* Device was reset */
+
+				break;
+
+			case TAPEDEV_SECT_STATUS_ERR_INVALID_TAPE_NO:
+
+				pr_warn("%s:%u: section: %d, error: ERR_INVALID_TAPE_NO\n", __func__, __LINE__, sec->idx);
+				/* Invalid tape number specified */
+
+				break;
+
+			case TAPEDEV_SECT_STATUS_ERR_INVALID_FFWD_POS:
+
+				pr_warn("%s:%u: section: %d, error: ERR_INVALID_FFWD_POS\n", __func__, __LINE__, sec->idx);
+				/* Invalid fast-forward position */
+
+				break;
+
+			case TAPEDEV_SECT_STATUS_ERR_READ_PAST_END:
+
+				pr_warn("%s:%u: section: %d, error: ERR_READ_PAST_END\n", __func__, __LINE__, sec->idx);
+				/* Attempted to read past end of tape */
+
+				break;
+
+			case TAPEDEV_SECT_STATUS_ERR_WRITE_PAST_END:
+
+				pr_warn("%s:%u: section: %d, error: ERR_WRITE_PAST_END\n", __func__, __LINE__, sec->idx);
+				/* Attempted to write past end of tape */
+
+				break;
+
+			case TAPEDEV_SECT_STATUS_ERR_IO:
+
+				pr_warn("%s:%u: section: %d, error: ERR_IO\n", __func__, __LINE__, sec->idx);
+				/* General I/O error */
+
+				break;
+
+			case TAPEDEV_SECT_STATUS_ERR_PGTABLE:
+
+				pr_warn("%s:%u: section: %d, error: ERR_PGTABLE\n", __func__, __LINE__, sec->idx);
+				/* Page table error */
+
+				break;
+
+			default:
+
+				pr_warn("%s:%u: section: %d, error: Unknown\n", __func__, __LINE__, sec->idx);
+				/* Unknown status code */
+
+				break;
+
+		}
+	}
+
+	if (section_status == TAPEDEV_SECT_STATUS_WORKING)
+		return 0;
+
+	// Section finished a command, we need to clear interrupt flag
+	// TODO: add helper function for clearing DONE and ERROR flags, we will pass 
+	// there just sec and function will do the rest
+	if (section_done)
+		tapedev_iow(sec->private_data, TAPEDEV_IRQ_CLEAR_ADDR, 
+			(1 << TAPEDEV_IRQ_SECT_X_DONE(sec->idx)));
+
+	unsigned long flags;
+	spin_lock_irqsave(&sec->lock, flags);
+
+	uint32_t curr_cmd_type = GET_CMD_TYPE(sec->curr_cmd);
+	// uint32_t curr_cmd_body = GET_CMD_BODY(sec->curr_cmd);
+	sec->curr_cmd = TAPEDEV_CMD_NONE;
+
+	// TODO: check below
+	// IDK if section_status has value STATUS_DONE always when section_done is set 
+	if (section_status == TAPEDEV_SECT_STATUS_DONE)
+	{
+		if (curr_cmd_type == TAPEDEV_CMD_EJECT_TAPE)
+		{
+			// wake up all threads that were waiting for ejection
+			// if anyone waited
+			sec->current_tape = 0;
+			uint32_t tape = section_ior(sec->private_data, GET_SECTION_ADDR(sec->idx), TAPEDEV_SECT_TAPE_NO_ADDR);
+
+			if (tape != 0)
+			{
+				pr_err("something went wrong, eject_tape was done but  %u tape is still inserted\n", tape);
+			}
+
+			if (sec->ejection_cmds)
+			{
+				sec->ejection_cmds = 0;
+				wake_up_all(&sec->ioctl_eject_wait_q);
+			}
+
+			// It might happen that both request_handling thread and ioctl thread
+			// want to eject, if it happens both current and next are EJECT cmds
+			// thus we simply wake up all threads and set next_cmd to NONE
+			if (GET_CMD_TYPE(sec->next_cmd) == TAPEDEV_CMD_EJECT_TAPE)
+			{
+				sec->next_cmd = TAPEDEV_CMD_NONE;
+				wake_up(&sec->cmd_wait_q);
+			}
+
+		}
+
+		// TODO: handling of other commands
+
+		// After completing current command we check if anyone wants to eject tape
+		// If there is no tape to eject we just wake everyone, and go to executing 
+		// next command 
+		// If there is a tape to eject we send ejection command and set curr_cmd as
+		// eject_tape and end handling this section for now
+		if (sec->ejection_cmds)
+		{
+			if (sec->current_tape)
+			{
+				// We send command to eject and return
+				sec->curr_cmd = TAPEDEV_CMD_EJECT_TAPE;
+				return 0;
+			}
+			else
+			{
+				// there is no tape inserted, we just wake up ioctl threads
+				wake_up(&sec->cmd_wait_q);
+			}
+
+		}
+
+		// After handling current cmd we handle next command
+		// To handle next_command we just need to send it to the tapedevice and set
+		// it as current_cmd
+
+		uint32_t next_cmd_type = GET_CMD_TYPE(sec->next_cmd);
+		// uint32_t next_cmd_body = GET_CMD_BODY(sec->next_cmd);
+
+		if (next_cmd_type == TAPEDEV_CMD_NONE)
+		{
+			// TODO: add gotos that restores spinlock and returns correct value
+			spin_unlock_irqrestore(&sec->lock, flags);
+			return 0;
+		}
+
+		sec->curr_cmd = sec->next_cmd;
+		sec->next_cmd = TAPEDEV_CMD_NONE;
+
+		// TODO: send command to tapedev
+
+		spin_unlock_irqrestore(&sec->lock, flags);
+		return 0;
+		// After command is done we check if anyone wanted to eject tape, and we send
+		// command to eject it before other commands, and free all threads waiting 
+		// for ejection
+	}
+	else if (section_status == TAPEDEV_SECT_STATUS_IDLE)
+	{
+		// Here there is no previous command's result we need to take care of.
+		// We can just start a new one if there is any.
+	}
+}
 
 MODULE_LICENSE("GPL");
 MODULE_AUTHOR("Krzysztof Lembryk");

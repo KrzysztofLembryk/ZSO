@@ -7,6 +7,10 @@
 #include <linux/dma-mapping.h>
 #include <linux/blkdev.h>
 
+// I would add it to tapedev.h but probably it will be replaced with default .h file
+#define TAPEDEV_CMD_NONE				0x06
+
+// To create section object use create_section function
 struct section
 {
 	uint32_t idx;
@@ -14,8 +18,16 @@ struct section
 	// 0 to 4, to calc size of tape for this section use SIZE_OF_TAPE macro
 	uint32_t section_type; 	
 	sector_t n_sectors;
-	// if 0 - no tape inserted in tapedevice
+	// If 0 - no tape inserted in tapedevice
 	uint32_t current_tape;
+	// Number of ejection commands waiting to be executed, the same number of threads
+	// are waiting on ejection_queue
+	uint32_t ejection_cmds;
+	wait_queue_head_t ioctl_eject_wait_q;
+	wait_queue_head_t cmd_wait_q;
+	uint32_t curr_cmd;
+	uint32_t next_cmd;
+	int status;
 	/*
 		gendisk is kernel's representation of of an individual DISK DEVICE
 	*/
@@ -28,7 +40,7 @@ struct section
 	void *data_cpu;
 	struct blk_mq_tag_set tag_set; /* multi queue */
 
-	// private_data is tapedev_device
+	// private_data must be tapedev_device
 	void *private_data;
 };
 

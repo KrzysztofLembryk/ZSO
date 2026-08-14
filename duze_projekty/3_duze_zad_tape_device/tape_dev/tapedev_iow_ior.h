@@ -3,6 +3,8 @@
 
 #include "tapedev_defs.h"
 
+// iowrite32/ioread32 are atomic - TODO: must check if there are no data races 
+
 static inline void tapedev_iow(struct tapedev_device *dev, uint32_t reg, uint32_t val)
 {
 	iowrite32(val, dev->bar + reg);
