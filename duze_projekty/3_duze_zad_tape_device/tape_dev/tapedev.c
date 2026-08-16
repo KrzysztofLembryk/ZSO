@@ -26,6 +26,7 @@
 #define TAPEDEV_NAME "tapedev"
 #define BAR_ID 0
 #define BAR_MAXLEN 0
+#define NO_TAPE 0 
 
 #define GET_SECTION_ADDR(s_id) ((s_id + 1) * 0x100)
 #define PHYSICAL_BLOCK_SIZE 8192
@@ -39,6 +40,29 @@
 // Bits 8-31 are used to pass command-specific information.
 #define GET_CMD_BODY(cmd) ((uint32_t)((cmd) & 0xffffff00U))
 
+static inline void clear_sec_done_intrpt(struct section* sec)
+{
+	tapedev_iow(sec->private_data, TAPEDEV_IRQ_CLEAR_ADDR, 
+		(1 << TAPEDEV_IRQ_SECT_X_DONE(sec->idx))
+	);
+}
+
+static inline void clear_sec_err_intrpt(struct section* sec)
+{
+	tapedev_iow(sec->private_data, TAPEDEV_IRQ_CLEAR_ADDR, 
+		(1 << TAPEDEV_IRQ_SECT_X_ERROR(sec->idx))
+	);
+}
+
+static inline void section_send_cmd(uint32_t cmd, struct section *sec)
+{
+	section_iow(sec->private_data, GET_SECTION_ADDR(sec->idx), TAPEDEV_SECT_CMD_ADDR, cmd);
+}
+
+static inline uint32_t section_read_from(uint32_t addr, struct section *sec)
+{
+	section_ior(sec->private_data, GET_SECTION_ADDR(sec->idx), addr);
+}
 // Blk dev example impl
 // https://github.com/CodeImp/sblkdev/blob/master/device.c
 // 
@@ -47,7 +71,6 @@
 
 static dev_t tapedev_major;
 
-// We probably should make a list of queues to store commands for sections
 // Global static variables are initialized to NULL, so now we have an array of NULLs
 static struct tapedev_device *tapedev_devices[MAX_DEVICES_TAPEDEV]; 
 
@@ -125,6 +148,7 @@ static irqreturn_t tapedev_interrupt_handler(int irq, void *opaque_dev)
 
 			for (uint32_t s_id = 0; s_id < num_sections; s_id++)
 			{
+				
 				uint32_t n_tapes = section_ior(dev, GET_SECTION_ADDR(s_id),TAPEDEV_SECT_TAPES_ADDR);
 				// Todo: add checking if section type is within allowed range
 				uint32_t sec_type = section_ior(dev, GET_SECTION_ADDR(s_id),TAPEDEV_SECT_TAPE_SIZE_ADDR);
@@ -192,9 +216,11 @@ static irqreturn_t tapedev_interrupt_handler(int irq, void *opaque_dev)
 	// We need a queue of 32-bit commands for every section
 	for (int sec_id = 0; sec_id < num_sections; sec_id++)
 	{
+		struct section *sec = dev->sections[sec_id];
+		
 		section_done = tapedev_ior(dev, TAPEDEV_IRQ_SECT_X_DONE(sec_id));
 		section_error = tapedev_ior(dev, TAPEDEV_IRQ_SECT_X_ERROR(sec_id));
-		section_status = section_ior(dev, GET_SECTION_ADDR(sec_id),TAPEDEV_SECT_STATUS_ADDR);
+		section_status = section_read_from(TAPEDEV_SECT_STATUS_ADDR, sec);
 
 		pr_info("%s:%u: section: %d, done: %d, error: %d, STATUS: %u\n", __func__, __LINE__, sec_id, section_done, section_error, section_status);
 
@@ -202,7 +228,7 @@ static irqreturn_t tapedev_interrupt_handler(int irq, void *opaque_dev)
 				section_done, 
 				section_error, 
 				section_status, 
-				dev->sections[sec_id]
+				sec				
 		);
 
 		if (err)
@@ -890,6 +916,7 @@ static int create_section(
 
 	sec->curr_cmd = TAPEDEV_CMD_NONE;
 	sec->next_cmd = TAPEDEV_CMD_NONE;
+	sec->cmd_done = false;
 	sec->private_data = tape_dev;
 	sec->status = 0;
 	// s->data_buf = kzalloc(SIZE_OF_TAPE(s->section_type) * s->n_sectors, GFP_KERNEL);
@@ -1057,148 +1084,43 @@ int add_section_disks(struct tapedev_device *tape_dev, int num_sections)
 	return 0;
 }
 
+int __handle_section_error(uint32_t section_status, struct section *sec);
+int __handle_section_done(uint32_t cmd, struct section *sec);
 
 int handle_section_interrupt(uint32_t section_done, uint32_t section_error, uint32_t section_status, struct section *sec)
 {
+	int err = 0;
+	// TOD: Move to separate error handling function
 	if (section_error)
 	{
-		// We need to clear the interrupt, so that it doesn't fire endlessly
-		tapedev_iow(sec->private_data, TAPEDEV_IRQ_CLEAR_ADDR, 
-			(1 << TAPEDEV_IRQ_SECT_X_ERROR(sec->idx))
-		);
-
-		pr_err("%s:%u: section: %d, we got error for current command: %u\n", __func__, __LINE__, sec->idx, sec->curr_cmd);
-		// TODO: IDK how we should handle these things yet
-		switch (section_status)
-		{
-			case TAPEDEV_SECT_STATUS_ERR_INVALID_CMD:
-				pr_warn("%s:%u: section: %d, error: ERR_INVALID_CMD\n", __func__, __LINE__, sec->idx);
-
-				/* Invalid command received */
-
-				break;
-
-			case TAPEDEV_SECT_STATUS_ERR_TAPE_ACTIVE:
-
-				pr_warn("%s:%u: section: %d, error: ERR_TAPE_ACTIVE\n", __func__, __LINE__, sec->idx);
-				/* Tape is currently active/busy */
-
-				break;
-
-			case TAPEDEV_SECT_STATUS_ERR_NO_TAPE:
-
-				pr_warn("%s:%u: section: %d, error: ERR_NO_TAPE\n", __func__, __LINE__, sec->idx);
-				/* No tape present */
-
-				break;
-
-			case TAPEDEV_SECT_STATUS_ERR_RESET:
-
-				pr_warn("%s:%u: section: %d, error: ERR_RESET\n", __func__, __LINE__, sec->idx);
-				/* Device was reset */
-
-				break;
-
-			case TAPEDEV_SECT_STATUS_ERR_INVALID_TAPE_NO:
-
-				pr_warn("%s:%u: section: %d, error: ERR_INVALID_TAPE_NO\n", __func__, __LINE__, sec->idx);
-				/* Invalid tape number specified */
-
-				break;
-
-			case TAPEDEV_SECT_STATUS_ERR_INVALID_FFWD_POS:
-
-				pr_warn("%s:%u: section: %d, error: ERR_INVALID_FFWD_POS\n", __func__, __LINE__, sec->idx);
-				/* Invalid fast-forward position */
-
-				break;
-
-			case TAPEDEV_SECT_STATUS_ERR_READ_PAST_END:
-
-				pr_warn("%s:%u: section: %d, error: ERR_READ_PAST_END\n", __func__, __LINE__, sec->idx);
-				/* Attempted to read past end of tape */
-
-				break;
-
-			case TAPEDEV_SECT_STATUS_ERR_WRITE_PAST_END:
-
-				pr_warn("%s:%u: section: %d, error: ERR_WRITE_PAST_END\n", __func__, __LINE__, sec->idx);
-				/* Attempted to write past end of tape */
-
-				break;
-
-			case TAPEDEV_SECT_STATUS_ERR_IO:
-
-				pr_warn("%s:%u: section: %d, error: ERR_IO\n", __func__, __LINE__, sec->idx);
-				/* General I/O error */
-
-				break;
-
-			case TAPEDEV_SECT_STATUS_ERR_PGTABLE:
-
-				pr_warn("%s:%u: section: %d, error: ERR_PGTABLE\n", __func__, __LINE__, sec->idx);
-				/* Page table error */
-
-				break;
-
-			default:
-
-				pr_warn("%s:%u: section: %d, error: Unknown\n", __func__, __LINE__, sec->idx);
-				/* Unknown status code */
-
-				break;
-
-		}
+		err = __handle_section_error(section_status, sec);
+		goto ret;
 	}
 
 	if (section_status == TAPEDEV_SECT_STATUS_WORKING)
-		return 0;
+		goto ret;
 
 	// Section finished a command, we need to clear interrupt flag
 	// TODO: add helper function for clearing DONE and ERROR flags, we will pass 
 	// there just sec and function will do the rest
 	if (section_done)
-		tapedev_iow(sec->private_data, TAPEDEV_IRQ_CLEAR_ADDR, 
-			(1 << TAPEDEV_IRQ_SECT_X_DONE(sec->idx)));
+		clear_sec_done_intrpt(sec);
 
 	unsigned long flags;
 	spin_lock_irqsave(&sec->lock, flags);
 
-	uint32_t curr_cmd_type = GET_CMD_TYPE(sec->curr_cmd);
-	// uint32_t curr_cmd_body = GET_CMD_BODY(sec->curr_cmd);
+	uint32_t curr_cmd = sec->curr_cmd;
 	sec->curr_cmd = TAPEDEV_CMD_NONE;
 
 	// TODO: check below
 	// IDK if section_status has value STATUS_DONE always when section_done is set 
+	// If status is DONE this means that current command was executed
 	if (section_status == TAPEDEV_SECT_STATUS_DONE)
 	{
-		if (curr_cmd_type == TAPEDEV_CMD_EJECT_TAPE)
+		err = __handle_section_done(curr_cmd, sec);
+		if (err)
 		{
-			// wake up all threads that were waiting for ejection
-			// if anyone waited
-			sec->current_tape = 0;
-			uint32_t tape = section_ior(sec->private_data, GET_SECTION_ADDR(sec->idx), TAPEDEV_SECT_TAPE_NO_ADDR);
-
-			if (tape != 0)
-			{
-				pr_err("something went wrong, eject_tape was done but  %u tape is still inserted\n", tape);
-			}
-
-			if (sec->ejection_cmds)
-			{
-				sec->ejection_cmds = 0;
-				wake_up_all(&sec->ioctl_eject_wait_q);
-			}
-
-			// It might happen that both request_handling thread and ioctl thread
-			// want to eject, if it happens both current and next are EJECT cmds
-			// thus we simply wake up all threads and set next_cmd to NONE
-			if (GET_CMD_TYPE(sec->next_cmd) == TAPEDEV_CMD_EJECT_TAPE)
-			{
-				sec->next_cmd = TAPEDEV_CMD_NONE;
-				wake_up(&sec->cmd_wait_q);
-			}
-
+			goto release_lock;
 		}
 
 		// TODO: handling of other commands
@@ -1214,7 +1136,9 @@ int handle_section_interrupt(uint32_t section_done, uint32_t section_error, uint
 			{
 				// We send command to eject and return
 				sec->curr_cmd = TAPEDEV_CMD_EJECT_TAPE;
-				return 0;
+				section_send_cmd(sec->curr_cmd, sec);
+
+				goto release_lock;
 			}
 			else
 			{
@@ -1231,8 +1155,10 @@ int handle_section_interrupt(uint32_t section_done, uint32_t section_error, uint
 		uint32_t next_cmd_type = GET_CMD_TYPE(sec->next_cmd);
 		// uint32_t next_cmd_body = GET_CMD_BODY(sec->next_cmd);
 
+		// Both commands are now NONE, so there is nothing to do
 		if (next_cmd_type == TAPEDEV_CMD_NONE)
 		{
+			goto release_lock;
 			// TODO: add gotos that restores spinlock and returns correct value
 			spin_unlock_irqrestore(&sec->lock, flags);
 			return 0;
@@ -1251,9 +1177,181 @@ int handle_section_interrupt(uint32_t section_done, uint32_t section_error, uint
 	}
 	else if (section_status == TAPEDEV_SECT_STATUS_IDLE)
 	{
+		pr_info("%s:%u: section_status == TAPEDEV_SECT_STATUS_IDLE\n", __func__, __LINE__);
 		// Here there is no previous command's result we need to take care of.
 		// We can just start a new one if there is any.
 	}
+
+release_lock:
+	spin_unlock_irqrestore(&sec->lock, flags);
+ret:
+	return err;
+}
+
+int __handle_section_error(uint32_t section_status, struct section *sec)
+{
+	// We need to clear the interrupt, so that it doesn't fire endlessly
+	clear_sec_err_intrpt(sec);
+
+	pr_err("%s:%u: section: %d, we got error for current command: %u\n", __func__, __LINE__, sec->idx, sec->curr_cmd);
+	// TODO: IDK how we should handle these things yet
+	switch (section_status)
+	{
+		case TAPEDEV_SECT_STATUS_ERR_INVALID_CMD:
+			pr_warn("%s:%u: section: %d, error: ERR_INVALID_CMD\n", __func__, __LINE__, sec->idx);
+
+			/* Invalid command received */
+
+			break;
+
+		case TAPEDEV_SECT_STATUS_ERR_TAPE_ACTIVE:
+
+			pr_warn("%s:%u: section: %d, error: ERR_TAPE_ACTIVE\n", __func__, __LINE__, sec->idx);
+			/* Tape is currently active/busy */
+
+			break;
+
+		case TAPEDEV_SECT_STATUS_ERR_NO_TAPE:
+
+			pr_warn("%s:%u: section: %d, error: ERR_NO_TAPE\n", __func__, __LINE__, sec->idx);
+			/* No tape present */
+
+			break;
+
+		case TAPEDEV_SECT_STATUS_ERR_RESET:
+
+			pr_warn("%s:%u: section: %d, error: ERR_RESET\n", __func__, __LINE__, sec->idx);
+			/* Device was reset */
+
+			break;
+
+		case TAPEDEV_SECT_STATUS_ERR_INVALID_TAPE_NO:
+
+			pr_warn("%s:%u: section: %d, error: ERR_INVALID_TAPE_NO\n", __func__, __LINE__, sec->idx);
+			/* Invalid tape number specified */
+
+			break;
+
+		case TAPEDEV_SECT_STATUS_ERR_INVALID_FFWD_POS:
+
+			pr_warn("%s:%u: section: %d, error: ERR_INVALID_FFWD_POS\n", __func__, __LINE__, sec->idx);
+			/* Invalid fast-forward position */
+
+			break;
+
+		case TAPEDEV_SECT_STATUS_ERR_READ_PAST_END:
+
+			pr_warn("%s:%u: section: %d, error: ERR_READ_PAST_END\n", __func__, __LINE__, sec->idx);
+			/* Attempted to read past end of tape */
+
+			break;
+
+		case TAPEDEV_SECT_STATUS_ERR_WRITE_PAST_END:
+
+			pr_warn("%s:%u: section: %d, error: ERR_WRITE_PAST_END\n", __func__, __LINE__, sec->idx);
+			/* Attempted to write past end of tape */
+
+			break;
+
+		case TAPEDEV_SECT_STATUS_ERR_IO:
+
+			pr_warn("%s:%u: section: %d, error: ERR_IO\n", __func__, __LINE__, sec->idx);
+			/* General I/O error */
+
+			break;
+
+		case TAPEDEV_SECT_STATUS_ERR_PGTABLE:
+
+			pr_warn("%s:%u: section: %d, error: ERR_PGTABLE\n", __func__, __LINE__, sec->idx);
+			/* Page table error */
+
+			break;
+
+		default:
+
+			pr_warn("%s:%u: section: %d, error: Unknown\n", __func__, __LINE__, sec->idx);
+			/* Unknown status code */
+
+			break;
+
+	}
+}
+
+int __handle_section_done(uint32_t cmd, struct section *sec)
+{
+	int err = 0;
+	uint32_t curr_cmd_type = GET_CMD_TYPE(sec->curr_cmd);
+	uint32_t curr_cmd_body = GET_CMD_BODY(sec->curr_cmd);
+
+	switch(curr_cmd_type)
+	{
+		case TAPEDEV_CMD_TAKE_TAPE:
+		{
+			sec->current_tape = curr_cmd_body;
+			uint32_t tape = section_read_from(TAPEDEV_SECT_TAPE_NO_ADDR, sec); 
+	
+			if (tape != sec->current_tape)
+			{
+				pr_err("%s:%u: take_tape was done but inserted tape: '%u' is different from requested tape: '%u' \n", __func__, __LINE__, tape, sec->current_tape);
+				err = -1;
+				goto ret;
+			}
+
+			goto wake_up_request_worker;
+		}
+		case TAPEDEV_CMD_EJECT_TAPE:
+		{
+			// TODO: add constant NO_TAPE instead of magic number 0
+			sec->current_tape = NO_TAPE;
+			uint32_t tape = section_read_from(TAPEDEV_SECT_TAPE_NO_ADDR, sec); 
+	
+			if (tape != NO_TAPE)
+			{
+				pr_err("something went wrong, eject_tape was done but  %u tape is still inserted\n", tape);
+				err = -1;
+				goto ret;
+			}
+	
+			// wake up all threads that were waiting for ejection
+			// if anyone waited
+			if (sec->ejection_cmds)
+			{
+				sec->ejection_cmds = 0;
+				wake_up_all(&sec->ioctl_eject_wait_q);
+			}
+	
+			// It might happen that both request_handling thread and ioctl thread
+			// want to eject, if it happens both current and next cmds are EJECT, 
+			// thus we simply wake up all threads and set next_cmd to NONE
+			if (GET_CMD_TYPE(sec->next_cmd) == TAPEDEV_CMD_EJECT_TAPE)
+			{
+				sec->next_cmd = TAPEDEV_CMD_NONE;
+				goto wake_up_request_worker;
+			}
+			goto ret;
+		}
+		case TAPEDEV_CMD_REWIND:
+			pr_info("%s:%u: tape: %u rewinded\n", __func__, __LINE__, sec->current_tape);
+			goto wake_up_request_worker;
+		case TAPEDEV_CMD_FAST_FWD:
+			pr_info("%s:%u: tape: %u forwarded by %u blocks\n", __func__, __LINE__, sec->current_tape, curr_cmd_body);
+			goto wake_up_request_worker;
+		case TAPEDEV_CMD_READ:
+			pr_info("%s:%u: tape: %u has been read\n", __func__, __LINE__, sec->current_tape);
+			goto wake_up_request_worker;
+		case TAPEDEV_CMD_WRITE:
+			pr_info("%s:%u: tape: %u hase been written\n", __func__, __LINE__, sec->current_tape);
+			goto wake_up_request_worker;
+		default:
+			pr_err("%s:%u: got unsupported cmd: '%u' \n", __func__, __LINE__, curr_cmd_type);
+			err = -2;
+			goto ret;
+	}
+wake_up_request_worker:
+	sec->cmd_done = true;
+	wake_up(&sec->cmd_wait_q);
+ret:
+	return err;
 }
 
 MODULE_LICENSE("GPL");

@@ -27,6 +27,7 @@ struct section
 	wait_queue_head_t cmd_wait_q;
 	uint32_t curr_cmd;
 	uint32_t next_cmd;
+	bool cmd_done;
 	int status;
 	/*
 		gendisk is kernel's representation of of an individual DISK DEVICE
