@@ -40,6 +40,11 @@
 // Bits 8-31 are used to pass command-specific information.
 #define GET_CMD_BODY(cmd) ((uint32_t)((cmd) & 0xffffff00U))
 
+const struct section_cmd NO_CMD = {
+		.cmd = TAPEDEV_CMD_NONE,
+		.is_ioctl = false
+	};
+
 static inline void clear_sec_done_intrpt(struct section* sec)
 {
 	tapedev_iow(sec->private_data, TAPEDEV_IRQ_CLEAR_ADDR, 
@@ -320,6 +325,7 @@ static int tapedev_ioctl(struct block_device *bdev, blk_mode_t mode, unsigned cm
 		// There is some tape inserted, so we set information to eject and wait on 
 		// queue
 		sec->ejection_cmds += 1;
+		// If section is idle we send command, otherwise
 
 		while (sec->current_tape) 
 		{
@@ -914,8 +920,8 @@ static int create_section(
 	init_waitqueue_head(&sec->ioctl_eject_wait_q);
 	init_waitqueue_head(&sec->cmd_wait_q);
 
-	sec->curr_cmd = TAPEDEV_CMD_NONE;
-	sec->next_cmd = TAPEDEV_CMD_NONE;
+	sec->curr_cmd = NO_CMD;
+	sec->next_cmd = NO_CMD;
 	sec->cmd_done = false;
 	sec->private_data = tape_dev;
 	sec->status = 0;
@@ -1085,7 +1091,7 @@ int add_section_disks(struct tapedev_device *tape_dev, int num_sections)
 }
 
 int __handle_section_error(uint32_t section_status, struct section *sec);
-int __handle_section_done(uint32_t cmd, struct section *sec);
+int __handle_section_done(struct section_cmd cmd, struct section *sec);
 
 int handle_section_interrupt(uint32_t section_done, uint32_t section_error, uint32_t section_status, struct section *sec)
 {
@@ -1109,8 +1115,8 @@ int handle_section_interrupt(uint32_t section_done, uint32_t section_error, uint
 	unsigned long flags;
 	spin_lock_irqsave(&sec->lock, flags);
 
-	uint32_t curr_cmd = sec->curr_cmd;
-	sec->curr_cmd = TAPEDEV_CMD_NONE;
+	struct section_cmd curr_cmd = sec->curr_cmd;
+	sec->curr_cmd = NO_CMD;
 
 	// TODO: check below
 	// IDK if section_status has value STATUS_DONE always when section_done is set 
@@ -1122,8 +1128,17 @@ int handle_section_interrupt(uint32_t section_done, uint32_t section_error, uint
 		{
 			goto release_lock;
 		}
-
-		// TODO: handling of other commands
+		// We have only a few cases
+		// 1) Just executed command was from request handler thread, this means it's
+		// 	been woken up but doesn't have critical section yet. Firstly we check if
+		// 	there are any eject ioctl commands, if so, we need to execute them before
+		// 	allowing next request handler command.
+		// 	If there are no commands waiting we end execution and release lock.
+		// 
+		// 2) 
+		// If no error and no EJECT TAPE, request thread is woken up, but doesn't 
+		// have critical section yet since we need to check if there is any command
+		// waiting to be executed, if yes we execute it firstly
 
 		// After completing current command we check if anyone wants to eject tape
 		// If there is no tape to eject we just wake everyone, and go to executing 
@@ -1277,11 +1292,11 @@ int __handle_section_error(uint32_t section_status, struct section *sec)
 	}
 }
 
-int __handle_section_done(uint32_t cmd, struct section *sec)
+int __handle_section_done(struct section_cmd cmd, struct section *sec)
 {
 	int err = 0;
-	uint32_t curr_cmd_type = GET_CMD_TYPE(sec->curr_cmd);
-	uint32_t curr_cmd_body = GET_CMD_BODY(sec->curr_cmd);
+	uint32_t curr_cmd_type = GET_CMD_TYPE(sec->curr_cmd.cmd);
+	uint32_t curr_cmd_body = GET_CMD_BODY(sec->curr_cmd.cmd);
 
 	switch(curr_cmd_type)
 	{
@@ -1311,24 +1326,25 @@ int __handle_section_done(uint32_t cmd, struct section *sec)
 				err = -1;
 				goto ret;
 			}
-	
-			// wake up all threads that were waiting for ejection
-			// if anyone waited
+			// No matter who issued the command, we always wake up ioctl threads
 			if (sec->ejection_cmds)
 			{
 				sec->ejection_cmds = 0;
 				wake_up_all(&sec->ioctl_eject_wait_q);
 			}
 	
-			// It might happen that both request_handling thread and ioctl thread
-			// want to eject, if it happens both current and next cmds are EJECT, 
-			// thus we simply wake up all threads and set next_cmd to NONE
-			if (GET_CMD_TYPE(sec->next_cmd) == TAPEDEV_CMD_EJECT_TAPE)
-			{
-				sec->next_cmd = TAPEDEV_CMD_NONE;
-				goto wake_up_request_worker;
-			}
-			goto ret;
+			// If current command was issued by ioctl we only wake up ioctl threads
+			if (cmd.is_ioctl)
+				goto ret;
+
+			// If current command wasn't issued by ioctl we need to also wake up 
+			// request handling thread and also check if NEXT command isn't 
+			// EJECT_TAPE, if it is we must cancel it since it was issued by ioctl
+			// and we've just woken up all ioctl threads
+			if (GET_CMD_TYPE(sec->next_cmd.cmd) == TAPEDEV_CMD_EJECT_TAPE)
+				sec->next_cmd = NO_CMD;
+	
+			goto wake_up_request_worker;
 		}
 		case TAPEDEV_CMD_REWIND:
 			pr_info("%s:%u: tape: %u rewinded\n", __func__, __LINE__, sec->current_tape);

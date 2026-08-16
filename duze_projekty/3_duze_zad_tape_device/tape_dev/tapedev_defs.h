@@ -10,6 +10,12 @@
 // I would add it to tapedev.h but probably it will be replaced with default .h file
 #define TAPEDEV_CMD_NONE				0x06
 
+struct section_cmd
+{
+	uint32_t cmd;
+	bool is_ioctl;
+};
+
 // To create section object use create_section function
 struct section
 {
@@ -25,8 +31,8 @@ struct section
 	uint32_t ejection_cmds;
 	wait_queue_head_t ioctl_eject_wait_q;
 	wait_queue_head_t cmd_wait_q;
-	uint32_t curr_cmd;
-	uint32_t next_cmd;
+	struct section_cmd curr_cmd;
+	struct section_cmd next_cmd;
 	bool cmd_done;
 	int status;
 	/*
