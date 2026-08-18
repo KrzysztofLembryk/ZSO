@@ -7,3 +7,12 @@ zso2026*.qcow2
 *.ko
 *.mod*
 .clangd
+**/tests/z3-tests-2026/backward-order
+**/tests/z3-tests-2026/eject
+**/tests/z3-tests-2026/ioctl-read
+**/tests/z3-tests-2026/random-order
+**/tests/z3-tests-2026/rw-basic
+**/tests/z3-tests-2026/rw-direct
+**/tests/z3-tests-2026/rw-vector
+**/tests/z3-tests-2026/zig-zag-order
+compile_commands.json

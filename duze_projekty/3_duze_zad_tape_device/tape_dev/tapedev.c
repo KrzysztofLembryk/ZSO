@@ -19,7 +19,6 @@
 #include <linux/interrupt.h>
 #include <linux/mmzone.h>
 #include <linux/delay.h>
-#include <stdint.h>
 
 #define MAX_DEVICES_TAPEDEV 256
 #define BASE_MINOR 0
@@ -67,7 +66,7 @@ static inline void section_send_cmd(uint32_t cmd, struct section *sec)
 
 static inline uint32_t section_read_from(uint32_t addr, struct section *sec)
 {
-	section_ior(sec->private_data, GET_SECTION_ADDR(sec->idx), addr);
+	return section_ior(sec->private_data, GET_SECTION_ADDR(sec->idx), addr);
 }
 // Blk dev example impl
 // https://github.com/CodeImp/sblkdev/blob/master/device.c
@@ -272,7 +271,7 @@ struct tapedev_sect_info {
     uint32_t current_tape;
 };
 
-// #define cmd_name 	_IOX (type, nr, dataitem)
+// #define ioctl_cmd_name 	_IOX (type, nr, dataitem)
 #define TAPEDEV_IOCTL_GET_INFO             _IOR('~', 0, struct tapedev_sect_info)
 #define TAPEDEV_IOCTL_EJECT_TAPE           _IO('~', 1)
 
@@ -314,9 +313,9 @@ static int tapedev_ioctl(struct block_device *bdev, blk_mode_t mode, unsigned cm
 
 		uint32_t current_tape = sec->current_tape;
 
-		pr_info("%s:%u: got EJECT_TAPE ioctl cmd. Current tape: %u  \n", __func__, __LINE__, current_tape);
+		pr_info("%s:%u: got EJECT_TAPE ioctl cmd. Current tape: %u  (if 0 no tape inserted)\n", __func__, __LINE__, current_tape);
 
-		// No tape, no need to eject
+		// No tape, no need to eject --> eject successful
 		if (current_tape == 0)
 		{
 			spin_unlock_irqrestore(&sec->lock, flags);
@@ -1174,6 +1173,7 @@ release_lock:
 	return err;
 }
 
+// To use this function you MUST FIRST ACQUIRE LOCK
 int __handle_section_error(uint32_t section_status, struct section *sec)
 {
 	// Unknown error
@@ -1355,6 +1355,7 @@ ret:
 	return err;
 }
 
+// To use this function you MUST FIRST ACQUIRE LOCK
 int __handle_ejection_cmds_if_present(struct section *sec)
 {
 	if (sec->ejection_cmds)
@@ -1382,6 +1383,7 @@ int __handle_ejection_cmds_if_present(struct section *sec)
 	return 0;
 }
 
+// To use this function you MUST FIRST ACQUIRE LOCK
 void __handle_next_cmd(struct section *sec)
 {
 	uint32_t next_cmd_type = GET_CMD_TYPE(sec->next_cmd.cmd);
