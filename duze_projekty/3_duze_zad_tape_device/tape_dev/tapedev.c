@@ -149,7 +149,7 @@ static irqreturn_t tapedev_interrupt_handler(int irq, void *opaque_dev)
 			num_sections = tapedev_ior(dev, TAPEDEV_SECTIONS_ADDR);
 
 			pr_info("%s:%u: device status: %u\n", __func__, __LINE__, dev_status);
-			pr_info("%s:%u: nums sections: %u\n", __func__, __LINE__, num_sections);
+			pr_info("%s:%u: nbr of sections: %u\n", __func__, __LINE__, num_sections);
 
 			for (uint32_t s_id = 0; s_id < num_sections; s_id++)
 			{
@@ -421,12 +421,13 @@ static inline int process_request(struct request *rq, unsigned int *nr_bytes)
 	struct bio_vec bvec;
 	struct req_iterator iter;
 	struct section *s = rq->q->queuedata;
-	// We should probably use here TAPEDEV_SECT_PTR_SHIFT instead of SECTOR_SHIFT????
+	// TODO: We should probably use here TAPEDEV_SECT_PTR_SHIFT instead of SECTOR_SHIFT????
 	loff_t pos = blk_rq_pos(rq) << SECTOR_SHIFT;
 	loff_t dev_size = (s->n_sectors << SECTOR_SHIFT);
 
 
-	rq_for_each_segment(bvec, rq, iter) {
+	rq_for_each_segment(bvec, rq, iter) 
+	{
 		// bvec is populated with current memory segment we want to read/write
 		// so from bv_page number we get page_addres, and jump to offset we want to
 		// read from this page. We read bv_len bytes 
@@ -450,7 +451,7 @@ static inline int process_request(struct request *rq, unsigned int *nr_bytes)
 			pr_info("process_request WRITE");
 			return 0;
 		default:
-			blk_dump_rq_flags(rq, TAPEDEV_NAME " bad request");
+			blk_dump_rq_flags(rq, TAPEDEV_NAME " bad request, supported requests are READ and WRITE");
 			return BLK_STS_IOERR;
 		}
 
@@ -490,20 +491,20 @@ static struct blk_mq_ops mq_ops = {
 	.queue_rq = _queue_rq,
 };
 
-static inline int init_tag_set(struct blk_mq_tag_set *set, void *data)
-{
-	set->ops = &mq_ops;
-	set->nr_hw_queues = 1;
-	set->nr_maps = 1;
-	set->queue_depth = 128;
-	set->numa_node = NUMA_NO_NODE;
-	// set->flags = no flags I think are needed;
+// static inline int init_tag_set(struct blk_mq_tag_set *set, void *data)
+// {
+// 	set->ops = &mq_ops;
+// 	set->nr_hw_queues = 1;
+// 	set->nr_maps = 1;
+// 	set->queue_depth = 128;
+// 	set->numa_node = NUMA_NO_NODE;
+// 	// set->flags = no flags I think are needed;
 
-	set->cmd_size = 0;
-	set->driver_data = data;
+// 	set->cmd_size = 0;
+// 	set->driver_data = data;
 
-	return blk_mq_alloc_tag_set(set);
-}
+// 	return blk_mq_alloc_tag_set(set);
+// }
 
 
 // static int create_parent_dev(
@@ -628,6 +629,9 @@ static int tapedev_probe(
 	// (coherent - memory that is always visible to both the CPU and device without 
 	// 	explicit cache managemen)
 	// Our tapedevices support 32 bit registers
+	u64 req_dma_mask = dma_get_required_mask(&pdev->dev);
+	pr_info("tapedev_probe - req_dma_mask: %llu\n", req_dma_mask);
+
 	if ((err = dma_set_mask_and_coherent(&pdev->dev, DMA_BIT_MASK(32))))
 		goto out_dma_mask;
 	// For a device to perform DMA, we must first enable the device's ability to perform transactions
@@ -806,12 +810,14 @@ static void tapedev_remove(struct pci_dev *pdev)
 	tapedev_iow(tape_dev, TAPEDEV_ENABLE_ADDR, 0);
 	free_irq(pdev->irq, tape_dev);
 
-	for (int s_id = 1; s_id <= tape_dev->n_sections; s_id++)
+	for (int s_id = 0; s_id < tape_dev->n_sections; s_id++)
 	{
 		sysfs_remove_group(&disk_to_dev(tape_dev->sections[s_id]->gdisk)->kobj, &tape_attr_group);
 		del_gendisk(tape_dev->sections[s_id]->gdisk);
 		put_disk(tape_dev->sections[s_id]->gdisk);
 		kfree(tape_dev->sections[s_id]);
+		// TODO: inside section we also initialized some stuff like lists etc.
+		// they probably need to be deleted too
 	}
 	kfree(tape_dev->sections);
 	// blk dev free
@@ -961,8 +967,11 @@ static int create_section(
 		goto free_alloc_s;
 	}
 
-	// we set private driver_data to s
-	err = init_tag_set(&sec->tag_set, sec);
+	// err = init_tag_set(&sec->tag_set, sec);
+
+	// Each section device can process only ONE request at the time, thus we set 
+	// queue_depth as 1
+	err = blk_mq_alloc_sq_tag_set(&sec->tag_set, &mq_ops, 1, 0);
 	if (err) {
 		pr_err("%s:%u: Failed to allocate tag set\n", __func__, __LINE__);
 		goto free_dma_alloc;
@@ -1126,7 +1135,10 @@ int handle_section_interrupt(uint32_t section_done, uint32_t section_error, uint
 	spin_lock_irqsave(&sec->lock, flags);
 
 	if (section_status == TAPEDEV_SECT_STATUS_WORKING)
+	{
+		sec->status = TAPEDEV_SECT_STATUS_WORKING;
 		goto release_lock;
+	}
 
 	if (section_error)
 	{
@@ -1153,6 +1165,7 @@ int handle_section_interrupt(uint32_t section_done, uint32_t section_error, uint
 	}
 	else // section IDLE ???
 	{
+		sec->status = TAPEDEV_SECT_STATUS_IDLE;
 		pr_info("%s:%u: section_status == TAPEDEV_SECT_STATUS_IDLE, do nothing???\n", __func__, __LINE__);
 	}
 
@@ -1166,8 +1179,6 @@ int handle_section_interrupt(uint32_t section_done, uint32_t section_error, uint
 	__handle_next_cmd(sec);
 
 release_lock:
-	// TODO: maybe add status variable that takes either err or just status values
-	// sec->status = err;
 	spin_unlock_irqrestore(&sec->lock, flags);
 
 	return err;
@@ -1262,6 +1273,7 @@ int __handle_section_error(uint32_t section_status, struct section *sec)
 
 			break;
 	}
+	sec->status = -err;
 	return -err;
 }
 
@@ -1275,6 +1287,7 @@ int __handle_section_done(uint32_t section_status, struct section *sec)
 		err = -1;
 		goto ret;
 	}
+	sec->status = TAPEDEV_SECT_STATUS_DONE;
 	struct section_cmd curr_cmd = sec->curr_cmd;
 	sec->curr_cmd = NO_CMD;
 
