@@ -19,6 +19,7 @@
 #include <linux/interrupt.h>
 #include <linux/mmzone.h>
 #include <linux/delay.h>
+#include <stdint.h>
 
 #define MAX_DEVICES_TAPEDEV 256
 #define BASE_MINOR 0
@@ -28,9 +29,11 @@
 #define BAR_MAXLEN 0
 #define NO_TAPE 0 
 
-#define GET_SECTION_ADDR(s_id) ((s_id + 1) * 0x100)
 #define PHYSICAL_BLOCK_SIZE 8192
 #define BASE_TAPE_SIZE (32 * 8192)
+#define DMA_BUF_SIZE (512 * (sizeof(uint64_t)))
+
+#define GET_SECTION_ADDR(s_id) ((s_id + 1) * 0x100)
 #define SIZE_OF_TAPE(s_type) ((1 << s_type) * BASE_TAPE_SIZE)
 #define GET_NBR_OF_SECTORS(s_type, n_tapes) ((SIZE_OF_TAPE(s_type) / 512) * n_tapes)
 #define TAPEDEV_IRQ_SECT_X_DONE(i)  (TAPEDEV_IRQ_SECT_0_DONE  + (i))
@@ -373,6 +376,71 @@ static const struct block_device_operations tapedev_ops = {
 };
 
 // Multi queue and request processing functions
+static void ps3disk_scatter_gather(struct ps3_storage_device *dev,
+				   struct request *req, int gather)
+{
+	unsigned int offset = 0;
+	struct req_iterator iter;
+	struct bio_vec bvec;
+
+	rq_for_each_segment(bvec, req, iter) {
+		dev_dbg(&dev->sbd.core, "%s:%u: %u sectors from %llu\n",
+			__func__, __LINE__, bio_sectors(iter.bio),
+			iter.bio->bi_iter.bi_sector);
+		if (gather)
+			memcpy_from_bvec(dev->bounce_buf + offset, &bvec);
+		else
+			memcpy_to_bvec(&bvec, dev->bounce_buf + offset);
+		offset += bvec.bv_len;
+	}
+}
+
+static blk_status_t ps3disk_submit_request_sg(struct ps3_storage_device *dev,
+					      struct request *req)
+{
+	struct ps3disk_private *priv = ps3_system_bus_get_drvdata(&dev->sbd);
+	int write = rq_data_dir(req), res;
+	const char *op = write ? "write" : "read";
+	u64 start_sector, sectors;
+	unsigned int region_id = dev->regions[dev->region_idx].id;
+
+#ifdef DEBUG
+	unsigned int n = 0;
+	struct bio_vec bv;
+	struct req_iterator iter;
+
+	rq_for_each_segment(bv, req, iter)
+		n++;
+	dev_dbg(&dev->sbd.core,
+		"%s:%u: %s req has %u bvecs for %u sectors\n",
+		__func__, __LINE__, op, n, blk_rq_sectors(req));
+#endif
+
+	start_sector = blk_rq_pos(req) * priv->blocking_factor;
+	sectors = blk_rq_sectors(req) * priv->blocking_factor;
+	dev_dbg(&dev->sbd.core, "%s:%u: %s %llu sectors starting at %llu\n",
+		__func__, __LINE__, op, sectors, start_sector);
+
+	if (write) {
+		ps3disk_scatter_gather(dev, req, 1);
+
+		res = lv1_storage_write(dev->sbd.dev_id, region_id,
+					start_sector, sectors, 0,
+					dev->bounce_lpar, &dev->tag);
+	} else {
+		res = lv1_storage_read(dev->sbd.dev_id, region_id,
+				       start_sector, sectors, 0,
+				       dev->bounce_lpar, &dev->tag);
+	}
+	if (res) {
+		dev_err(&dev->sbd.core, "%s:%u: %s failed %d\n", __func__,
+			__LINE__, op, res);
+		return BLK_STS_IOERR;
+	}
+
+	priv->req = req;
+	return BLK_STS_OK;
+}
 
 static inline int process_request(struct request *rq, unsigned int *nr_bytes)
 {
@@ -444,10 +512,10 @@ static inline int process_request(struct request *rq, unsigned int *nr_bytes)
 		switch (req_op(rq)) {
 		case REQ_OP_READ:
 			pr_info("process_request READ");
-			memcpy(buf, s->data_cpu + pos, len); /* READ */
+			memcpy(buf, s->cpu_dma_buf + pos, len); /* READ */
 			return 0;
 		case REQ_OP_WRITE:
-			memcpy(s->data_cpu + pos, buf, len); /* WRITE */
+			memcpy(s->cpu_dma_buf + pos, buf, len); /* WRITE */
 			pr_info("process_request WRITE");
 			return 0;
 		default:
@@ -632,8 +700,13 @@ static int tapedev_probe(
 	u64 req_dma_mask = dma_get_required_mask(&pdev->dev);
 	pr_info("tapedev_probe - req_dma_mask: %llu\n", req_dma_mask);
 
+	// Our device has only 32-bit registers, so DMA mask needs to be 32 bit, thanks
+	// to that address returned by dma_alloc_coherent should be valid 32bit address 
+	// aligned to 512byte boundary stored in 64bit variable, meaning after shifting 
+	// 9 bits to the right we should get correct 32bit address
 	if ((err = dma_set_mask_and_coherent(&pdev->dev, DMA_BIT_MASK(32))))
 		goto out_dma_mask;
+
 	// For a device to perform DMA, we must first enable the device's ability to perform transactions
 	pci_set_master(pdev);
 
@@ -741,42 +814,48 @@ static int tapedev_probe(
 		goto sections_alloc_fail;
 	}
 
-	// err = create_parent_dev(tape_dev, num_sections, tape_dev->idx);
-
-	// if (err < 0)
-	// {
-	// 	pr_warn("%s:%u: create_parent_dev failed, err: %d\n", __func__, __LINE__, err);
-	// 	goto free_sections;
-	// }
-
-
 	err = create_sections(tape_dev, num_sections);
 	if (err) goto free_sections;
 
 	err = add_section_disks(tape_dev, num_sections);
 	if (err) goto free_sections;
 
-	// now we can enable section interrupts
-	// TODO: Or maybe we can check how many sections dev has before creating sections
-	// ?
-	uint32_t mask = (0xffffffff ^ (1 << TAPEDEV_IRQ_INIT_DONE)) ^ (1 << TAPEDEV_IRQ_HW_ERROR);
+	uint32_t irq_mask = (0xffffffff ^ (1 << TAPEDEV_IRQ_INIT_DONE)) ^ (1 << TAPEDEV_IRQ_HW_ERROR);
+
+	// TODO: add helper function: _enable_dev_interrupts
 
 	// Now we enable interrupts for this device's sections
 	for (int sec_id = 0; i < num_sections; i++)
 	{
-		mask = mask ^ (1 << TAPEDEV_IRQ_SECT_X_DONE(sec_id));
-		mask = mask ^ (1 << TAPEDEV_IRQ_SECT_X_ERROR(sec_id));
+		irq_mask = irq_mask ^ (1 << TAPEDEV_IRQ_SECT_X_DONE(sec_id));
+		irq_mask = irq_mask ^ (1 << TAPEDEV_IRQ_SECT_X_ERROR(sec_id));
 	}
 	tapedev_iow(
 		tape_dev, 
 		TAPEDEV_IRQ_MASK_ADDR, 
-		mask	
+		irq_mask	
 	);
 
-	// TODO: add blk dev impl
+	// TODO: add helper function: _set_dma_hw_buff
+
+	// And now for each section we need to set its dma address, they need to be 
+	// aligned to 512 byte boundary
+	// Explanation of alignment (stackoverflow): 4-alignment simply means that the 
+	// pointer, when considered as a numeric address, is a multiple of 4. If the 
+	// pointer is not a multiple of the required alignment, then it is unaligned. 
+	for (int sec_id = 0; i < num_sections; i++)
+	{
+		// dma_addr is 64, it is 512 byte aligned, so bits 0-8 are zeroed, 
+		// we want bits 9-40
+		// So we firstly shift dma_addr 9 times to the right, then zero bits 32-63 
+		// then cast to uint32
+		uint32_t dma_hw_buf_addr = 
+			(uint32_t)((tape_dev->sections[i]->dma_addr >> 9) & 0xffffffffULL);
+
+		section_iow(tape_dev, GET_SECTION_ADDR(i), TAPEDEV_SECT_BUFFER_PTR_ADDR, dma_hw_buf_addr);
+	}
 
 	return 0;
-	// put_disk(tape_dev->parent_gdisk);
 free_sections:
 	kfree(tape_dev->sections);
 sections_alloc_fail:
@@ -955,17 +1034,24 @@ static int create_section(
 	sec->status = 0;
 	// s->data_buf = kzalloc(SIZE_OF_TAPE(s->section_type) * s->n_sectors, GFP_KERNEL);
 
-	// TODO: currently for each section we have only one such dma buff, but probably
-	// we will need many for one section? Nah probably not, section is one continous
-	// chunk of memory
-	if (!(sec->data_cpu = dma_alloc_coherent(&tape_dev->pdev->dev,
-			PAGE_SIZE,
-			&sec->data_dma, GFP_KERNEL))) 
+	// dma_alloc_coherent - allocates a memory region accessible simultaneously by 
+	// both the CPU and hardware, of size DMA_BUF_SIZE. Cpu (so our programme) must
+	// access it via cpu_dma_buf. We must send/set dma_addr to hardware so that it 
+	// can also access our dma memory 
+	// cpu_dma_buf and dma_addr are already 512 byte aligned thanks to 
+	// dma_alloc_coherent
+	if (!(sec->cpu_dma_buf = dma_alloc_coherent(&tape_dev->pdev->dev,
+			DMA_BUF_SIZE,
+			&sec->dma_addr, GFP_KERNEL))) 
 	{
 		pr_err("%s:%u: Failed to dma_alloc_coherent\n", __func__, __LINE__);
 		err = -ENOMEM;
 		goto free_alloc_s;
 	}
+
+	// To be 512 byte aligned our first 9 bits (0 - 8) need to be zeroed, so that 
+	// in our address = 2^i + 2^(i+1) + ..., i >= 9, since 2^9 = 512, and if i >= 9
+	// all addresses will be divisible by 512 so aligned to 512 byte boundary
 
 	// err = init_tag_set(&sec->tag_set, sec);
 
@@ -1024,7 +1110,7 @@ static int create_section(
 free_tag_set:
 	blk_mq_free_tag_set(&sec->tag_set);
 free_dma_alloc:
-	dma_free_coherent(&tape_dev->pdev->dev, PAGE_SIZE, sec->data_cpu, sec->data_dma);
+	dma_free_coherent(&tape_dev->pdev->dev, PAGE_SIZE, sec->cpu_dma_buf, sec->dma_addr);
 free_alloc_s:
 	kfree(sec);
 fail:
@@ -1063,7 +1149,7 @@ int create_sections(struct tapedev_device *tape_dev, int num_sections)
 				// del_gendisk(tape_dev->sections[i]->gdisk);
 
 				blk_mq_free_tag_set(&tape_dev->sections[i]->tag_set);
-				dma_free_coherent(&tape_dev->pdev->dev, PAGE_SIZE, tape_dev->sections[i]->data_cpu, tape_dev->sections[i]->data_dma);
+				dma_free_coherent(&tape_dev->pdev->dev, PAGE_SIZE, tape_dev->sections[i]->cpu_dma_buf, tape_dev->sections[i]->dma_addr);
 				put_disk(tape_dev->sections[i]->gdisk);
 				kfree(tape_dev->sections[i]);
 			}
@@ -1111,7 +1197,7 @@ int add_section_disks(struct tapedev_device *tape_dev, int num_sections)
 				// for the rest put_disk and kfree is enough
 
 				blk_mq_free_tag_set(&s->tag_set);
-				dma_free_coherent(&tape_dev->pdev->dev, PAGE_SIZE, s->data_cpu, s->data_dma);
+				dma_free_coherent(&tape_dev->pdev->dev, PAGE_SIZE, s->cpu_dma_buf, s->dma_addr);
 				put_disk(s->gdisk);
 				kfree(s);
 			}

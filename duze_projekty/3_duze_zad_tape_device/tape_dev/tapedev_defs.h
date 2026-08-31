@@ -43,8 +43,10 @@ struct section
 	// request queue is inside gdisk
 	// struct request_queue *queue; /* The device request queue */
 	
-	dma_addr_t data_dma;
-	void *data_cpu;
+	// dma address the hardware should use
+	dma_addr_t dma_addr;
+	// data_cpu is our dma buff to which we will write/read scatter gather data
+	void *cpu_dma_buf;
 	struct blk_mq_tag_set tag_set; /* multi queue */
 
 	// private_data must be tapedev_device
