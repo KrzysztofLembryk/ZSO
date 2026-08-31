@@ -1,4 +1,5 @@
 #include "tapedev.h"
+#include "linux/blk-mq.h"
 #include "linux/irqreturn.h"
 #include "linux/stddef.h"
 #include "linux/wait.h"
@@ -31,8 +32,10 @@
 
 #define PHYSICAL_BLOCK_SIZE 8192
 #define BASE_TAPE_SIZE (32 * 8192)
-#define DMA_BUF_SIZE (512 * (sizeof(uint64_t)))
+// DMA_BUF_SIZE is equal to the TAPEDEV_BUF_PGTABLE_SIZE
+// #define DMA_BUF_SIZE (512 * (sizeof(uint64_t)))
 
+#define GET_BLOCK_SIZE(blk_type) ((1 << blk_type) * 512)
 #define GET_SECTION_ADDR(s_id) ((s_id + 1) * 0x100)
 #define SIZE_OF_TAPE(s_type) ((1 << s_type) * BASE_TAPE_SIZE)
 #define GET_NBR_OF_SECTORS(s_type, n_tapes) ((SIZE_OF_TAPE(s_type) / 512) * n_tapes)
@@ -375,74 +378,7 @@ static const struct block_device_operations tapedev_ops = {
 	.ioctl = tapedev_ioctl
 };
 
-// Multi queue and request processing functions
-static void ps3disk_scatter_gather(struct ps3_storage_device *dev,
-				   struct request *req, int gather)
-{
-	unsigned int offset = 0;
-	struct req_iterator iter;
-	struct bio_vec bvec;
-
-	rq_for_each_segment(bvec, req, iter) {
-		dev_dbg(&dev->sbd.core, "%s:%u: %u sectors from %llu\n",
-			__func__, __LINE__, bio_sectors(iter.bio),
-			iter.bio->bi_iter.bi_sector);
-		if (gather)
-			memcpy_from_bvec(dev->bounce_buf + offset, &bvec);
-		else
-			memcpy_to_bvec(&bvec, dev->bounce_buf + offset);
-		offset += bvec.bv_len;
-	}
-}
-
-static blk_status_t ps3disk_submit_request_sg(struct ps3_storage_device *dev,
-					      struct request *req)
-{
-	struct ps3disk_private *priv = ps3_system_bus_get_drvdata(&dev->sbd);
-	int write = rq_data_dir(req), res;
-	const char *op = write ? "write" : "read";
-	u64 start_sector, sectors;
-	unsigned int region_id = dev->regions[dev->region_idx].id;
-
-#ifdef DEBUG
-	unsigned int n = 0;
-	struct bio_vec bv;
-	struct req_iterator iter;
-
-	rq_for_each_segment(bv, req, iter)
-		n++;
-	dev_dbg(&dev->sbd.core,
-		"%s:%u: %s req has %u bvecs for %u sectors\n",
-		__func__, __LINE__, op, n, blk_rq_sectors(req));
-#endif
-
-	start_sector = blk_rq_pos(req) * priv->blocking_factor;
-	sectors = blk_rq_sectors(req) * priv->blocking_factor;
-	dev_dbg(&dev->sbd.core, "%s:%u: %s %llu sectors starting at %llu\n",
-		__func__, __LINE__, op, sectors, start_sector);
-
-	if (write) {
-		ps3disk_scatter_gather(dev, req, 1);
-
-		res = lv1_storage_write(dev->sbd.dev_id, region_id,
-					start_sector, sectors, 0,
-					dev->bounce_lpar, &dev->tag);
-	} else {
-		res = lv1_storage_read(dev->sbd.dev_id, region_id,
-				       start_sector, sectors, 0,
-				       dev->bounce_lpar, &dev->tag);
-	}
-	if (res) {
-		dev_err(&dev->sbd.core, "%s:%u: %s failed %d\n", __func__,
-			__LINE__, op, res);
-		return BLK_STS_IOERR;
-	}
-
-	priv->req = req;
-	return BLK_STS_OK;
-}
-
-static inline int process_request(struct request *rq, unsigned int *nr_bytes)
+static void do_scatter_gather(struct request *req, struct section *sec, int write)
 {
 	/*
 		struct request has the following interesting us fields:
@@ -485,78 +421,155 @@ static inline int process_request(struct request *rq, unsigned int *nr_bytes)
 		bio_vecs, and each bio_vec knows which part of given page we want to 
 		read/write
 	*/
-	int ret = 0;
-	struct bio_vec bvec;
+	struct tapedev_device *dev = sec->private_data; 
+
+	// unsigned int offset = 0;
 	struct req_iterator iter;
-	struct section *s = rq->q->queuedata;
-	// TODO: We should probably use here TAPEDEV_SECT_PTR_SHIFT instead of SECTOR_SHIFT????
-	loff_t pos = blk_rq_pos(rq) << SECTOR_SHIFT;
-	loff_t dev_size = (s->n_sectors << SECTOR_SHIFT);
+	struct bio_vec bvec;
+	uint64_t *pgt_buf = sec->cpu_dma_buf;
+	uint32_t section_blk_type = section_read_from(TAPEDEV_SECT_TAPE_BLOCKSIZE_ADDR, sec);
+	uint32_t section_blk_size = GET_BLOCK_SIZE(section_blk_type);
 
+	pr_warn("%s:%u: section: %u, blk_type: %u, blk_size: %u \n",
+			__func__, __LINE__, sec->idx, section_blk_type, section_blk_size);
 
-	rq_for_each_segment(bvec, rq, iter) 
+	// Firstly we zero whole buffer if we will do write
+	if (write)
+	{
+		pr_warn("%s:%u: We are zeroing page table buf\n", __func__, __LINE__);
+		for (int i = 0; i < TAPEDEV_BUF_PGTABLE_ENTRIES; i++)
+		{
+			pgt_buf[i] = 0;
+		}
+	}
+
+	// loff_t pos = blk_rq_pos(req) << TAPEDEV_SECT_PTR_SHIFT;
+	// loff_t dev_size = (sec->n_sectors << TAPEDEV_SECT_PTR_SHIFT);
+
+	// if ((pos + len) > dev_size)
+	// 	len = (unsigned long)(dev_size - pos);
+	int n_segments = 0;
+
+	// While creating scatter gather page table we probably should also create a list
+	// of commands for given entry, so that afterwards we will simply run through 
+	// these commands
+	rq_for_each_segment(bvec, req, iter) 
 	{
 		// bvec is populated with current memory segment we want to read/write
 		// so from bv_page number we get page_addres, and jump to offset we want to
 		// read from this page. We read bv_len bytes 
-		void *buf = page_address(bvec.bv_page) + bvec.bv_offset;
-		unsigned long len = bvec.bv_len;
+		dma_addr_t hw_mem_addr = dma_map_page(&dev->pdev->dev,
+                             bvec.bv_page,
+                             bvec.bv_offset,
+                             bvec.bv_len,
+                             rq_data_dir(req) == WRITE ? DMA_TO_DEVICE : DMA_FROM_DEVICE);
 
-		pr_warn("%s:%u: %u sectors from %llu\n",
-			__func__, __LINE__, bio_sectors(iter.bio),
-			iter.bio->bi_iter.bi_sector);
 
-		if ((pos + len) > dev_size)
-			len = (unsigned long)(dev_size - pos);
+		uint32_t actual_addr = (uint32_t)(hw_mem_addr >> 9);
+		uint32_t blksize_blocks =  DIV_ROUND_UP(bvec.bv_len, section_blk_size) ;
+		// TODO: I think - if we have less than section_blk_size division result is 0
+		// 	but still there is some data to write/read
+		if (blksize_blocks <= 0)
+			blksize_blocks = 1;
 
-		switch (req_op(rq)) {
-		case REQ_OP_READ:
-			pr_info("process_request READ");
-			memcpy(buf, s->cpu_dma_buf + pos, len); /* READ */
-			return 0;
-		case REQ_OP_WRITE:
-			memcpy(s->cpu_dma_buf + pos, buf, len); /* WRITE */
-			pr_info("process_request WRITE");
-			return 0;
-		default:
-			blk_dump_rq_flags(rq, TAPEDEV_NAME " bad request, supported requests are READ and WRITE");
-			return BLK_STS_IOERR;
+		pr_warn("%s:%u: segment: '%d',  hw_mem_addr high: %llu, low: %llu, blkszie_blocks: %u\n", __func__, __LINE__, n_segments, (hw_mem_addr >> 9) & 0xffffffff00000000, (hw_mem_addr >> 9) & 0xffffffffULL, blksize_blocks);
+
+		uint64_t pgt_elem = ((u64)actual_addr << 32) | (u64) blksize_blocks;
+		pgt_buf[n_segments] = pgt_elem;
+
+		n_segments++;
+
+		if (n_segments >= 512)
+		{
+			// Need to wait or whatever we need to do if too many segments
+			pr_warn("%s:%u: !!!!! n_segments >= 512\n", __func__, __LINE__);
+			return;
 		}
-
-		pos += len;
-		*nr_bytes += len;
 	}
+}
+
+static inline int submit_request_sg(struct request *req, struct section *sec)
+{
+	int ret = BLK_STS_OK;
+	// struct bio_vec bvec;
+	// struct req_iterator iter;
+	// TODO: We should probably use here TAPEDEV_SECT_PTR_SHIFT instead of SECTOR_SHIFT????
+	// loff_t pos = blk_rq_pos(req) << TAPEDEV_SECT_PTR_SHIFT;
+	// loff_t dev_size = (s->n_sectors << TAPEDEV_SECT_PTR_SHIFT);
+
+	// TODO: check this, why is it like that etc.
+	uint64_t start_sector = blk_rq_pos(req); 
+	uint64_t sectors = blk_rq_sectors(req);
+
+	switch (req_op(req)) {
+	case REQ_OP_WRITE:
+		pr_warn("%s:%u: WRITE %llu sectors starting at %llu\n",
+			__func__, __LINE__, sectors, start_sector);
+
+		do_scatter_gather(req, sec, 1);
+		return BLK_STS_OK;
+	case REQ_OP_READ:
+		pr_warn("%s:%u: READ %llu sectors starting at %llu\n",
+			__func__, __LINE__, sectors, start_sector);
+
+		do_scatter_gather(req, sec, 0);
+		return BLK_STS_OK;
+	default:
+		blk_dump_rq_flags(req, TAPEDEV_NAME " bad request, supported requests are READ and WRITE");
+		return BLK_STS_IOERR;
+	}
+
+		// pos += len;
+		// *nr_bytes += len;
+	sec->req = req;
 
 	return ret;
 }
 
-static blk_status_t _queue_rq(struct blk_mq_hw_ctx *hctx, const struct blk_mq_queue_data *bd)
+static inline int process_request(struct request *req, struct section *sec)
 {
-	// struct request_queue *q = hctx->queue;
-	// struct section *s = q->queuedata;
-	// struct tapedev_device *dev = s->private_data;
+	switch (req_op(req)) {
+	case REQ_OP_READ:
+	case REQ_OP_WRITE:
+		return submit_request_sg(req, sec);
+	default:
+		pr_err("%s:%u :: unsupported request type: %d\n", __func__, __LINE__, req_op(req));
+		return BLK_STS_IOERR;
+	}
+}
 
-	unsigned int nr_bytes = 0;
+static blk_status_t tapedev_queue_rq(struct blk_mq_hw_ctx *hctx, const struct blk_mq_queue_data *bd)
+{
+	struct request_queue *q = hctx->queue;
+	struct section *sec = q->queuedata;
+	// struct tapedev_device *dev = sec->private_data;
+	// unsigned int nr_bytes = 0;
 	blk_status_t status = BLK_STS_OK;
-	struct request *rq = bd->rq;
+	struct request *req = bd->rq;
 
 	//might_sleep();
-	cant_sleep(); /* cannot use any locks that make the thread sleep */
+	// cant_sleep(); /* cannot use any locks that make the thread sleep */
 
-	blk_mq_start_request(rq);
+	blk_mq_start_request(req);
+	spin_lock_irq(&sec->lock);
 
-	if (process_request(rq, &nr_bytes))
+	if (process_request(req, sec))
 		status = BLK_STS_IOERR;
 
-	pr_debug("request %llu:%d processed\n", blk_rq_pos(rq), nr_bytes);
+	spin_unlock_irq(&sec->lock);
 
-	blk_mq_end_request(rq, status);
+	// TODO: this end request probably should be in interrrupt handler for section
+	// once we are sure that request was handled, if we end request here all
+	// biovecs etc will be freed and our slow tapedev won't have access to this data
+	// anymore since we store pointers to these biovecs data in our page table
+	// 
+	blk_mq_end_request(req, status);
 
 	return status;
 }
 
 static struct blk_mq_ops mq_ops = {
-	.queue_rq = _queue_rq,
+	.queue_rq = tapedev_queue_rq,
 };
 
 // static inline int init_tag_set(struct blk_mq_tag_set *set, void *data)
@@ -830,6 +843,7 @@ static int tapedev_probe(
 		irq_mask = irq_mask ^ (1 << TAPEDEV_IRQ_SECT_X_DONE(sec_id));
 		irq_mask = irq_mask ^ (1 << TAPEDEV_IRQ_SECT_X_ERROR(sec_id));
 	}
+
 	tapedev_iow(
 		tape_dev, 
 		TAPEDEV_IRQ_MASK_ADDR, 
@@ -843,16 +857,17 @@ static int tapedev_probe(
 	// Explanation of alignment (stackoverflow): 4-alignment simply means that the 
 	// pointer, when considered as a numeric address, is a multiple of 4. If the 
 	// pointer is not a multiple of the required alignment, then it is unaligned. 
-	for (int sec_id = 0; i < num_sections; i++)
+	for (int sec_id = 0; sec_id < num_sections; sec_id++)
 	{
 		// dma_addr is 64, it is 512 byte aligned, so bits 0-8 are zeroed, 
 		// we want bits 9-40
 		// So we firstly shift dma_addr 9 times to the right, then zero bits 32-63 
 		// then cast to uint32
 		uint32_t dma_hw_buf_addr = 
-			(uint32_t)((tape_dev->sections[i]->dma_addr >> 9) & 0xffffffffULL);
+			(uint32_t)((tape_dev->sections[sec_id]->dma_addr >> 9) & 0xffffffffULL);
 
-		section_iow(tape_dev, GET_SECTION_ADDR(i), TAPEDEV_SECT_BUFFER_PTR_ADDR, dma_hw_buf_addr);
+		section_iow(tape_dev, GET_SECTION_ADDR(sec_id), 	
+			TAPEDEV_SECT_BUFFER_PTR_ADDR, dma_hw_buf_addr);
 	}
 
 	return 0;
@@ -994,6 +1009,8 @@ static int create_section(
 	struct tapedev_device *tape_dev
 )
 {
+	// TODO: check if these values are correct, in tapedev.h we have sth like 
+	// TAPEDEV_BUF_PGTABLE_SIZE etc.
 	struct queue_limits lim = {
 		.logical_block_size		= SECTOR_SIZE, 
 		/*
@@ -1030,6 +1047,7 @@ static int create_section(
 	sec->curr_cmd = NO_CMD;
 	sec->next_cmd = NO_CMD;
 	sec->cmd_done = false;
+	sec->req = NULL;
 	sec->private_data = tape_dev;
 	sec->status = 0;
 	// s->data_buf = kzalloc(SIZE_OF_TAPE(s->section_type) * s->n_sectors, GFP_KERNEL);
@@ -1041,7 +1059,7 @@ static int create_section(
 	// cpu_dma_buf and dma_addr are already 512 byte aligned thanks to 
 	// dma_alloc_coherent
 	if (!(sec->cpu_dma_buf = dma_alloc_coherent(&tape_dev->pdev->dev,
-			DMA_BUF_SIZE,
+			TAPEDEV_BUF_PGTABLE_SIZE,
 			&sec->dma_addr, GFP_KERNEL))) 
 	{
 		pr_err("%s:%u: Failed to dma_alloc_coherent\n", __func__, __LINE__);
