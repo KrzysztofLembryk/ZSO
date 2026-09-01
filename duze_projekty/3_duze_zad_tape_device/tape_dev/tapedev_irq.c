@@ -38,12 +38,6 @@ int handle_section_interrupt(uint32_t section_done, uint32_t section_error, uint
 		pr_info("%s:%u:else if (section_done) section_id: %u, done: %u, STATUS: %u\n", __func__, __LINE__, sec->idx, section_done, section_status);
 		clear_sec_done_intrpt(sec);
 
-		pr_info("%s:%u: before clearing section_done intrpt section_status == %u\n", __func__, __LINE__, section_status);
-
-		uint32_t status = section_read_from(TAPEDEV_SECT_STATUS_ADDR, sec);
-
-		pr_info("%s:%u: after clearing section_done intrpt section_status == %u\n", __func__, __LINE__, status);
-
 		// TODO: if handle_section done failed something went REAALLY wrong, so we 
 		// end execution without next steps ???
 		err = __handle_section_done(section_status, sec);
@@ -247,7 +241,7 @@ int __handle_section_done(uint32_t section_status, struct section *sec)
 			pr_info("%s:%u: tape: %u rewinded\n", __func__, __LINE__, sec->current_tape);
 			goto wake_up_request_worker;
 		case TAPEDEV_CMD_FAST_FWD:
-			pr_info("%s:%u: tape: %u forwarded by %u blocks\n", __func__, __LINE__, sec->current_tape, curr_cmd_body);
+			pr_info("%s:%u: tape: %u forwarded by %u blocks\n", __func__, __LINE__, sec->current_tape, curr_cmd_body >> 8);
 			goto wake_up_request_worker;
 		case TAPEDEV_CMD_READ:
 			pr_info("%s:%u: tape: %u has been read\n", __func__, __LINE__, sec->current_tape);

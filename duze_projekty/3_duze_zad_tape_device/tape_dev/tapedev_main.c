@@ -397,6 +397,7 @@ static int schedule_cmd_and_wait(u32 cmd, struct section *sec, bool has_lock, un
 			spin_lock_irqsave(&sec->lock, *flags);
 	}
 
+	sec->cmd_done = false;
 	pr_warn("%s:%u: cmd completed\n", __func__, __LINE__);
 
 	if (!has_lock)
@@ -647,9 +648,11 @@ static inline void set_section_start_pos(u64 start_sector, struct section *sec, 
 	// We have our correct tape inside tapedev, firstly we rewind it to the start
 	// then we forward it to the start_sector_within_tape
 
+	pr_warn("%s:%u: will rewind tape: %u\n", __func__, __LINE__, tape_nbr);
 	cmd = create_tapedev_cmd(TAPEDEV_CMD_REWIND, 0, 0);
 	schedule_cmd_and_wait(cmd, sec, has_lock, flags);
 
+	pr_warn("%s:%u: will fastforward tape: %u\n", __func__, __LINE__, tape_nbr);
 	cmd = create_tapedev_cmd(TAPEDEV_CMD_FAST_FWD, start_sector_within_tape, 0);
 	schedule_cmd_and_wait(cmd, sec, has_lock, flags);
 
@@ -664,7 +667,9 @@ static inline int submit_request_sg(struct request *req, struct section *sec)
 	// 	then operate and calculate stuff using these scatter gather entities
 	// !!!!!!!!!!!!!!!!! !!!!!!!!!!!!!!!!!!! !!!!!!!!!!!!!!!!!!!!!
 	pr_warn("%s:%u: START submit_request_sg\n", __func__, __LINE__);
+	int kupa;
 
+	pr_warn("%s:%u: START submit_request_sg: %d \n", __func__, __LINE__, kupa);
 	int ret = BLK_STS_OK;
 	// struct bio_vec bvec;
 	// struct req_iterator iter;
@@ -719,6 +724,7 @@ static inline int process_request(struct request *req, struct section *sec)
 	switch (req_op(req)) {
 	case REQ_OP_READ:
 	case REQ_OP_WRITE:
+		pr_warn("%s:%u: got READ/WRITE request\n", __func__, __LINE__);
 		return submit_request_sg(req, sec);
 	default:
 		pr_err("%s:%u :: unsupported request type: %d\n", __func__, __LINE__, req_op(req));
@@ -738,6 +744,7 @@ static blk_status_t tapedev_queue_rq(struct blk_mq_hw_ctx *hctx, const struct bl
 	//might_sleep();
 	// cant_sleep(); /* cannot use any locks that make the thread sleep */
 
+	pr_warn("%s:%u: starting request for section: %u\n", __func__, __LINE__, sec->idx);
 	blk_mq_start_request(req);
 
 	if (process_request(req, sec))
@@ -750,6 +757,7 @@ static blk_status_t tapedev_queue_rq(struct blk_mq_hw_ctx *hctx, const struct bl
 	// 
 	blk_mq_end_request(req, status);
 
+	pr_warn("%s:%u: ENDED request (blk_mq_end_request) for section: %u\n", __func__, __LINE__, sec->idx);
 	return status;
 }
 
@@ -931,8 +939,6 @@ static int tapedev_probe(
 	if ((err = request_irq(pdev->irq, tapedev_interrupt_handler, IRQF_SHARED, "tapedev", tape_dev)))
 		goto out_irq;
 
-	uint32_t n_sections = tapedev_ior(tape_dev, TAPEDEV_SECTIONS_ADDR);
-	pr_warn("%s:%u: device n_sections BEFORE enabling the device: %u \n", __func__, __LINE__, n_sections);
 	// Once interrupts are enabled, to start device we need to:
 	// 1) Clear all interrupts by writing ones to TAPEDEV_IRQ_CLEAR
 	// 2) Enable at least the TAPEDEV_IRQ_INIT_DONE and TAPEDEV_IRQ_HW_ERROR 		
@@ -1002,7 +1008,6 @@ static int tapedev_probe(
 		err = -EINVAL;
 		goto out_bad_num_sec;
 	}
-	pr_warn("%s:%u: read num_sections\n", __func__, __LINE__);
 
 	tape_dev->n_sections = num_sections;
 	// Section ids are counted from 0, however to use Section Registers we count them
@@ -1216,14 +1221,11 @@ static int create_section(
 	// TODO: check if these values are correct, in tapedev.h we have sth like 
 	// TAPEDEV_BUF_PGTABLE_SIZE etc.
 	struct queue_limits lim = {
-		.logical_block_size		= SECTOR_SIZE, 
-		/*
-			* To ensure that we always get PAGE_SIZE aligned and
-			* n*PAGE_SIZED sized I/O requests.
-			*/
-		.physical_block_size		= PHYSICAL_BLOCK_SIZE,
+		.logical_block_size		= 512, //SECTOR_SIZE, 
+		.physical_block_size		= 512, //PHYSICAL_BLOCK_SIZE,
 		// .io_min				= PAGE_SIZE,
 		// .io_opt				= PAGE_SIZE,
+		.max_segments = 512,
 	};
 
     int err;
@@ -1271,6 +1273,13 @@ static int create_section(
 		goto free_alloc_s;
 	}
 
+	if (!IS_ALIGNED(sec->dma_addr, 512)) 
+	{
+		pr_err("%s:%u: page table DMA address is not 512-byte aligned\n", __func__, __LINE__);
+		err = -EINVAL;
+		goto free_dma_alloc;
+	}
+
 	// To be 512 byte aligned our first 9 bits (0 - 8) need to be zeroed, so that 
 	// in our address = 2^i + 2^(i+1) + ..., i >= 9, since 2^9 = 512, and if i >= 9
 	// all addresses will be divisible by 512 so aligned to 512 byte boundary
@@ -1285,7 +1294,7 @@ static int create_section(
 		goto free_dma_alloc;
 	}
 
-	// inside blk_mq_alloc_disk we set queuedata (which is private data) to s
+	// inside blk_mq_alloc_disk we set queuedata (which is private data) to sec
 	sec->gdisk = blk_mq_alloc_disk(&sec->tag_set, &lim, sec);
 	if (IS_ERR_OR_NULL(sec->gdisk)) 
 	{
@@ -1316,9 +1325,6 @@ static int create_section(
 	// We should set capacity of the disk by using set_capacity, to this function 
 	// we pass HOW MANY 512 byte SECTORS our disk has; 8192 / 512 = 16, so by using 
 	// TAPEDEV_SECT_TAPE_SIZE we can calculate how many sectors our tape has
-	// So this probably mean that each section in our tapedev needs to be a separate 
-	// gendisk, minors in these gendisk will be our tapes i.e. we get 50 tapes, we 
-	// need 50 minors.
 	// Each tape has SIZE_OF_TAPE so every tape will have SIZE_OF_TAPE / 512 sectors
 	set_capacity(sec->gdisk, GET_NBR_OF_SECTORS(sec_type, n_tapes));
 
@@ -1332,7 +1338,7 @@ static int create_section(
 free_tag_set:
 	blk_mq_free_tag_set(&sec->tag_set);
 free_dma_alloc:
-	dma_free_coherent(&tape_dev->pdev->dev, PAGE_SIZE, sec->cpu_dma_buf, sec->dma_addr);
+	dma_free_coherent(&tape_dev->pdev->dev, TAPEDEV_BUF_PGTABLE_SIZE, sec->cpu_dma_buf, sec->dma_addr);
 free_alloc_s:
 	kfree(sec);
 fail:
