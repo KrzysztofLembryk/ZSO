@@ -1,1 +1,2 @@
 obj-m := tapedev.o
+tapedev-objs := tapedev_main.o tapedev_irq.o tapedev_defs.o

@@ -10,11 +10,38 @@
 // I would add it to tapedev.h but probably it will be replaced with default .h file
 #define TAPEDEV_CMD_NONE				0x06
 
+#define MAX_DEVICES_TAPEDEV 256
+#define BASE_MINOR 0
+#define MINORS_COUNT 8
+#define TAPEDEV_NAME "tapedev"
+#define BAR_ID 0
+#define BAR_MAXLEN 0
+#define NO_TAPE 0 
+
+#define PHYSICAL_BLOCK_SIZE 8192
+#define BASE_TAPE_SIZE (32 * 8192)
+
+#define GET_BLOCK_SIZE(blk_type) ((1 << blk_type) * 512)
+#define GET_SECTION_ADDR(s_id) ((s_id + 1) * 0x100)
+#define SIZE_OF_TAPE(s_type) ((1 << s_type) * BASE_TAPE_SIZE)
+#define GET_NBR_OF_SECTORS(s_type, n_tapes) ((SIZE_OF_TAPE(s_type) / 512) * n_tapes)
+#define SIZE_OF_SECTION(s_type, n_tapes) (SIZE_OF_TAPE(s_type) * n_tapes)
+
+#define TAPEDEV_IRQ_SECT_X_DONE(i)  (TAPEDEV_IRQ_SECT_0_DONE  + (i))
+#define TAPEDEV_IRQ_SECT_X_ERROR(i) (TAPEDEV_IRQ_SECT_0_ERROR + (i))
+
+// Bits 0-7 are the identifier of the command, cmd should have 32 bits.
+#define GET_CMD_TYPE(cmd) ((uint32_t)((cmd) & 0xffU))
+// Bits 8-31 are used to pass command-specific information.
+#define GET_CMD_BODY(cmd) ((uint32_t)((cmd) & 0xffffff00U))
+
 struct section_cmd
 {
 	uint32_t cmd;
 	bool is_ioctl;
 };
+
+extern const struct section_cmd NO_CMD; 
 
 // To create section object use create_section function
 struct section
