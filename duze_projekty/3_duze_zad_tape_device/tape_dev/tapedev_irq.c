@@ -18,14 +18,16 @@ int handle_section_interrupt(uint32_t section_done, uint32_t section_error, uint
 	unsigned long flags;
 	spin_lock_irqsave(&sec->lock, flags);
 
-	if (section_status == TAPEDEV_SECT_STATUS_WORKING)
-	{
-		sec->status = TAPEDEV_SECT_STATUS_WORKING;
-		goto release_lock;
-	}
+    if (section_status == TAPEDEV_SECT_STATUS_WORKING)
+    {
+		pr_info("%s:%u: section_status == TAPEDEV_SECT_STATUS_WORKING, section_done: %u\n", __func__, __LINE__, section_done);
+        sec->status = TAPEDEV_SECT_STATUS_WORKING;
+        goto release_lock;
+    }
 
 	if (section_error)
 	{
+		pr_err("%s:%u: section_error \n", __func__, __LINE__);
 		clear_sec_err_intrpt(sec);
 		// After getting error from CURR_CMD we need to check if there are any eject 
 		// requests or start next_cmd 
@@ -33,6 +35,7 @@ int handle_section_interrupt(uint32_t section_done, uint32_t section_error, uint
 	}
 	else if (section_done)
 	{
+		pr_info("%s:%u:else if (section_done) section_id: %u, done: %u, STATUS: %u\n", __func__, __LINE__, sec->idx, section_done, section_status);
 		clear_sec_done_intrpt(sec);
 
 		pr_info("%s:%u: before clearing section_done intrpt section_status == %u\n", __func__, __LINE__, section_status);
@@ -49,8 +52,12 @@ int handle_section_interrupt(uint32_t section_done, uint32_t section_error, uint
 	}
 	else // section IDLE ???
 	{
+		// TODO: SOMETHING IS WRONG with section 1, section 0 completes but not section 1
+		if (sec->idx == 1)
+		{
+			pr_warn("%s:%u: section: %u, is IDLE\n", __func__, __LINE__, sec->idx);
+		}
 		sec->status = TAPEDEV_SECT_STATUS_IDLE;
-		pr_info("%s:%u: section_status == TAPEDEV_SECT_STATUS_IDLE, do nothing???\n", __func__, __LINE__);
 	}
 
 	// After handling curr command whether it was DONE or we got ERROR, we check if 
@@ -165,9 +172,16 @@ int __handle_section_error(uint32_t section_status, struct section *sec)
 int __handle_section_done(uint32_t section_status, struct section *sec)
 {
 	int err = 0;
+	// Probably it works like this: when error check status, if section_done we don't
+	// need to check status
+	// TAPEDEV_IRQ_SECT_n_DONE - Section finished a command, if no error we probably
+	// 	can safely assume that everything is OK.
+	// TAPEDEV_IRQ_SECT_n_ERROR - Section error, check status.
+
+
 	if (section_status != TAPEDEV_SECT_STATUS_DONE)
 	{
-		pr_err("%s:%u: section_status (%d) is not equal to DONE even though it should be \n", __func__, __LINE__, section_status);
+		pr_err("%s:%u: section_status (%d) is not equal to TAPEDEV_SECT_STATUS_DONE even though it should be \n", __func__, __LINE__, section_status);
 		err = -1;
 		goto ret;
 	}
@@ -182,6 +196,7 @@ int __handle_section_done(uint32_t section_status, struct section *sec)
 	{
 		case TAPEDEV_CMD_TAKE_TAPE:
 		{
+			curr_cmd_body = curr_cmd_body >> 8;
 			sec->current_tape = curr_cmd_body;
 			uint32_t tape = section_read_from(TAPEDEV_SECT_TAPE_NO_ADDR, sec); 
 	
