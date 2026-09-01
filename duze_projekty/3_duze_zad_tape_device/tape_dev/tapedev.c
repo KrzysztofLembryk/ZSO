@@ -20,7 +20,6 @@
 #include <linux/interrupt.h>
 #include <linux/mmzone.h>
 #include <linux/delay.h>
-#include <stdint.h>
 
 #define MAX_DEVICES_TAPEDEV 256
 #define BASE_MINOR 0
@@ -39,6 +38,8 @@
 #define GET_SECTION_ADDR(s_id) ((s_id + 1) * 0x100)
 #define SIZE_OF_TAPE(s_type) ((1 << s_type) * BASE_TAPE_SIZE)
 #define GET_NBR_OF_SECTORS(s_type, n_tapes) ((SIZE_OF_TAPE(s_type) / 512) * n_tapes)
+#define SIZE_OF_SECTION(s_type, n_tapes) (SIZE_OF_TAPE(s_type) * n_tapes)
+
 #define TAPEDEV_IRQ_SECT_X_DONE(i)  (TAPEDEV_IRQ_SECT_0_DONE  + (i))
 #define TAPEDEV_IRQ_SECT_X_ERROR(i) (TAPEDEV_IRQ_SECT_0_ERROR + (i))
 // Bits 0-7 are the identifier of the command, cmd should have 32 bits.
@@ -378,7 +379,128 @@ static const struct block_device_operations tapedev_ops = {
 	.ioctl = tapedev_ioctl
 };
 
-static void do_scatter_gather(struct request *req, struct section *sec, int write)
+/*
+	Function sets curr_cmd if its current value is NO_CMD, sets next_cmd otherwise.
+	If both cmd are SET returns error.
+	- If caller had lock, after function ends he STILL HAS A LOCK with updated flags 
+	inside *flags.
+	- If caller didn't have a lock, after function ends he doesn't have a lock
+*/
+static int schedule_cmd_and_wait(u32 cmd, struct section *sec, bool has_lock, unsigned long *flags)
+{
+	unsigned long _flags;
+
+	if (!has_lock)
+		spin_lock_irqsave(&sec->lock, _flags);
+
+	// set command
+	if (sec->curr_cmd.cmd == NO_CMD.cmd)
+	{
+		sec->curr_cmd.cmd = cmd;
+		sec->curr_cmd.is_ioctl = false;
+		section_send_cmd(sec->curr_cmd.cmd, sec);
+	}
+	else
+	{
+		// This branch should never happen, unless ioctl command was issued before 
+		// our command, if it was, our interrupt handler WON'T wake us up once ioctl
+		// is done, it will see next_cmd and start doing it and wake us up when done 
+		if (sec->next_cmd.cmd == NO_CMD.cmd)
+		{
+			sec->next_cmd.cmd = cmd;
+			sec->next_cmd.is_ioctl = false;
+		}
+		else
+		{
+			pr_err("%s:%u: both curr and next commands are not NO_CMD, this should NEVER HAPPEN\n", __func__, __LINE__);
+
+			if (!has_lock)
+				spin_unlock_irqrestore(&sec->lock, _flags);
+			else
+				spin_unlock_irqrestore(&sec->lock, *flags);
+
+			return -1;
+		}
+	}
+
+	// Wait for our command to complete
+	while (!sec->cmd_done) 
+	{
+		if (!has_lock)
+			spin_unlock_irqrestore(&sec->lock, _flags);
+		else
+			spin_unlock_irqrestore(&sec->lock, *flags);
+
+		if (wait_event_interruptible(sec->cmd_wait_q, sec->cmd_done))
+			return -ERESTARTSYS;
+
+		if (!has_lock)
+			spin_lock_irqsave(&sec->lock, _flags);
+		else
+			spin_lock_irqsave(&sec->lock, *flags);
+	}
+
+	if (!has_lock)
+		spin_unlock_irqrestore(&sec->lock, _flags);
+
+	return 0;
+}
+
+/*
+	Depending on the cmd type:
+		- arg1 is for 8-31 bits, arg2 NOT PRESENT 
+		- arg1 is for 23-31, arg2 PRESENT
+		- arg2 is only for 8-22 bits
+*/
+static inline uint32_t create_tapedev_cmd(uint32_t cmd_type, uint32_t arg1, uint32_t arg2)
+{
+	uint32_t cmd;
+
+	switch (cmd_type) 
+	{
+		case TAPEDEV_CMD_TAKE_TAPE:
+			// arg1, bits 8-31, can only have first 24 bits non zero, but we don't 
+			// need to apply mask, since we are shifting to the left and if there are
+			// more non-zero bits, they will be discarded; so we just shift to the 
+			// left
+			cmd = arg1 << 8;
+			cmd = cmd | TAPEDEV_CMD_TAKE_TAPE;
+		break;
+		
+		case TAPEDEV_CMD_EJECT_TAPE:
+			cmd = TAPEDEV_CMD_EJECT_TAPE;
+		break;
+
+		case TAPEDEV_CMD_REWIND:
+			cmd = TAPEDEV_CMD_REWIND;
+		break;
+
+		case TAPEDEV_CMD_FAST_FWD:
+			cmd = arg1 << 8;
+			cmd = cmd | TAPEDEV_CMD_FAST_FWD;
+		break;
+
+		case TAPEDEV_CMD_READ:
+		case TAPEDEV_CMD_WRITE:
+			// arg1 is offset counted in blocks, bits 23-31, should have only 9 bits
+			// thus as a safety check we allow it to have only first nine bits not 0
+			cmd = (arg1 & 0x1ff) << 23;
+			// arg2, bits 8-22, should have only 15 bits so we mask it
+			cmd = cmd | ((arg2 & 0x7fff) << 8);
+			cmd = cmd | cmd_type;
+		break;		
+
+		default:
+			// error,
+			pr_err("%s:%u: unsupported command: %u\n", __func__, __LINE__, cmd_type);
+			cmd = 0xffffffff;
+		break;
+	}
+
+	return cmd;
+}
+
+static int do_scatter_gather(struct request *req, struct section *sec, int write, unsigned long *flags)
 {
 	/*
 		struct request has the following interesting us fields:
@@ -430,17 +552,14 @@ static void do_scatter_gather(struct request *req, struct section *sec, int writ
 	uint32_t section_blk_type = section_read_from(TAPEDEV_SECT_TAPE_BLOCKSIZE_ADDR, sec);
 	uint32_t section_blk_size = GET_BLOCK_SIZE(section_blk_type);
 
-	pr_warn("%s:%u: section: %u, blk_type: %u, blk_size: %u \n",
-			__func__, __LINE__, sec->idx, section_blk_type, section_blk_size);
+	pr_warn("%s:%u: section: %u, section size: %u, blk_type: %u, blk_size: %u, one tape has: %u sectors \n",
+			__func__, __LINE__, sec->idx, SIZE_OF_SECTION(sec->section_type, sec->n_tapes), section_blk_type, section_blk_size, (SIZE_OF_TAPE(sec->section_type) / 512));
 
-	// Firstly we zero whole buffer if we will do write
-	if (write)
+	// Firstly we zero whole buffer regardless of whether it's READ or WRITE
+	pr_warn("%s:%u: We are zeroing page table buf\n", __func__, __LINE__);
+	for (int i = 0; i < TAPEDEV_BUF_PGTABLE_ENTRIES; i++)
 	{
-		pr_warn("%s:%u: We are zeroing page table buf\n", __func__, __LINE__);
-		for (int i = 0; i < TAPEDEV_BUF_PGTABLE_ENTRIES; i++)
-		{
-			pgt_buf[i] = 0;
-		}
+		pgt_buf[i] = 0;
 	}
 
 	// loff_t pos = blk_rq_pos(req) << TAPEDEV_SECT_PTR_SHIFT;
@@ -448,7 +567,8 @@ static void do_scatter_gather(struct request *req, struct section *sec, int writ
 
 	// if ((pos + len) > dev_size)
 	// 	len = (unsigned long)(dev_size - pos);
-	int n_segments = 0;
+	int pgt_idx = 0;
+	u32 total_blocks = 0;
 
 	// While creating scatter gather page table we probably should also create a list
 	// of commands for given entry, so that afterwards we will simply run through 
@@ -456,15 +576,20 @@ static void do_scatter_gather(struct request *req, struct section *sec, int writ
 	rq_for_each_segment(bvec, req, iter) 
 	{
 		// bvec is populated with current memory segment we want to read/write
-		// so from bv_page number we get page_addres, and jump to offset we want to
-		// read from this page. We read bv_len bytes 
+		// dma_map_page will give us correct hardware address (if we used 
+		// page_address as I did previously we would get cpu address = virtual 
+		// address)
 		dma_addr_t hw_mem_addr = dma_map_page(&dev->pdev->dev,
                              bvec.bv_page,
                              bvec.bv_offset,
                              bvec.bv_len,
                              rq_data_dir(req) == WRITE ? DMA_TO_DEVICE : DMA_FROM_DEVICE);
+		 if (dma_mapping_error(&dev->pdev->dev, hw_mem_addr))
+        	return -EIO;
 
-
+		// hw_mem_addr must be 512byte aligned (dma_alloc_coherent guarantees it), 
+		// and should be 32bit wide (dma mask we set guarantees it) thus shifting 
+		// addres 9 bits to the right can't lose any bits
 		uint32_t actual_addr = (uint32_t)(hw_mem_addr >> 9);
 		uint32_t blksize_blocks =  DIV_ROUND_UP(bvec.bv_len, section_blk_size) ;
 		// TODO: I think - if we have less than section_blk_size division result is 0
@@ -472,20 +597,89 @@ static void do_scatter_gather(struct request *req, struct section *sec, int writ
 		if (blksize_blocks <= 0)
 			blksize_blocks = 1;
 
-		pr_warn("%s:%u: segment: '%d',  hw_mem_addr high: %llu, low: %llu, blkszie_blocks: %u\n", __func__, __LINE__, n_segments, (hw_mem_addr >> 9) & 0xffffffff00000000, (hw_mem_addr >> 9) & 0xffffffffULL, blksize_blocks);
+		total_blocks += blksize_blocks;
+		// after shifting there should be no 1 bits in high range
+		u64 high_addr = (hw_mem_addr >> 9) & 0xffffffff00000000;
+		u64 low_addr = (hw_mem_addr >> 9) & 0xffffffffULL;
+
+		pr_warn("%s:%u: segment: '%d',  hw_mem_addr full: %llu, high: %llu, low: %llu, blksize_blocks: %u\n", __func__, __LINE__, pgt_idx, hw_mem_addr, high_addr, low_addr, blksize_blocks);
+
 
 		uint64_t pgt_elem = ((u64)actual_addr << 32) | (u64) blksize_blocks;
-		pgt_buf[n_segments] = pgt_elem;
+		pgt_buf[pgt_idx] = pgt_elem;
 
-		n_segments++;
+		pgt_idx++;
 
-		if (n_segments >= 512)
+		// if pgt_idx >= 512 we should issue a command 
+		// ALSO if we need to change tape we must issue a command and then come back
+		// to iterating biovecs
+		if (pgt_idx >= 512)
 		{
 			// Need to wait or whatever we need to do if too many segments
-			pr_warn("%s:%u: !!!!! n_segments >= 512\n", __func__, __LINE__);
-			return;
+			pr_warn("%s:%u: !!!!! pgt_idx >= 512\n", __func__, __LINE__);
+			return -1;
 		}
+
 	}
+
+	uint32_t cmd;
+
+	if (write)
+		cmd = create_tapedev_cmd(TAPEDEV_CMD_WRITE, 0, total_blocks);
+	else 
+		cmd = create_tapedev_cmd(TAPEDEV_CMD_READ, 0, total_blocks);
+
+	schedule_cmd_and_wait(cmd, sec, true, flags);
+
+	return 0;
+}
+
+
+
+static inline void set_section_start_pos(u64 start_sector, struct section *sec, unsigned long *flags, bool has_lock)
+{
+	// Each sector is 512 bytes, each tape has (SIZE_OF_TAPE(s_type) / 512) sectors
+	// - Firstly we need to find out which tape has our sector 
+	// - Then fastforward our tape by correct number of sectors to start reading/
+	// 		writing at start_sector
+	// TODO: if we change blocksize do sectors also change?
+	// uint32_t n_tapes = sec->n_tapes;
+	// uint32_t all_sectors = GET_NBR_OF_SECTORS(sec->section_type, sec->n_tapes);
+
+	uint32_t tape_sectors = (SIZE_OF_TAPE(sec->section_type) / 512);
+
+	// i.e. if tapes have 200 sectors, and our start_sector is 198 we will get 0 
+	// from below division and that's correct since we want tape of number 0
+	uint32_t tape_nbr = start_sector / tape_sectors;
+	// i.e. if start_sector is 403, we get tape 2, and we should start from 
+	// 	403 - 2 * 200 = 3 sector within tape 2
+	uint32_t start_sector_within_tape = start_sector - tape_nbr * tape_sectors;
+
+	// We count tapes starting from 1
+	tape_nbr++;
+
+	uint32_t cmd;
+
+	if (sec->current_tape != tape_nbr)
+	{
+		if (sec->current_tape != 0)
+		{
+			cmd = create_tapedev_cmd(TAPEDEV_CMD_EJECT_TAPE, 0, 0);
+			schedule_cmd_and_wait(cmd, sec, has_lock, flags);
+		}
+
+		cmd = create_tapedev_cmd(TAPEDEV_CMD_TAKE_TAPE, tape_nbr, 0);
+		schedule_cmd_and_wait(cmd, sec, has_lock, flags);
+	}
+
+	// We have our correct tape inside tapedev, firstly we rewind it to the start
+	// then we forward it to the start_sector_within_tape
+
+	cmd = create_tapedev_cmd(TAPEDEV_CMD_REWIND, 0, 0);
+	schedule_cmd_and_wait(cmd, sec, has_lock, flags);
+
+	cmd = create_tapedev_cmd(TAPEDEV_CMD_FAST_FWD, start_sector_within_tape, 0);
+	schedule_cmd_and_wait(cmd, sec, has_lock, flags);
 }
 
 static inline int submit_request_sg(struct request *req, struct section *sec)
@@ -497,31 +691,42 @@ static inline int submit_request_sg(struct request *req, struct section *sec)
 	// loff_t pos = blk_rq_pos(req) << TAPEDEV_SECT_PTR_SHIFT;
 	// loff_t dev_size = (s->n_sectors << TAPEDEV_SECT_PTR_SHIFT);
 
+	unsigned long flags;
+	spin_lock_irqsave(&sec->lock, flags);
+
 	// TODO: check this, why is it like that etc.
+	// start sector is always in 512byte sectors
 	uint64_t start_sector = blk_rq_pos(req); 
 	uint64_t sectors = blk_rq_sectors(req);
 
-	switch (req_op(req)) {
+	// After set_section_start_pos if we had a lock we still have it
+	set_section_start_pos(start_sector, sec, &flags, true);
+
+	switch (req_op(req)) 
+	{
 	case REQ_OP_WRITE:
 		pr_warn("%s:%u: WRITE %llu sectors starting at %llu\n",
 			__func__, __LINE__, sectors, start_sector);
 
-		do_scatter_gather(req, sec, 1);
-		return BLK_STS_OK;
+		do_scatter_gather(req, sec, 1, &flags);
+		ret = BLK_STS_OK;
+		break;
 	case REQ_OP_READ:
 		pr_warn("%s:%u: READ %llu sectors starting at %llu\n",
 			__func__, __LINE__, sectors, start_sector);
 
-		do_scatter_gather(req, sec, 0);
-		return BLK_STS_OK;
+		do_scatter_gather(req, sec, 0, &flags);
+		ret = BLK_STS_OK;
+		break;
 	default:
 		blk_dump_rq_flags(req, TAPEDEV_NAME " bad request, supported requests are READ and WRITE");
-		return BLK_STS_IOERR;
+		ret = BLK_STS_IOERR;
+		break;
 	}
 
-		// pos += len;
-		// *nr_bytes += len;
 	sec->req = req;
+
+	spin_unlock_irqrestore(&sec->lock, flags);
 
 	return ret;
 }
@@ -551,12 +756,9 @@ static blk_status_t tapedev_queue_rq(struct blk_mq_hw_ctx *hctx, const struct bl
 	// cant_sleep(); /* cannot use any locks that make the thread sleep */
 
 	blk_mq_start_request(req);
-	spin_lock_irq(&sec->lock);
 
 	if (process_request(req, sec))
 		status = BLK_STS_IOERR;
-
-	spin_unlock_irq(&sec->lock);
 
 	// TODO: this end request probably should be in interrrupt handler for section
 	// once we are sure that request was handled, if we end request here all
