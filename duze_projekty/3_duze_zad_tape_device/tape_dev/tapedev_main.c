@@ -667,9 +667,7 @@ static inline int submit_request_sg(struct request *req, struct section *sec)
 	// 	then operate and calculate stuff using these scatter gather entities
 	// !!!!!!!!!!!!!!!!! !!!!!!!!!!!!!!!!!!! !!!!!!!!!!!!!!!!!!!!!
 	pr_warn("%s:%u: START submit_request_sg\n", __func__, __LINE__);
-	int kupa;
 
-	pr_warn("%s:%u: START submit_request_sg: %d \n", __func__, __LINE__, kupa);
 	int ret = BLK_STS_OK;
 	// struct bio_vec bvec;
 	// struct req_iterator iter;
@@ -910,7 +908,7 @@ static int tapedev_probe(
 	// to that address returned by dma_alloc_coherent should be valid 32bit address 
 	// aligned to 512byte boundary stored in 64bit variable, meaning after shifting 
 	// 9 bits to the right we should get correct 32bit address
-	if ((err = dma_set_mask_and_coherent(&pdev->dev, DMA_BIT_MASK(32))))
+	if ((err = dma_set_mask_and_coherent(&pdev->dev, DMA_BIT_MASK(41))))
 		goto out_dma_mask;
 
 	// For a device to perform DMA, we must first enable the device's ability to perform transactions
