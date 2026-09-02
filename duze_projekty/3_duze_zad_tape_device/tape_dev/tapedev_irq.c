@@ -95,17 +95,22 @@ int __handle_section_error(uint32_t section_status, struct section *sec)
 
 		case TAPEDEV_SECT_STATUS_ERR_NO_TAPE:
 
+			// TODO: if our request ejects tape and there is NO TAPE, we should 
+			// kinda ignore this error and continue with execution, since it doesn't
+			// matter, our next command will insert new tape 
 			pr_err("%s:%u: section: %d, error: ERR_NO_TAPE\n", __func__, __LINE__, sec->idx);
 			/* No tape present */
 			// We need to wake up ioctl thread if it issued this command
+			list_del(&curr_cmd_node->lst_link);
+			kfree(curr_cmd_node);
 			if (curr_cmd.is_ioctl)
 			{
-				list_del(&curr_cmd_node->lst_link);
-				kfree(curr_cmd_node);
 				sec->ioctl_cmd_done = true;
 				sec->ioctl_status = TAPEDEV_SECT_STATUS_ERR_NO_TAPE;
 				wake_up(&sec->ioctl_eject_wait_q);
 			}
+			// otherwise we ignore this error, request that ejected tape will in next
+			// step insert new one
 
 			err = TAPEDEV_SECT_STATUS_ERR_NO_TAPE;
 			break;
@@ -170,6 +175,18 @@ int __handle_section_error(uint32_t section_status, struct section *sec)
 
 	if (curr_cmd.is_ioctl)
 		return -err;
+	// This allows us below flow:
+	// - at the start of the request we ALWAYS eject the tape, because sec->curr_tape
+	// 	might show the tape we want, BUT there might be an ioctl command running 
+	// 	and it might end while we are creating our request commands, and we will get
+	// 	situation where we assumed we have a tape, but when our command is being 
+	// 	computed there is no tape inserted
+	// - so we always EJECT tape, and only after that we insert our tape
+	if (section_status == TAPEDEV_SECT_STATUS_ERR_NO_TAPE)
+	{
+		pr_err("%s:%u: request wanted to EJECT TAPE, but there was no tape, if next command inserts tape it's fine \n", __func__, __LINE__);
+		return -err;
+	}
 
 	pr_err("%s:%u: ABORTING rest commands of current request\n", __func__, __LINE__);
 	while (!list_empty(&sec->cmd_queue_head))

@@ -416,8 +416,8 @@ static int schedule_cmd_and_wait(u32 cmd, struct section *sec, bool has_lock, un
 /*
 	Depending on the cmd type:
 		- arg1 is for 8-31 bits, arg2 NOT PRESENT 
-		- arg1 is for 23-31, arg2 PRESENT
-		- arg2 is only for 8-22 bits
+		- arg1 is for 23-31 bits, arg2 PRESENT
+		- arg2 is only for 8-22 bits (arg2 is number of blocks to READ/WRITE)
 */
 static inline uint32_t create_tapedev_cmd(uint32_t cmd_type, uint32_t arg1, uint32_t arg2)
 {
@@ -614,7 +614,7 @@ static int do_scatter_gather(struct request *req, struct section *sec, int write
 	return 0;
 }
 
-static inline void set_section_start_pos(u64 start_sector, struct section *sec, unsigned long *flags, bool has_lock)
+static inline void set_starting_pos(u64 start_sector, struct section *sec, unsigned long *flags, bool has_lock)
 {
 	pr_warn("%s:%u: Starting moving to correct pos\n", __func__, __LINE__);
 	// Each sector is 512 bytes, each tape has (SIZE_OF_TAPE(s_type) / 512) sectors
@@ -690,7 +690,6 @@ static inline int submit_request_sg(struct request *req, struct section *sec)
 	unsigned long flags;
 	spin_lock_irqsave(&sec->lock, flags);
 
-
 	// Plan:
 	// 1) Inside section we need to store list of commands
 	// 2) Here in submit_request_sg we will create a list of commands that
@@ -709,14 +708,17 @@ static inline int submit_request_sg(struct request *req, struct section *sec)
 	// 7) Before calling blk_mq_end_request() we shouldn't get other queue_rq call
 
 	// TODO: check this, why is it like that etc.
-	// start sector is always in 512byte sectors
+	// start sector is always in 512byte sectors (we set that value in queue_lim)
 	uint64_t start_sector = blk_rq_pos(req); 
 	uint64_t sectors = blk_rq_sectors(req);
 
+	// TODO: ADD SANITY CHECKS EVERYWHERE whether given addresses are 512byte aligned
+
 	pr_warn("%s:%u: start_sector: %llu, sectors: %llu\n", __func__, __LINE__, start_sector, sectors);
 
+	// We must create sequence of commands and add the to the cmd queue
 	// After set_section_start_pos if we had a lock we still have it
-	set_section_start_pos(start_sector, sec, &flags, true);
+	set_starting_pos(start_sector, sec, &flags, true);
 
 	switch (req_op(req)) 
 	{
@@ -740,7 +742,7 @@ static inline int submit_request_sg(struct request *req, struct section *sec)
 		break;
 	}
 
-	// sec->req = req;
+	sec->req = req;
 
 	spin_unlock_irqrestore(&sec->lock, flags);
 
@@ -770,22 +772,20 @@ static blk_status_t tapedev_queue_rq(struct blk_mq_hw_ctx *hctx, const struct bl
 	struct request *req = bd->rq;
 
 	//might_sleep();
-	// cant_sleep(); /* cannot use any locks that make the thread sleep */
+	cant_sleep(); /* cannot use any locks that make the thread sleep */
 
 	pr_warn("%s:%u: starting request for section: %u\n", __func__, __LINE__, sec->idx);
 	blk_mq_start_request(req);
 
-	if (process_request(req, sec))
-		status = BLK_STS_IOERR;
-
+	status = process_request(req, sec);
 	// TODO: this end request probably should be in interrrupt handler for section
 	// once we are sure that request was handled, if we end request here all
 	// biovecs etc will be freed and our slow tapedev won't have access to this data
 	// anymore since we store pointers to these biovecs data in our page table
 	// 
-	blk_mq_end_request(req, status);
+	// blk_mq_end_request(req, status);
 
-	pr_warn("%s:%u: ENDED request (blk_mq_end_request) for section: %u\n", __func__, __LINE__, sec->idx);
+	pr_warn("%s:%u: ENDED request creation and scheduling for section: %u\n", __func__, __LINE__, sec->idx);
 	return status;
 }
 
