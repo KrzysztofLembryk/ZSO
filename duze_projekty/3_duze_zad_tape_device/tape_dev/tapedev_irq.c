@@ -223,7 +223,10 @@ int __handle_section_done(uint32_t section_status, struct section *sec)
 	struct section_cmd curr_cmd = node->cmd;
 	
 	list_del(&node->lst_link);
-	
+	// After removing from queue list we must free memory of the node, we no longer
+	// need it here, just information aobut curr cmd is sufficient
+	kfree(node);
+
 	uint32_t curr_cmd_type = GET_CMD_TYPE(curr_cmd.cmd);
 	uint32_t curr_cmd_body = GET_CMD_BODY(curr_cmd.cmd);
 
@@ -241,7 +244,7 @@ int __handle_section_done(uint32_t section_status, struct section *sec)
 				// TODO: rework errors, add INTERNAL_ERROR or sth and return it here
 				// instead of -1
 				err = -1;
-				goto free_node;
+				goto ret;
 			}
 
 			break;
@@ -256,7 +259,7 @@ int __handle_section_done(uint32_t section_status, struct section *sec)
 			{
 				pr_err("something went wrong, eject_tape was done but  %u tape is still inserted\n", tape);
 				err = -1;
-				goto free_node;
+				goto ret;
 			}
 
 			// If current command was issued by ioctl we only wake up ioctl threads
@@ -285,7 +288,7 @@ int __handle_section_done(uint32_t section_status, struct section *sec)
 		default:
 			pr_err("%s:%u: got unsupported cmd: '%u' \n", __func__, __LINE__, curr_cmd_type);
 			err = -2;
-			goto free_node;
+			goto ret;
 	}
 
 	// After handling current command we check if list empty 
@@ -293,7 +296,7 @@ int __handle_section_done(uint32_t section_status, struct section *sec)
 	{
 		// If there is no next command, we check if just ended command is ioctl,
 		// if it is we do nothing, otherwise we inform that request has ended 
-		// successfully
+		// successfullynow we use queue of cmds,
 		if (!curr_cmd.is_ioctl)
 			blk_mq_end_request(sec->req, BLK_STS_OK);
 	}
@@ -309,9 +312,6 @@ int __handle_section_done(uint32_t section_status, struct section *sec)
 			blk_mq_end_request(sec->req, BLK_STS_OK);
 	}
 
-free_node:
-	// After removing from queue list we must free memory of the node
-	kfree(node);
 ret:
 	return err;
 }

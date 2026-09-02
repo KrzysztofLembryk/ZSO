@@ -1285,6 +1285,7 @@ static int create_section(
 	INIT_LIST_HEAD(&sec->cmd_queue_head);
 	sec->private_data = tape_dev;
 	sec->status = 0;
+	sec->ioctl_status = 0;
 	// s->data_buf = kzalloc(SIZE_OF_TAPE(s->section_type) * s->n_sectors, GFP_KERNEL);
 
 	// dma_alloc_coherent - allocates a memory region accessible simultaneously by 
