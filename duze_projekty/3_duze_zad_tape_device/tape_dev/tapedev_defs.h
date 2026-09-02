@@ -11,6 +11,9 @@
 #define TAPEDEV_CMD_NONE				0x06
 
 #define MAX_DEVICES_TAPEDEV 256
+// From task description we have 8-22 bits for number of blocks to read, thus we have
+// 15 bits to encode this number, max number we can encode is 0x7fff (all 15 bits 1)
+#define MAX_BLOCKS_PER_ONE_CMD 0x7fff 
 #define BASE_MINOR 0
 #define MINORS_COUNT 8
 #define TAPEDEV_NAME "tapedev"
@@ -61,6 +64,7 @@ struct section
 	uint32_t n_tapes;
 	// 0 to 4, to calc size of tape for this section use SIZE_OF_TAPE macro
 	uint32_t section_type; 	
+	uint32_t blk_size;
 	sector_t n_sectors;
 	// If 0 - no tape inserted in tapedevice
 	uint32_t current_tape;

@@ -781,8 +781,6 @@ static inline int submit_request_sg(struct request *req, struct section *sec)
 		goto ret;
 	}
 
-	unsigned long flags;
-	spin_lock_irqsave(&sec->lock, flags);
 
 	switch (req_op(req)) 
 	{
@@ -802,9 +800,14 @@ static inline int submit_request_sg(struct request *req, struct section *sec)
 		break;
 	default:
 		pr_warn("%s:%u: submitted bad request, supported requests are READ and WRITE\n", __func__, __LINE__);
-		err = BLK_STS_IOERR;
-		break;
+		err = BLK_STS_NOTSUPP;
+		goto ret;
 	}
+
+	// We will add scatter gather table, add commands and remember req
+	// if needed we will start commands execution if sec->cmd_lst empty
+	unsigned long flags;
+	spin_lock_irqsave(&sec->lock, flags);
 
 	sec->req = req;
 
@@ -835,8 +838,8 @@ static blk_status_t tapedev_queue_rq(struct blk_mq_hw_ctx *hctx, const struct bl
 	blk_status_t status = BLK_STS_OK;
 	struct request *req = bd->rq;
 
-	//might_sleep();
-	cant_sleep(); /* cannot use any locks that make the thread sleep */
+	// might_sleep();
+	// cant_sleep(); /* cannot use any locks that make the thread sleep */
 
 	pr_warn("%s:%u: starting request for section: %u\n", __func__, __LINE__, sec->idx);
 	blk_mq_start_request(req);
@@ -1307,14 +1310,23 @@ static int create_section(
 	struct tapedev_device *tape_dev
 )
 {
-	// TODO: check if these values are correct, in tapedev.h we have sth like 
-	// TAPEDEV_BUF_PGTABLE_SIZE etc.
+	// I assume that blksize (512, 1024, 2048, 4096, 8192) is set in stone at 
+	// tapedevice start, thus based on this value we can setup queue_limits so that
+	// block layer can serve us correctly aligned data
+	uint32_t blksize = GET_BLOCK_SIZE(section_ior(tape_dev, GET_SECTION_ADDR(section_id), TAPEDEV_SECT_TAPE_BLOCKSIZE_ADDR));
+
+	// Knowing how many blocks we can read/write per one command and knowing block
+	// size we can calculate how many 512byte sectors at most we can handle
+	// max_hw_sectors is always in 512-byte units
+	uint32_t max_nbr_of_sectors = (MAX_BLOCKS_PER_ONE_CMD * blksize) / 512;
+
 	struct queue_limits lim = {
-		.logical_block_size		= 512, //SECTOR_SIZE, 
-		.physical_block_size		= 512, //PHYSICAL_BLOCK_SIZE,
-		// .io_min				= PAGE_SIZE,
-		// .io_opt				= PAGE_SIZE,
-		.max_segments = 512,
+		.logical_block_size	= blksize, // so that we read/write in blksize blocks
+		.physical_block_size = blksize, 
+		.io_min = blksize,
+		.max_hw_sectors = max_nbr_of_sectors,
+		.max_segments = 512, // so that at most we have 512 entries in pg table
+		.dma_alignment = 511, // so that dma addresses are 512 byte aligned
 	};
 
     int err;
@@ -1332,6 +1344,7 @@ static int create_section(
 	sec->idx = section_id;
 	sec->n_tapes = n_tapes;
 	sec->section_type = sec_type;
+	sec->blk_size = blksize;
 	sec->n_sectors = GET_NBR_OF_SECTORS(sec_type, n_tapes);
 	sec->current_tape = 0;
 	sec->ejection_cmds = 0;
