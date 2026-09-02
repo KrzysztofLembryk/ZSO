@@ -1,3 +1,4 @@
+#include "linux/list.h"
 #include "tapedev.h"
 #include "linux/blk-mq.h"
 #include "linux/irqreturn.h"
@@ -275,49 +276,55 @@ static int tapedev_ioctl(struct block_device *bdev, blk_mode_t mode, unsigned cm
 
 		pr_info("%s:%u: got EJECT_TAPE ioctl cmd. Current tape: %u  (if 0 no tape inserted)\n", __func__, __LINE__, current_tape);
 
-		// No tape, no need to eject --> eject successful
-		if (current_tape == 0)
+		struct lst_node *node = kzalloc(sizeof(*node), GFP_KERNEL);
+		if (!node) 
 		{
 			spin_unlock_irqrestore(&sec->lock, flags);
-			return 0;
+			return -ENOMEM;
 		}
 
-		// There is some tape inserted, so we increment number of ejection commands
+		node->cmd = (struct section_cmd) {
+			.cmd = TAPEDEV_CMD_EJECT_TAPE,
+			.is_ioctl = true
+		};
 		sec->ejection_cmds += 1;
-
-		// We must send command to the section ONLY when both curr and next cmds
-		// are NONE.
-		// Otherwise we have the following cases (keep in mind we are in critical 
-		// section now):
-		// - curr && next are NOT NONE - meaning section is working and will see our
-		// 	incrementing of ejection_cmds once it ends its curr command or if it's
-		// 	already ended once we release lock
-		// - curr is NOT NONE, next is NONE - the same as above
-		// - curr is NONE, next is NOT NONE - isn't possible if logic is correctly 
-		// 	implemented, after completing curr command we immediately start next one
-		// 	while having critical section, so above state shouldn't be visible
-		// - curr && next are NONE - our case, section is idle, we send command
-		if (
-			sec->curr_cmd.cmd == TAPEDEV_CMD_NONE 
-			&& sec->next_cmd.cmd == TAPEDEV_CMD_NONE
-		)
-		{
+		// We must send command to the section ONLY when command list is empty  
+		// otherwise our command will be done in near future, we just add it at the
+		// end of the queue
+		if (list_empty(&sec->cmd_queue_head))
 			section_send_cmd(TAPEDEV_CMD_EJECT_TAPE, sec);
-			sec->curr_cmd = (struct section_cmd) {
-				.cmd = TAPEDEV_CMD_EJECT_TAPE,
-				.is_ioctl = true
-			};
-		}
 
-		while (sec->current_tape) 
+		list_add_tail(&node->lst_link, &sec->cmd_queue_head);
+
+		while (!sec->ioctl_cmd_done) 
 		{
 			spin_unlock_irqrestore(&sec->lock, flags);
-			if (wait_event_interruptible(sec->ioctl_eject_wait_q, !sec->current_tape))
+			if (wait_event_interruptible(sec->ioctl_eject_wait_q, sec->ioctl_cmd_done))
 				return -ERESTARTSYS;
 			spin_lock_irqsave(&sec->lock, flags);
 		}
 
+		sec->ejection_cmds--;
+		sec->ioctl_cmd_done = false;
+
+		// TODO: this is prone to some data races - we ejected tape but before we are
+		// 	able to acquire lock, comes request that inserts tape, so current tape is
+		// 	not 0, thus we cannot check current_tape value, we will check 
+		// 	ioctl_status, this is less likely to fail
+		// ----> probably we should create a queue of results for ioctl commands
+		// 	and simply remove first node from it and check status
+		// ----> for now below should probably work
+		if (sec->ioctl_status == TAPEDEV_SECT_STATUS_ERR_NO_TAPE)
+		{
+			pr_warn("%s:%u: EJECT_TAPE ioctl cmd wanted to eject when there is NO TAPE inserted \n", __func__, __LINE__);
+			sec->ioctl_status = 0;
+			spin_unlock_irqrestore(&sec->lock, flags);
+			return -EIO;
+		}
+
+		sec->ioctl_status = 0;
 		// Once current tape is 0, we return success
+		spin_unlock_irqrestore(&sec->lock, flags);
 		return 0;
 	}
 	default:
@@ -381,14 +388,14 @@ static int schedule_cmd_and_wait(u32 cmd, struct section *sec, bool has_lock, un
 
 	// Wait for our command to complete
 	pr_warn("%s:%u: waiting for cmd to complete\n", __func__, __LINE__);
-	while (!sec->cmd_done) 
+	while (!sec->ioctl_cmd_done) 
 	{
 		if (!has_lock)
 			spin_unlock_irqrestore(&sec->lock, _flags);
 		else
 			spin_unlock_irqrestore(&sec->lock, *flags);
 
-		if (wait_event_interruptible(sec->cmd_wait_q, sec->cmd_done))
+		if (wait_event_interruptible(sec->cmd_wait_q, sec->ioctl_cmd_done))
 			return -ERESTARTSYS;
 
 		if (!has_lock)
@@ -397,7 +404,7 @@ static int schedule_cmd_and_wait(u32 cmd, struct section *sec, bool has_lock, un
 			spin_lock_irqsave(&sec->lock, *flags);
 	}
 
-	sec->cmd_done = false;
+	sec->ioctl_cmd_done = false;
 	pr_warn("%s:%u: cmd completed\n", __func__, __LINE__);
 
 	if (!has_lock)
@@ -551,6 +558,11 @@ static int do_scatter_gather(struct request *req, struct section *sec, int write
                              bvec.bv_offset,
                              bvec.bv_len,
                              rq_data_dir(req) == WRITE ? DMA_TO_DEVICE : DMA_FROM_DEVICE);
+		// TODO: we must also unmap this
+		// dma_unmap_page(&dev->pdev->dev,
+            //    hw_mem_addr,
+            //    bvec.bv_len,
+            //    direction);
 		 if (dma_mapping_error(&dev->pdev->dev, hw_mem_addr))
         	return -EIO;
 
@@ -677,6 +689,24 @@ static inline int submit_request_sg(struct request *req, struct section *sec)
 
 	unsigned long flags;
 	spin_lock_irqsave(&sec->lock, flags);
+
+
+	// Plan:
+	// 1) Inside section we need to store list of commands
+	// 2) Here in submit_request_sg we will create a list of commands that
+	// 		will set correct tape fastforward it etc and add it to the list
+	// 3) after that (while still having a lock) we will iterate over biovecs using
+	// 		blk_rq_map_sg to create scatter gather list
+	// 4) Then we will iterate over created scatter gather list and create read/
+	// 		write commands while simultaneously checking if we are still on correct
+	// 		tape, if not we will add command to the list of commands and then add 
+	// 		commands that change tapes
+	// 5) Once all commands are added we can safely return from submit_request_sg 
+	// 		without any waiting in here, since we cannot wait in this context, kernel
+	// 		throws some warnings/errors when we do
+	// 6) We need to remember req so that later we can do blk_mq_end_request(req, 
+	// 		status);
+	// 7) Before calling blk_mq_end_request() we shouldn't get other queue_rq call
 
 	// TODO: check this, why is it like that etc.
 	// start sector is always in 512byte sectors
@@ -1250,8 +1280,9 @@ static int create_section(
 
 	sec->curr_cmd = NO_CMD;
 	sec->next_cmd = NO_CMD;
-	sec->cmd_done = false;
+	sec->ioctl_cmd_done = false;
 	sec->req = NULL;
+	INIT_LIST_HEAD(&sec->cmd_queue_head);
 	sec->private_data = tape_dev;
 	sec->status = 0;
 	// s->data_buf = kzalloc(SIZE_OF_TAPE(s->section_type) * s->n_sectors, GFP_KERNEL);

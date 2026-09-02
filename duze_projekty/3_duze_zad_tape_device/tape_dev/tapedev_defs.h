@@ -41,6 +41,17 @@ struct section_cmd
 	bool is_ioctl;
 };
 
+// Add at the end with - list_add_tail(&node->link, &section->cmd_queue)
+// Check empty - list_empty(&section->cmd_queue)
+// Remove:
+// 	node = list_first_entry(&section->cmd_queue, struct your_node_type, link)
+// 	list_del(&node->link)
+struct lst_node
+{
+	struct section_cmd cmd;
+	struct list_head lst_link;
+};
+
 extern const struct section_cmd NO_CMD; 
 
 // To create section object use create_section function
@@ -60,8 +71,9 @@ struct section
 	wait_queue_head_t cmd_wait_q;
 	struct section_cmd curr_cmd;
 	struct section_cmd next_cmd;
-	bool cmd_done;
+	bool ioctl_cmd_done;
 	int status;
+	int ioctl_status;
 	/*
 		gendisk is kernel's representation of of an individual DISK DEVICE
 	*/
@@ -74,6 +86,7 @@ struct section
 	void *cpu_dma_buf;
 	struct blk_mq_tag_set tag_set; /* multi queue */
 	struct request *req; 
+	struct list_head cmd_queue_head;
 	// private_data must be tapedev_device
 	void *private_data;
 };
