@@ -9,8 +9,10 @@
 
 // I would add it to tapedev.h but probably it will be replaced with default .h file
 #define TAPEDEV_CMD_NONE				0x06
+#define TAPEDEV_CMD_UNSUPPORTED			0xffffffff
 
 #define MAX_DEVICES_TAPEDEV 256
+#define MAX_SG_PGT_ENTRIES 512
 // From task description we have 8-22 bits for number of blocks to read, thus we have
 // 15 bits to encode this number, max number we can encode is 0x7fff (all 15 bits 1)
 #define MAX_BLOCKS_PER_ONE_CMD 0x7fff 
@@ -40,8 +42,13 @@
 
 struct section_cmd
 {
+	uint32_t cmd_type;
 	uint32_t cmd;
 	bool is_ioctl;
+	int nents;
+	int sg_idx;
+	uint32_t blocks_sent;
+	enum dma_data_direction dir;
 };
 
 // Add at the end with - list_add_tail(&node->link, &section->cmd_queue)

@@ -1,4 +1,5 @@
 #include "linux/list.h"
+#include "linux/scatterlist.h"
 #include "tapedev.h"
 #include "linux/blk-mq.h"
 #include "linux/irqreturn.h"
@@ -22,6 +23,7 @@
 #include <linux/interrupt.h>
 #include <linux/mmzone.h>
 #include <linux/delay.h>
+#include <stdint.h>
 
 
 // Blk dev example impl
@@ -340,80 +342,6 @@ static const struct block_device_operations tapedev_ops = {
 };
 
 /*
-	Function sets curr_cmd if its current value is NO_CMD, sets next_cmd otherwise.
-	If both cmd are SET returns error.
-	- If caller had lock, after function ends he STILL HAS A LOCK with updated flags 
-	inside *flags.
-	- If caller didn't have a lock, after function ends he doesn't have a lock
-*/
-static int schedule_cmd_and_wait(u32 cmd, struct section *sec, bool has_lock, unsigned long *flags)
-{
-	pr_warn("%s:%u: Scheduling command, has_lock: %d\n", __func__, __LINE__, has_lock);
-	unsigned long _flags;
-
-	if (!has_lock)
-		spin_lock_irqsave(&sec->lock, _flags);
-
-	// set command
-	if (sec->curr_cmd.cmd == NO_CMD.cmd)
-	{
-		pr_warn("%s:%u: curr_cmd is NO_CMD\n", __func__, __LINE__);
-		sec->curr_cmd.cmd = cmd;
-		sec->curr_cmd.is_ioctl = false;
-		section_send_cmd(sec->curr_cmd.cmd, sec);
-	}
-	else
-	{
-		// This branch should never happen, unless ioctl command was issued before 
-		// our command, if it was, our interrupt handler WON'T wake us up once ioctl
-		// is done, it will see next_cmd and start doing it and wake us up when done 
-		if (sec->next_cmd.cmd == NO_CMD.cmd)
-		{
-			pr_warn("%s:%u: next_cmd is NO_CMD\n", __func__, __LINE__);
-			sec->next_cmd.cmd = cmd;
-			sec->next_cmd.is_ioctl = false;
-		}
-		else
-		{
-			pr_err("%s:%u: curr_cmd != NO_CMD and next_cmd != NO_CMD, this should NEVER HAPPEN\n", __func__, __LINE__);
-
-			if (!has_lock)
-				spin_unlock_irqrestore(&sec->lock, _flags);
-			// else
-			// 	spin_unlock_irqrestore(&sec->lock, *flags);
-
-			return -1;
-		}
-	}
-
-	// Wait for our command to complete
-	pr_warn("%s:%u: waiting for cmd to complete\n", __func__, __LINE__);
-	while (!sec->ioctl_cmd_done) 
-	{
-		if (!has_lock)
-			spin_unlock_irqrestore(&sec->lock, _flags);
-		else
-			spin_unlock_irqrestore(&sec->lock, *flags);
-
-		if (wait_event_interruptible(sec->cmd_wait_q, sec->ioctl_cmd_done))
-			return -ERESTARTSYS;
-
-		if (!has_lock)
-			spin_lock_irqsave(&sec->lock, _flags);
-		else
-			spin_lock_irqsave(&sec->lock, *flags);
-	}
-
-	sec->ioctl_cmd_done = false;
-	pr_warn("%s:%u: cmd completed\n", __func__, __LINE__);
-
-	if (!has_lock)
-		spin_unlock_irqrestore(&sec->lock, _flags);
-
-	return 0;
-}
-
-/*
 	Depending on the cmd type:
 		- arg1 is for 8-31 bits, arg2 NOT PRESENT 
 		- arg1 is for 23-31 bits, arg2 PRESENT
@@ -465,7 +393,7 @@ static inline uint32_t create_tapedev_cmd(uint32_t cmd_type, uint32_t arg1, uint
 		default:
 			// error,
 			pr_err("%s:%u: unsupported command: %u\n", __func__, __LINE__, cmd_type);
-			cmd = 0xffffffff;
+			cmd = TAPEDEV_CMD_UNSUPPORTED;
 		break;
 	}
 
@@ -517,17 +445,67 @@ static int do_scatter_gather(struct request *req, struct section *sec, int write
 	*/
 
 	pr_warn("%s:%u: Doing scatter gather\n", __func__, __LINE__);
-	struct tapedev_device *dev = sec->private_data; 
 
-	// unsigned int offset = 0;
+	struct tapedev_device *dev = sec->private_data; 
 	struct req_iterator iter;
 	struct bio_vec bvec;
 	uint64_t *pgt_buf = sec->cpu_dma_buf;
 	uint32_t section_blk_type = section_read_from(TAPEDEV_SECT_TAPE_BLOCKSIZE_ADDR, sec);
-	uint32_t section_blk_size = GET_BLOCK_SIZE(section_blk_type);
+	uint32_t section_blk_size = sec->blk_size;
 
-	pr_warn("%s:%u: section: %u, section size: %u, blk_type: %u, blk_size: %u, one tape has: %u sectors \n",
-			__func__, __LINE__, sec->idx, SIZE_OF_SECTION(sec->section_type, sec->n_tapes), section_blk_type, section_blk_size, (SIZE_OF_TAPE(sec->section_type) / 512));
+	// TODO:
+	// Even kmalloc inside queue_rq is BAD --> what we should do is preallocate sg
+	// 	array inside requests private memory,
+	// 	we should create a current request context which will be a state machine
+	// 	and here instead of creating all cmds and then starting our task we will
+	// 	set state machine to eject and irq handler will handle the rest and 
+	// 	transition to the next steps
+
+	// TODO: maybe this sg should be inside section struct, but if it was we would
+	// 	need lock here, but on the other hand our section can do one request at a 
+	// 	time, so no-one will create more requests until we call blk_mq_end_request
+	// mtip32xx.c - mtip_hw_submit_io 
+	struct scatterlist main_sg[MAX_SG_PGT_ENTRIES];
+	sg_init_table(main_sg, MAX_SG_PGT_ENTRIES);
+
+	int n_collapsed_segments = blk_rq_map_sg(req, main_sg);
+	// nents might be less than n_collapsed_segments, if its 0 it means error
+	int nents = dma_map_sg(
+		&dev->pdev->dev, 
+		main_sg, 
+		n_collapsed_segments, 
+		write ? DMA_TO_DEVICE : DMA_FROM_DEVICE
+	);
+
+	if (!nents)
+		return -ENOMEM;
+
+	struct scatterlist *sg;
+	int i;
+
+	// mtip32xx.c - fill_command_sg
+	for_each_sg(main_sg, sg, nents, i)
+	{
+		dma_addr_t dma_addr = sg_dma_address(sg);
+		uint32_t dma_len = sg_dma_len(sg);
+		uint32_t nbr_of_blocks = dma_len / section_blk_size;
+
+		if (!IS_ALIGNED(dma_addr, 512)) 
+		{
+			pr_err("%s:%u: dma_addr is not 512 byte aligned\n", __func__, __LINE__);
+		}
+		if (dma_len % section_blk_size != 0)
+		{
+			pr_err("%s:%u: dma_len is not multiple of block size\n", __func__, __LINE__);
+		}
+		// TODO: conitnue with this approach then see if works and change to better
+		// 	state machine with pre-allocation so that in queue_rq there is no alloc
+		pgt_buf[i] = (dma_addr  >> 9);
+		pgt_buf[i] = pgt_buf[i] << 32;
+		pgt_buf[i] = pgt_buf[i] | ((uint64_t)nbr_of_blocks);
+	}
+
+	pr_warn("%s:%u: section: %u, section size: %u, blk_type: %u, blk_size: %u, one tape has: %u sectors \n", __func__, __LINE__, sec->idx, SIZE_OF_SECTION(sec->section_type, sec->n_tapes), section_blk_type, section_blk_size, (SIZE_OF_TAPE(sec->section_type) / 512));
 
 	// Firstly we zero whole buffer regardless of whether it's READ or WRITE
 	pr_warn("%s:%u: We are zeroing page table buf\n", __func__, __LINE__);
@@ -825,7 +803,7 @@ static inline int process_request(struct request *req, struct section *sec)
 		return submit_request_sg(req, sec);
 	default:
 		pr_err("%s:%u :: unsupported request type: %d\n", __func__, __LINE__, req_op(req));
-		return BLK_STS_IOERR;
+		return BLK_STS_NOTSUPP;
 	}
 }
 
@@ -1240,8 +1218,6 @@ static struct pci_driver tapedev_pci_driver = {
 	.id_table = tapedev_pci_ids,
 	.probe = tapedev_probe,
 	.remove = tapedev_remove,
-	// .suspend = adlerdev_suspend,
-	// .resume = adlerdev_resume,
 };
 
 
