@@ -24,7 +24,6 @@
 #include <linux/interrupt.h>
 #include <linux/mmzone.h>
 #include <linux/delay.h>
-#include <stdint.h>
 
 
 // Blk dev example impl
@@ -190,8 +189,8 @@ static irqreturn_t tapedev_interrupt_handler(int irq, void *opaque_dev)
 		section_error = (ir_status & (1 << TAPEDEV_IRQ_SECT_X_ERROR(sec_id))) > 0;
 		section_status = section_read_from(TAPEDEV_SECT_STATUS_ADDR, sec);
 
-		if (sec_id == 1)
-			pr_warn("%s:%u: section: %u, section_done: %u, section_error: %u, section_status: %u \n", __func__, __LINE__, sec_id, section_done, section_error, section_status);
+		// if (sec_id == 1)
+		// 	pr_warn("%s:%u: section: %u, section_done: %u, section_error: %u, section_status: %u \n", __func__, __LINE__, sec_id, section_done, section_error, section_status);
 
 		int err = handle_section_interrupt(
 				section_done, 
@@ -477,8 +476,6 @@ static int do_scatter_gather(struct request *req, struct section *sec, int write
 	pr_warn("%s:%u: Doing scatter gather\n", __func__, __LINE__);
 
 	struct tapedev_device *dev = sec->private_data; 
-	struct req_iterator iter;
-	struct bio_vec bvec;
 	uint64_t *pgt_buf = sec->cpu_dma_buf;
 	uint32_t section_blk_type = section_read_from(TAPEDEV_SECT_TAPE_BLOCKSIZE_ADDR, sec);
 	uint32_t section_blk_size = sec->blk_size;
@@ -496,7 +493,11 @@ static int do_scatter_gather(struct request *req, struct section *sec, int write
 	// 	need lock here, but on the other hand our section can do one request at a 
 	// 	time, so no-one will create more requests until we call blk_mq_end_request
 	// mtip32xx.c - mtip_hw_submit_io 
-	struct scatterlist main_sg[MAX_SG_PGT_ENTRIES];
+	struct scatterlist *main_sg = kzalloc((sizeof(*main_sg) * MAX_SG_PGT_ENTRIES), GFP_KERNEL);
+	if (!main_sg)
+	{
+		return BLK_STS_IOERR;
+	}
 	sg_init_table(main_sg, MAX_SG_PGT_ENTRIES);
 
 	int n_collapsed_segments = blk_rq_map_sg(req, main_sg);
@@ -509,7 +510,7 @@ static int do_scatter_gather(struct request *req, struct section *sec, int write
 	);
 
 	if (!nents)
-		return -ENOMEM;
+		return BLK_STS_IOERR;
 
 	pr_warn("%s:%u: final nbr of nents: %d\n", __func__, __LINE__, nents);
 	struct scatterlist *sg;
@@ -788,67 +789,6 @@ static blk_status_t tapedev_queue_rq(struct blk_mq_hw_ctx *hctx, const struct bl
 static struct blk_mq_ops mq_ops = {
 	.queue_rq = tapedev_queue_rq,
 };
-
-// static inline int init_tag_set(struct blk_mq_tag_set *set, void *data)
-// {
-// 	set->ops = &mq_ops;
-// 	set->nr_hw_queues = 1;
-// 	set->nr_maps = 1;
-// 	set->queue_depth = 128;
-// 	set->numa_node = NUMA_NO_NODE;
-// 	// set->flags = no flags I think are needed;
-
-// 	set->cmd_size = 0;
-// 	set->driver_data = data;
-
-// 	return blk_mq_alloc_tag_set(set);
-// }
-
-
-// static int create_parent_dev(
-// 	struct tapedev_device *tape_dev,
-// 	uint32_t n_sections,
-// 	int device_id
-// )
-// {
-// 	// Currently dont know whats the point of creating /dev/tapedevX since all 
-// 	// operations will be done at SECTION devices, and this device will just exist
-// 	int err;
-// 	uint32_t total_nbr_of_sectors = 0;
-// 	struct gendisk *gdisk = blk_alloc_disk(NULL, NUMA_NO_NODE);
-
-// 	if (IS_ERR_OR_NULL(gdisk)) 
-// 	{
-// 		err = gdisk ? PTR_ERR(gdisk) : -ENOMEM;
-// 		pr_err("%s:%u :: blk_alloc_disk failed with error: %d\n", __func__, __LINE__,err);
-// 		return err;
-// 	}
-
-// 	gdisk->fops = &tapedev_ops;
-// 	gdisk->private_data = tape_dev;
-
-// 	snprintf(gdisk->disk_name, 15, "tapedev%d", tape_dev->idx);
-
-// 	for (u32 s_id = 1; s_id <= n_sections; s_id++) 
-// 	{
-//         u32 n_tapes = section_ior(tape_dev, GET_SECTION_ADDR(s_id), TAPEDEV_SECT_TAPES_ADDR);
-//         u32 sec_type = section_ior(tape_dev, GET_SECTION_ADDR(s_id), TAPEDEV_SECT_TAPE_SIZE_ADDR);
-
-//         total_nbr_of_sectors += (SIZE_OF_TAPE(sec_type) / 512) * n_tapes;
-//     }
-
-//     set_capacity(gdisk, total_nbr_of_sectors);
-
-//     // err = device_add_disk(&tape_dev->pdev->dev, gdisk, NULL);
-//     err = add_disk(gdisk);
-//     if (err < 0) {
-//         put_disk(gdisk);
-//         return err;
-//     }
-
-//     tape_dev->parent_gdisk = gdisk;
-//     return 0;
-// }
 
 
 /* PCI driver.  */

@@ -184,7 +184,7 @@ int __handle_section_error(uint32_t section_status, struct section *sec)
 	// - so we always EJECT tape, and only after that we insert our tape
 	if (section_status == TAPEDEV_SECT_STATUS_ERR_NO_TAPE)
 	{
-		pr_err("%s:%u: request wanted to EJECT TAPE, but there was no tape, if next command inserts tape it's fine \n", __func__, __LINE__);
+		pr_err("%s:%u: request wanted to EJECT TAPE, but there was no tape, if next command inserts tape it's fine, returning \n", __func__, __LINE__);
 		return -err;
 	}
 
@@ -364,14 +364,17 @@ int __handle_ejection_cmds_if_present(struct section *sec)
 // To use this function you MUST FIRST ACQUIRE LOCK
 void __handle_next_cmd(struct section *sec)
 {
+	pr_warn("%s:%u: Will schedule next cmd\n", __func__, __LINE__);
 	if (list_empty(&sec->cmd_queue_head))
 	{
+		pr_warn("%s:%u: cmd queue EMPTY\n", __func__, __LINE__);
 		return;
 	}
 	// We get first command in queue, but not remove it from the list.
 	// Removal will only happen once command is done.
 	struct lst_node *node = list_first_entry(&sec->cmd_queue_head, struct lst_node, lst_link);
 
+	pr_warn("%s:%u: cmd that will be scheduled is: %u\n", __func__, __LINE__, GET_CMD_TYPE(node->cmd.cmd));
 	section_send_cmd(node->cmd.cmd, sec);
 
 	return; 
