@@ -235,6 +235,7 @@ int __handle_section_done(uint32_t section_status, struct section *sec)
 		goto ret;
 	}
 
+
 	sec->status = TAPEDEV_SECT_STATUS_DONE;
 	struct lst_node *node = list_first_entry(&sec->cmd_queue_head, struct lst_node, lst_link);
 	struct section_cmd curr_cmd = node->cmd;
@@ -247,10 +248,13 @@ int __handle_section_done(uint32_t section_status, struct section *sec)
 	uint32_t curr_cmd_type = GET_CMD_TYPE(curr_cmd.cmd);
 	uint32_t curr_cmd_body = GET_CMD_BODY(curr_cmd.cmd);
 
+	pr_warn("%s:%u: CMD: '%u' done \n", __func__, __LINE__, curr_cmd_type);
+
 	switch(curr_cmd_type)
 	{
 		case TAPEDEV_CMD_TAKE_TAPE:
 		{
+			pr_warn("%s:%u: cmd DONE: TAPEDEV_CMD_TAKE_TAPE \n", __func__, __LINE__);
 			curr_cmd_body = curr_cmd_body >> 8;
 			sec->current_tape = curr_cmd_body;
 			uint32_t tape = section_read_from(TAPEDEV_SECT_TAPE_NO_ADDR, sec); 
@@ -268,6 +272,7 @@ int __handle_section_done(uint32_t section_status, struct section *sec)
 		}
 		case TAPEDEV_CMD_EJECT_TAPE:
 		{
+			pr_warn("%s:%u: cmd DONE: TAPEDEV_CMD_EJECT_TAPE \n", __func__, __LINE__);
 			// TODO: add constant NO_TAPE instead of magic number 0
 			sec->current_tape = NO_TAPE;
 			uint32_t tape = section_read_from(TAPEDEV_SECT_TAPE_NO_ADDR, sec); 
@@ -289,18 +294,18 @@ int __handle_section_done(uint32_t section_status, struct section *sec)
 			break;
 		}
 		case TAPEDEV_CMD_REWIND:
-			pr_info("%s:%u: tape: %u rewinded\n", __func__, __LINE__, sec->current_tape);
+			pr_warn("%s:%u: tape: %u rewinded\n", __func__, __LINE__, sec->current_tape);
 			break;
 		case TAPEDEV_CMD_FAST_FWD:
-			pr_info("%s:%u: tape: %u forwarded by %u blocks\n", __func__, __LINE__, sec->current_tape, curr_cmd_body >> 8);
+			pr_warn("%s:%u: tape: %u forwarded by %u blocks\n", __func__, __LINE__, sec->current_tape, curr_cmd_body >> 8);
 			break;
 		case TAPEDEV_CMD_READ:
 			// In read/write we probably will need to do something with checking how
 			// many bytes or sth was read/done etc
-			pr_info("%s:%u: tape: %u has been read\n", __func__, __LINE__, sec->current_tape);
+			pr_warn("%s:%u: tape: %u has been read\n", __func__, __LINE__, sec->current_tape);
 			break;
 		case TAPEDEV_CMD_WRITE:
-			pr_info("%s:%u: tape: %u has been written\n", __func__, __LINE__, sec->current_tape);
+			pr_warn("%s:%u: tape: %u has been written\n", __func__, __LINE__, sec->current_tape);
 			break;	
 		default:
 			pr_err("%s:%u: got unsupported cmd: '%u' \n", __func__, __LINE__, curr_cmd_type);
@@ -364,7 +369,7 @@ int __handle_ejection_cmds_if_present(struct section *sec)
 // To use this function you MUST FIRST ACQUIRE LOCK
 void __handle_next_cmd(struct section *sec)
 {
-	pr_warn("%s:%u: Will schedule next cmd\n", __func__, __LINE__);
+	pr_warn("%s:%u: Will schedule next cmd for section: %u\n", __func__, __LINE__, sec->idx);
 	if (list_empty(&sec->cmd_queue_head))
 	{
 		pr_warn("%s:%u: cmd queue EMPTY\n", __func__, __LINE__);

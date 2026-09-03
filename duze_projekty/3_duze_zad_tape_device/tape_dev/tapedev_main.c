@@ -192,12 +192,16 @@ static irqreturn_t tapedev_interrupt_handler(int irq, void *opaque_dev)
 		// if (sec_id == 1)
 		// 	pr_warn("%s:%u: section: %u, section_done: %u, section_error: %u, section_status: %u \n", __func__, __LINE__, sec_id, section_done, section_error, section_status);
 
-		int err = handle_section_interrupt(
-				section_done, 
-				section_error, 
-				section_status, 
-				sec				
-		);
+		int err = 0;
+		if (section_done || section_error)
+		{
+			err = handle_section_interrupt(
+					section_done, 
+					section_error, 
+					section_status, 
+					sec				
+			);
+		}
 
 		if (err)
 		{
@@ -207,7 +211,8 @@ static irqreturn_t tapedev_interrupt_handler(int irq, void *opaque_dev)
 	}
 
 
-	return IRQ_RETVAL(ir_status);
+	// return IRQ_RETVAL(ir_status);
+	return IRQ_HANDLED;
 }
 
 // good link with blk dev: https://olegkutkov.me/2020/02/10/linux-block-device-driver/
