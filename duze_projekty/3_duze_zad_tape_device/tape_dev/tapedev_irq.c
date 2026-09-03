@@ -6,6 +6,7 @@
 #include "tapedev.h"
 #include "tapedev_defs.h"
 #include "tapedev_iow_ior.h"
+#include <stdint.h>
 
 
 int __handle_section_error(uint32_t section_status, struct section *sec);
@@ -17,6 +18,7 @@ void clear_sec_err_intrpt(struct section* sec);
 
 int handle_section_interrupt(uint32_t section_done, uint32_t section_error, uint32_t section_status, struct section *sec)
 {
+	pr_warn("%s:%u: handling intrpt for section %u \n", __func__, __LINE__, sec->idx);
 	int err = 0;
 
 	// -------- CRITICAL SECTION Start --------
@@ -25,10 +27,20 @@ int handle_section_interrupt(uint32_t section_done, uint32_t section_error, uint
 
     if (section_status == TAPEDEV_SECT_STATUS_WORKING)
     {
-		pr_info("%s:%u: section_status == TAPEDEV_SECT_STATUS_WORKING, section_done: %u\n", __func__, __LINE__, section_done);
+		pr_warn("%s:%u: section_status == TAPEDEV_SECT_STATUS_WORKING, section_done: %u\n", __func__, __LINE__, section_done);
         sec->status = TAPEDEV_SECT_STATUS_WORKING;
         goto release_lock;
     }
+	uint32_t nodes_in_lst = list_count_nodes(&sec->cmd_queue_head);
+	pr_warn("%s:%u: nodes in cmd qeueu: %u \n", __func__, __LINE__, nodes_in_lst);
+
+	pr_warn("%s:%u: Starting to iterate over cmd queue \n", __func__, __LINE__);
+
+	struct lst_node *curr;
+	list_for_each_entry(curr, &sec->cmd_queue_head, lst_link)
+	{
+		pr_warn("%s:%u: cmd: %u \n", __func__, __LINE__, GET_CMD_TYPE(curr->cmd.cmd));
+	}
 
 	if (section_error)
 	{
