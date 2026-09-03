@@ -15,6 +15,7 @@
 #include "linux/blk_types.h"
 #include "linux/gfp_types.h"
 #include "linux/slab.h"
+#include "vdso/align.h"
 #include <linux/atomic.h>
 #include <linux/err.h>
 #include <linux/module.h>
@@ -574,12 +575,12 @@ static int do_scatter_gather(struct request *req, struct section *sec, int write
 	{
 		// We schedule commands if section cmd queue is emmpty 
 		struct lst_node *node = list_first_entry(cmd_lst_head, struct lst_node, lst_link);
-		pr_warn("%s:%u: scheduling cmd: %u \n", __func__, __LINE__, GET_CMD_TYPE(node->cmd.cmd));
+		pr_warn("%s:%u: cmd_qeueu list empty, scheduling cmd: %u \n", __func__, __LINE__, GET_CMD_TYPE(node->cmd.cmd));
 		section_send_cmd(node->cmd.cmd, sec);
 	}
 
 	uint32_t cmd_queue_size = list_count_nodes(&sec->cmd_queue_head);
-	pr_warn("%s:%u: cmd_queue_size: %u \n", __func__, __LINE__, cmd_queue_size);
+	pr_warn("%s:%u: cmd_queue_size BEFORE adding new cmds: %u \n", __func__, __LINE__, cmd_queue_size);
 	// otherwise we just add new commands
 	list_splice_tail_init(cmd_lst_head, &sec->cmd_queue_head);
 
@@ -885,8 +886,6 @@ static int tapedev_probe(
 	// (coherent - memory that is always visible to both the CPU and device without 
 	// 	explicit cache managemen)
 	// Our tapedevices support 32 bit registers
-	u64 req_dma_mask = dma_get_required_mask(&pdev->dev);
-	pr_info("tapedev_probe - req_dma_mask: %llu\n", req_dma_mask);
 
 	// Our device has only 32-bit registers, so DMA mask needs to be 32 bit, thanks
 	// to that address returned by dma_alloc_coherent should be valid 32bit address 
@@ -1009,25 +1008,22 @@ static int tapedev_probe(
 
 	pr_warn("%s:%u: after create_sections\n", __func__, __LINE__);
 
-	pr_warn("%s:%u: enabling sections interrupts\n", __func__, __LINE__);
 	uint32_t irq_mask = (0xffffffff ^ (1 << TAPEDEV_IRQ_INIT_DONE)) ^ (1 << TAPEDEV_IRQ_HW_ERROR);
 
 	// TODO: add helper function: _enable_dev_interrupts
 
 	// Now we enable interrupts for this device's sections
-	for (int sec_id = 0; i < num_sections; i++)
+	for (int sec_id = 0; sec_id < num_sections; sec_id++)
 	{
 		irq_mask = irq_mask ^ (1 << TAPEDEV_IRQ_SECT_X_DONE(sec_id));
 		irq_mask = irq_mask ^ (1 << TAPEDEV_IRQ_SECT_X_ERROR(sec_id));
 	}
 
-	pr_warn("%s:%u: before enabling intrpts for this device's sections\n", __func__, __LINE__);
 	tapedev_iow(
 		tape_dev, 
 		TAPEDEV_IRQ_MASK_ADDR, 
 		irq_mask	
 	);
-	pr_warn("%s:%u: after enabling intrpts for this device's sections\n", __func__, __LINE__);
 
 	// TODO: add helper function: _set_dma_hw_buff
 
@@ -1043,6 +1039,12 @@ static int tapedev_probe(
 		// we want bits 9-40
 		// So we firstly shift dma_addr 9 times to the right, then zero bits 32-63 
 		// then cast to uint32
+		if (!IS_ALIGNED(tape_dev->sections[sec_id]->dma_addr, 512))
+		{
+			pr_err("%s:%u: section: %u, dma_addr is not 512 aligned\n", __func__, __LINE__, sec_id);
+			// TODO: here we should free our sections CORRECTLY, not only tapedev->sections, but alos what is allocated INSIDE section struct
+			goto free_sections;
+		}
 		uint32_t dma_hw_buf_addr = 
 			(uint32_t)((tape_dev->sections[sec_id]->dma_addr >> 9) & 0xffffffffULL);
 
@@ -1053,7 +1055,6 @@ static int tapedev_probe(
 
 		pr_warn("%s:%u: section: %u, current tape: %u\n", __func__, __LINE__, sec_id, tape_dev->sections[sec_id]->current_tape);
 	}
-	pr_warn("%s:%u: ended setting buffer ptr addresses\n", __func__, __LINE__);
 
 	pr_warn("%s:%u: BEFORE add_section_disks\n", __func__, __LINE__);
 	err = add_section_disks(tape_dev, num_sections);

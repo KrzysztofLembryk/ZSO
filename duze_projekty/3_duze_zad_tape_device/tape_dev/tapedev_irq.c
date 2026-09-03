@@ -30,16 +30,9 @@ int handle_section_interrupt(uint32_t section_done, uint32_t section_error, uint
         sec->status = TAPEDEV_SECT_STATUS_WORKING;
         goto release_lock;
     }
+
 	uint32_t nodes_in_lst = list_count_nodes(&sec->cmd_queue_head);
 	pr_warn("%s:%u: nodes in cmd qeueu: %u \n", __func__, __LINE__, nodes_in_lst);
-
-	pr_warn("%s:%u: Starting to iterate over cmd queue \n", __func__, __LINE__);
-
-	struct lst_node *curr;
-	list_for_each_entry(curr, &sec->cmd_queue_head, lst_link)
-	{
-		pr_warn("%s:%u: cmd: %u \n", __func__, __LINE__, GET_CMD_TYPE(curr->cmd.cmd));
-	}
 
 	if (section_error)
 	{
@@ -259,8 +252,6 @@ int __handle_section_done(uint32_t section_status, struct section *sec)
 	uint32_t curr_cmd_type = GET_CMD_TYPE(curr_cmd.cmd);
 	uint32_t curr_cmd_body = GET_CMD_BODY(curr_cmd.cmd);
 
-	pr_warn("%s:%u: CMD: '%u' done \n", __func__, __LINE__, curr_cmd_type);
-
 	switch(curr_cmd_type)
 	{
 		case TAPEDEV_CMD_TAKE_TAPE:
@@ -305,18 +296,18 @@ int __handle_section_done(uint32_t section_status, struct section *sec)
 			break;
 		}
 		case TAPEDEV_CMD_REWIND:
-			pr_warn("%s:%u: tape: %u rewinded\n", __func__, __LINE__, sec->current_tape);
+			pr_warn("%s:%u: cmd DONE: TAPEDEV_CMD_REWIND, tape: %u rewinded \n", __func__, __LINE__, sec->current_tape);
 			break;
 		case TAPEDEV_CMD_FAST_FWD:
-			pr_warn("%s:%u: tape: %u forwarded by %u blocks\n", __func__, __LINE__, sec->current_tape, curr_cmd_body >> 8);
+			pr_warn("%s:%u: cmd DONE: TAPEDEV_CMD_FAST_FWD. tape: %u forwarded by %u blocks\n", __func__, __LINE__, sec->current_tape, curr_cmd_body >> 8);
 			break;
 		case TAPEDEV_CMD_READ:
 			// In read/write we probably will need to do something with checking how
 			// many bytes or sth was read/done etc
-			pr_warn("%s:%u: tape: %u has been read\n", __func__, __LINE__, sec->current_tape);
+			pr_warn("%s:%u: cmd DONE TAPEDEV_CMD_READ, tape: %u has been read\n", __func__, __LINE__, sec->current_tape);
 			break;
 		case TAPEDEV_CMD_WRITE:
-			pr_warn("%s:%u: tape: %u has been written\n", __func__, __LINE__, sec->current_tape);
+			pr_warn("%s:%u: cmd DONE TAPEDEV_CMD_WRITE, tape: %u has been written\n", __func__, __LINE__, sec->current_tape);
 			break;	
 		default:
 			pr_err("%s:%u: got unsupported cmd: '%u' \n", __func__, __LINE__, curr_cmd_type);
@@ -327,11 +318,15 @@ int __handle_section_done(uint32_t section_status, struct section *sec)
 	// After handling current command we check if list empty 
 	if (list_empty(&sec->cmd_queue_head))
 	{
+		pr_warn("%s:%u: After handling current command cmd queue is EMPTY\n", __func__, __LINE__);
 		// If there is no next command, we check if just ended command is ioctl,
 		// if it is we do nothing, otherwise we inform that request has ended 
 		// successfullynow we use queue of cmds,
 		if (!curr_cmd.is_ioctl)
+		{
+			pr_warn("%s:%u: calling blk_mq_end_request\n", __func__, __LINE__);
 			blk_mq_end_request(sec->req, BLK_STS_OK);
+		}
 	}
 	else
 	{
@@ -380,12 +375,13 @@ int __handle_ejection_cmds_if_present(struct section *sec)
 // To use this function you MUST FIRST ACQUIRE LOCK
 void __handle_next_cmd(struct section *sec)
 {
-	pr_warn("%s:%u: Will schedule next cmd for section: %u\n", __func__, __LINE__, sec->idx);
 	if (list_empty(&sec->cmd_queue_head))
 	{
-		pr_warn("%s:%u: cmd queue EMPTY\n", __func__, __LINE__);
+		pr_warn("%s:%u: no more cmds to schedule, cmd queue EMPTY\n", __func__, __LINE__);
 		return;
 	}
+
+	pr_warn("%s:%u: Will schedule next cmd for section: %u\n", __func__, __LINE__, sec->idx);
 	// We get first command in queue, but not remove it from the list.
 	// Removal will only happen once command is done.
 	struct lst_node *node = list_first_entry(&sec->cmd_queue_head, struct lst_node, lst_link);
