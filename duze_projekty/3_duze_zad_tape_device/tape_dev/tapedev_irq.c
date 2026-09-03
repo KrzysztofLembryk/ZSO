@@ -6,7 +6,6 @@
 #include "tapedev.h"
 #include "tapedev_defs.h"
 #include "tapedev_iow_ior.h"
-#include <stdint.h>
 
 
 int __handle_section_error(uint32_t section_status, struct section *sec);

@@ -560,6 +560,8 @@ static int do_scatter_gather(struct request *req, struct section *sec, int write
 		return BLK_STS_IOERR;
 	}
 
+	uint32_t nodes_in_lst = list_count_nodes(cmd_lst_head);
+	pr_warn("%s:%u: nodes in cmd qeueu AFTER sg: %u \n", __func__, __LINE__, nodes_in_lst);
 	// // after shifting there should be no 1 bits in high range
 	// u64 high_addr = (hw_mem_addr >> 9) & 0xffffffff00000000;
 	// u64 low_addr = (hw_mem_addr >> 9) & 0xffffffffULL;
@@ -572,10 +574,17 @@ static int do_scatter_gather(struct request *req, struct section *sec, int write
 	{
 		// We schedule commands if section cmd queue is emmpty 
 		struct lst_node *node = list_first_entry(cmd_lst_head, struct lst_node, lst_link);
+		pr_warn("%s:%u: scheduling cmd: %u \n", __func__, __LINE__, GET_CMD_TYPE(node->cmd.cmd));
 		section_send_cmd(node->cmd.cmd, sec);
 	}
+
+	uint32_t cmd_queue_size = list_count_nodes(&sec->cmd_queue_head);
+	pr_warn("%s:%u: cmd_queue_size: %u \n", __func__, __LINE__, cmd_queue_size);
 	// otherwise we just add new commands
 	list_splice_tail_init(cmd_lst_head, &sec->cmd_queue_head);
+
+	cmd_queue_size = list_count_nodes(&sec->cmd_queue_head);
+	pr_warn("%s:%u: cmd_queue_size AFTER list_splice_tail_init: %u \n", __func__, __LINE__, cmd_queue_size);
 
 	spin_unlock_irqrestore(&sec->lock, flags);
 
@@ -720,6 +729,9 @@ static inline int submit_request_sg(struct request *req, struct section *sec)
 		err = BLK_STS_IOERR;
 		goto ret;
 	}
+
+	uint32_t nodes_in_lst = list_count_nodes(&cmd_lst_head);
+	pr_warn("%s:%u: nodes in cmd qeueu AFTER pos setup: %u \n", __func__, __LINE__, nodes_in_lst);
 
 
 	switch (req_op(req)) 
