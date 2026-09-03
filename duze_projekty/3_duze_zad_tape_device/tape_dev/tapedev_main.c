@@ -1,3 +1,4 @@
+#include "linux/dma-mapping.h"
 #include "linux/list.h"
 #include "linux/scatterlist.h"
 #include "tapedev.h"
@@ -400,7 +401,36 @@ static inline uint32_t create_tapedev_cmd(uint32_t cmd_type, uint32_t arg1, uint
 	return cmd;
 }
 
-static int do_scatter_gather(struct request *req, struct section *sec, int write)
+static int enqueue_new_cmd(uint32_t cmd, struct list_head *cmd_lst_head)
+{
+	struct lst_node *new_lst_node = kzalloc(sizeof(*new_lst_node), GFP_KERNEL);
+
+	if (!new_lst_node) 
+	{
+		pr_err("%s:%u: failed to alloc node for cmd\n", __func__, __LINE__);
+		return -ENOMEM;
+	}
+	new_lst_node->cmd = (struct section_cmd) {
+			.cmd = cmd,
+			.is_ioctl = false
+	};
+	list_add_tail(&new_lst_node->lst_link, cmd_lst_head);
+
+	return 0;
+}
+
+static void _free_enqueued_cmds(struct list_head *cmd_lst_head)
+{
+	while (!list_empty(cmd_lst_head))
+	{
+		struct lst_node *node = list_first_entry(cmd_lst_head, struct lst_node, lst_link);
+
+		list_del(&node->lst_link);
+		kfree(node);
+	}
+}
+
+static int do_scatter_gather(struct request *req, struct section *sec, int write, struct list_head *cmd_lst_head)
 {
 	/*
 		struct request has the following interesting us fields:
@@ -453,6 +483,7 @@ static int do_scatter_gather(struct request *req, struct section *sec, int write
 	uint32_t section_blk_type = section_read_from(TAPEDEV_SECT_TAPE_BLOCKSIZE_ADDR, sec);
 	uint32_t section_blk_size = sec->blk_size;
 
+	pr_warn("%s:%u: DOING SCATTER GATHER section: %u, section size: %u, blk_type: %u, blk_size: %u, one tape has: %u sectors \n", __func__, __LINE__, sec->idx, SIZE_OF_SECTION(sec->section_type, sec->n_tapes), section_blk_type, section_blk_size, (SIZE_OF_TAPE(sec->section_type) / 512));
 	// TODO:
 	// Even kmalloc inside queue_rq is BAD --> what we should do is preallocate sg
 	// 	array inside requests private memory,
@@ -480,8 +511,10 @@ static int do_scatter_gather(struct request *req, struct section *sec, int write
 	if (!nents)
 		return -ENOMEM;
 
+	pr_warn("%s:%u: final nbr of nents: %d\n", __func__, __LINE__, nents);
 	struct scatterlist *sg;
 	int i;
+	uint32_t total_blocks = 0;
 
 	// mtip32xx.c - fill_command_sg
 	for_each_sg(main_sg, sg, nents, i)
@@ -503,123 +536,46 @@ static int do_scatter_gather(struct request *req, struct section *sec, int write
 		pgt_buf[i] = (dma_addr  >> 9);
 		pgt_buf[i] = pgt_buf[i] << 32;
 		pgt_buf[i] = pgt_buf[i] | ((uint64_t)nbr_of_blocks);
+		total_blocks += nbr_of_blocks;
 	}
 
-	pr_warn("%s:%u: section: %u, section size: %u, blk_type: %u, blk_size: %u, one tape has: %u sectors \n", __func__, __LINE__, sec->idx, SIZE_OF_SECTION(sec->section_type, sec->n_tapes), section_blk_type, section_blk_size, (SIZE_OF_TAPE(sec->section_type) / 512));
+	pr_warn("%s:%u: total blocks we will read/write: %u\n", __func__, __LINE__, total_blocks);
+	uint32_t cmd = create_tapedev_cmd(write ? TAPEDEV_CMD_WRITE : TAPEDEV_CMD_READ, 0, total_blocks);
 
-	// Firstly we zero whole buffer regardless of whether it's READ or WRITE
-	pr_warn("%s:%u: We are zeroing page table buf\n", __func__, __LINE__);
-	for (int i = 0; i < TAPEDEV_BUF_PGTABLE_ENTRIES; i++)
+	if (enqueue_new_cmd(cmd, cmd_lst_head))
 	{
-		pgt_buf[i] = 0;
+		_free_enqueued_cmds(cmd_lst_head);
+		dma_unmap_sg(
+			&dev->pdev->dev, 
+			main_sg, 
+			n_collapsed_segments, 
+			write ? DMA_TO_DEVICE : DMA_FROM_DEVICE
+		);
+		return BLK_STS_IOERR;
 	}
 
-	// loff_t pos = blk_rq_pos(req) << TAPEDEV_SECT_PTR_SHIFT;
-	// loff_t dev_size = (sec->n_sectors << TAPEDEV_SECT_PTR_SHIFT);
-
-	// if ((pos + len) > dev_size)
-	// 	len = (unsigned long)(dev_size - pos);
-	int pgt_idx = 0;
-	u32 total_blocks = 0;
-
-	// While creating scatter gather page table we probably should also create a list
-	// of commands for given entry, so that afterwards we will simply run through 
-	// these commands
-	rq_for_each_segment(bvec, req, iter) 
-	{
-		// bvec is populated with current memory segment we want to read/write
-		// dma_map_page will give us correct hardware address (if we used 
-		// page_address as I did previously we would get cpu address = virtual 
-		// address)
-		dma_addr_t hw_mem_addr = dma_map_page(&dev->pdev->dev,
-                             bvec.bv_page,
-                             bvec.bv_offset,
-                             bvec.bv_len,
-                             rq_data_dir(req) == WRITE ? DMA_TO_DEVICE : DMA_FROM_DEVICE);
-		// TODO: we must also unmap this
-		// dma_unmap_page(&dev->pdev->dev,
-            //    hw_mem_addr,
-            //    bvec.bv_len,
-            //    direction);
-		 if (dma_mapping_error(&dev->pdev->dev, hw_mem_addr))
-        	return -EIO;
-
-		// hw_mem_addr must be 512byte aligned (dma_alloc_coherent guarantees it), 
-		// and should be 32bit wide (dma mask we set guarantees it) thus shifting 
-		// addres 9 bits to the right can't lose any bits
-		uint32_t actual_addr = (uint32_t)(hw_mem_addr >> 9);
-		uint32_t blksize_blocks =  DIV_ROUND_UP(bvec.bv_len, section_blk_size) ;
-		// TODO: I think - if we have less than section_blk_size division result is 0
-		// 	but still there is some data to write/read
-		if (blksize_blocks <= 0)
-			blksize_blocks = 1;
-
-		total_blocks += blksize_blocks;
-		// after shifting there should be no 1 bits in high range
-		u64 high_addr = (hw_mem_addr >> 9) & 0xffffffff00000000;
-		u64 low_addr = (hw_mem_addr >> 9) & 0xffffffffULL;
-
-		pr_warn("%s:%u: iterating bio_vec, segment: '%d',  hw_mem_addr full: %llu, high: %llu, low: %llu, blksize_blocks: %u\n", __func__, __LINE__, pgt_idx, hw_mem_addr, high_addr, low_addr, blksize_blocks);
-
-
-		uint64_t pgt_elem = ((u64)actual_addr << 32) | (u64) blksize_blocks;
-		pgt_buf[pgt_idx] = pgt_elem;
-
-		pgt_idx++;
-
-		// if pgt_idx >= 512 we should issue a command 
-		// ALSO if we need to change tape we must issue a command and then come back
-		// to iterating biovecs
-		if (pgt_idx >= 512)
-		{
-			// Need to wait or whatever we need to do if too many segments
-			pr_warn("%s:%u: !!!!! pgt_idx >= 512\n", __func__, __LINE__);
-			return -1;
-		}
-
-	}
-
-	uint32_t cmd;
-
-	if (write)
-		cmd = create_tapedev_cmd(TAPEDEV_CMD_WRITE, 0, total_blocks);
-	else 
-		cmd = create_tapedev_cmd(TAPEDEV_CMD_READ, 0, total_blocks);
+	// // after shifting there should be no 1 bits in high range
+	// u64 high_addr = (hw_mem_addr >> 9) & 0xffffffff00000000;
+	// u64 low_addr = (hw_mem_addr >> 9) & 0xffffffffULL;
 
 	pr_warn("%s:%u: scheduling read/write command\n", __func__, __LINE__);
-	// schedule_cmd_and_wait(cmd, sec, true, flags);
+	unsigned long flags;
+	spin_lock_irqsave(&sec->lock, flags);
 
-	return 0;
-}
-
-static int enqueue_new_cmd(uint32_t cmd, struct list_head *cmd_lst_head)
-{
-	struct lst_node *new_lst_node = kzalloc(sizeof(*new_lst_node), GFP_KERNEL);
-
-	if (!new_lst_node) 
+	if (list_empty(&sec->cmd_queue_head))
 	{
-		pr_err("%s:%u: failed to alloc node for cmd\n", __func__, __LINE__);
-		return -ENOMEM;
-	}
-	new_lst_node->cmd = (struct section_cmd) {
-			.cmd = cmd,
-			.is_ioctl = false
-	};
-	list_add_tail(&new_lst_node->lst_link, cmd_lst_head);
-
-	return 0;
-}
-
-static void _free_enqueued_cmds(struct list_head *cmd_lst_head)
-{
-	while (!list_empty(cmd_lst_head))
-	{
+		// We schedule commands if section cmd queue is emmpty 
 		struct lst_node *node = list_first_entry(cmd_lst_head, struct lst_node, lst_link);
-
-		list_del(&node->lst_link);
-		kfree(node);
+		section_send_cmd(node->cmd.cmd, sec);
 	}
+	// otherwise we just add new commands
+	list_splice_tail_init(cmd_lst_head, &sec->cmd_queue_head);
+
+	spin_unlock_irqrestore(&sec->lock, flags);
+
+	return BLK_STS_OK;
 }
+
 
 static int create_start_pos_setup_cmds(u64 start_sector, struct list_head *cmd_lst_head, struct section *sec)
 {
@@ -766,15 +722,13 @@ static inline int submit_request_sg(struct request *req, struct section *sec)
 		pr_warn("%s:%u: WRITE %llu sectors starting at %llu\n",
 			__func__, __LINE__, sectors_to_read, start_sector);
 
-		do_scatter_gather(req, sec, 1);
-		err = BLK_STS_OK;
+		err = do_scatter_gather(req, sec, 1, &cmd_lst_head);
 		break;
 	case REQ_OP_READ:
 		pr_warn("%s:%u: READ %llu sectors starting at %llu\n",
 			__func__, __LINE__, sectors_to_read, start_sector);
 
-		do_scatter_gather(req, sec, 0);
-		err = BLK_STS_OK;
+		err = do_scatter_gather(req, sec, 0, &cmd_lst_head);
 		break;
 	default:
 		pr_warn("%s:%u: submitted bad request, supported requests are READ and WRITE\n", __func__, __LINE__);
