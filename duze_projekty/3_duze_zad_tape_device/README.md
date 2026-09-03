@@ -91,6 +91,11 @@ make install
 insmod tapedev.ko
 ```
 
+## running tests
+```bash
+./rw_basic  /dev/tapedev0s0
+```
+
 ## Clang acting up
 - If clangd doesnt see kernel modules/funcs/etc., we need to create compile_commands.json
 in our project (```tapedev/``` dir)

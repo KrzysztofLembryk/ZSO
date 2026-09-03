@@ -15,4 +15,5 @@ zso2026*.qcow2
 **/tests/z3-tests-2026/rw-direct
 **/tests/z3-tests-2026/rw-vector
 **/tests/z3-tests-2026/zig-zag-order
+**/tests/z3-tests-2026/my-test
 compile_commands.json

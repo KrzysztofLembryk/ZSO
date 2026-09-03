@@ -1,4 +1,4 @@
-all:  eject random-order rw-basic rw-vector ioctl-read rw-direct zig-zag-order backward-order
+all:  eject random-order rw-basic rw-vector ioctl-read rw-direct zig-zag-order backward-order my-test
 
 backward-order: backward-order.c
 	gcc backward-order.c -o backward-order
@@ -24,6 +24,9 @@ rw-vector: rw-vector.c
 zig-zag-order: zig-zag-order.c
 	gcc zig-zag-order.c -o zig-zag-order
 
+my-test: my_test.c
+	gcc my_test.c -o my-test
+
 clean:
-	rm -f eject random-order rw-basic rw-vector ioctl-read rw-direct zig-zag-order backward-order
+	rm -f eject random-order rw-basic rw-vector ioctl-read rw-direct zig-zag-order backward-order my-test
 
