@@ -661,6 +661,7 @@ static int create_start_pos_setup_cmds(u64 start_sector, struct list_head *cmd_l
 	}
 
 	pr_warn("%s:%u: Moving to correct pos ENDED\n", __func__, __LINE__);
+	goto ret;
 
 free_cmd_queue:
 	_free_enqueued_cmds(cmd_lst_head);
