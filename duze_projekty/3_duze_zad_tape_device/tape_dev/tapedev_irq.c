@@ -8,6 +8,7 @@
 #include "tapedev_iow_ior.h"
 
 
+void _end_request_helper(struct section *sec, blk_status_t status);
 int __handle_section_error(uint32_t section_status, struct section *sec);
 int __handle_section_done(uint32_t section_status, struct section *sec);
 void __handle_next_cmd(struct section *sec);
@@ -237,7 +238,7 @@ int __handle_section_error(uint32_t section_status, struct section *sec)
 	__abort_rest_of_req_cmds(sec);
 
 	if (list_empty(&sec->cmd_queue_head))
-		blk_mq_end_request(sec->req, BLK_STS_IOERR);
+		_end_request_helper(sec, BLK_STS_IOERR);
 
 	return -err;
 }
@@ -393,13 +394,15 @@ void __abort_rest_of_req_cmds(struct section *sec)
 		// means we removed whole request
 		if (node->cmd.is_ioctl)
 		{
-			blk_mq_end_request(sec->req, BLK_STS_IOERR);
+			_end_request_helper(sec, BLK_STS_IOERR);
 			break;
 		}
 
 		list_del(&node->lst_link);
 		kfree(node);
 	}
+
+	sec->req = NULL;
 }
 
 void __end_req_if_completed(struct section *sec, struct section_cmd *curr_cmd)
@@ -413,10 +416,8 @@ void __end_req_if_completed(struct section *sec, struct section_cmd *curr_cmd)
 		// if it is we do nothing, otherwise we inform that request has ended 
 		// successfullynow we use queue of cmds,
 		if (!curr_cmd->is_ioctl)
-		{
-			pr_warn("%s:%u: calling blk_mq_end_request\n", __func__, __LINE__);
-			blk_mq_end_request(sec->req, BLK_STS_OK);
-		}
+			_end_request_helper(sec, BLK_STS_OK);
+	
 	}
 	else
 	{
@@ -427,6 +428,23 @@ void __end_req_if_completed(struct section *sec, struct section_cmd *curr_cmd)
 
 		// next and curr cmd should NEVER BOTH BE IOCTL, but still better to check it
 		if (next_node->cmd.is_ioctl && !curr_cmd->is_ioctl)
-			blk_mq_end_request(sec->req, BLK_STS_OK);
+			_end_request_helper(sec, BLK_STS_OK);
+	}
+}
+
+/*
+	Must be used with already acquired sec->lock
+*/
+void _end_request_helper(struct section *sec, blk_status_t status)
+{
+	if (sec->req != NULL)
+	{
+		pr_warn("%s:%u: doing blk_mq_end_request\n", __func__, __LINE__);
+		blk_mq_end_request(sec->req, status);
+		sec->req = NULL;
+	}
+	else
+	{
+		pr_err("%s:%u: doing blk_mq_end_request BUT REQ IS NULL\n", __func__, __LINE__);
 	}
 }

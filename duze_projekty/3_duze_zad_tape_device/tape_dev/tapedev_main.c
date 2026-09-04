@@ -26,7 +26,6 @@
 #include <linux/interrupt.h>
 #include <linux/mmzone.h>
 #include <linux/delay.h>
-#include <stdint.h>
 
 
 // Blk dev example impl
@@ -678,6 +677,12 @@ ret:
 
 static inline int submit_request_sg(struct request *req, struct section *sec)
 {
+	unsigned long flags;
+	spin_lock_irqsave(&sec->lock, flags);
+
+	sec->req = req;
+
+	spin_unlock_irqrestore(&sec->lock, flags);
 	// TODO:
 	// !!!!!!!!!!!!!!!!! CHECK MORE IN DEPTH !!!!!!!!!!!!!!!!!!!!!
 	// blk_rq_map_sg - maybe we should change workflow to use blk_rq_map_sg, and 
@@ -764,12 +769,6 @@ static inline int submit_request_sg(struct request *req, struct section *sec)
 
 	// We will add scatter gather table, add commands and remember req
 	// if needed we will start commands execution if sec->cmd_lst empty
-	unsigned long flags;
-	spin_lock_irqsave(&sec->lock, flags);
-
-	sec->req = req;
-
-	spin_unlock_irqrestore(&sec->lock, flags);
 ret:
 	return err;
 }
@@ -805,7 +804,23 @@ static blk_status_t tapedev_queue_rq(struct blk_mq_hw_ctx *hctx, const struct bl
 	status = process_request(req, sec);
 
 	if (status)
-		blk_mq_end_request(req, status);
+	{
+		unsigned long flags;
+		spin_lock_irqsave(&sec->lock, flags);
+
+		if (sec->req != NULL)
+		{
+			pr_warn("%s:%u: doing blk_mq_end_request\n", __func__, __LINE__);
+			blk_mq_end_request(req, status);
+			sec->req = NULL;
+		}
+		else
+		{
+			pr_err("%s:%u: wanted to do blk_mq_end_request but sec->req WAS NULL\n", __func__, __LINE__);
+		}
+
+		spin_unlock_irqrestore(&sec->lock, flags);
+	}
 
 	pr_warn("%s:%u: ENDED request creation and scheduling for section: %u\n", __func__, __LINE__, sec->idx);
 	return status;
