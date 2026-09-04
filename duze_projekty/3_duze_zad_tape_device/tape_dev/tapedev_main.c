@@ -49,7 +49,7 @@ static struct class tapedev_class = {
 // helpers pre-decl
 int create_sections(struct tapedev_device *tape_dev, int num_sections);
 int add_section_disks(struct tapedev_device *tape_dev, int num_sections);
-
+int _handle_tapedev_init(uint32_t ir_status, struct tapedev_device *dev);
 // #################################################################################
 // ############################## HANDLING INTERRUPTS ##############################
 // #################################################################################
@@ -64,6 +64,7 @@ int add_section_disks(struct tapedev_device *tape_dev, int num_sections);
 // 	void *dev_id -- often points to our device struct: dev
 // );
 
+
 // TODO: maybe we should move it to tapedev_irq, or leave it here as a main interrupt
 // function
 static irqreturn_t tapedev_interrupt_handler(int irq, void *opaque_dev)
@@ -74,8 +75,6 @@ static irqreturn_t tapedev_interrupt_handler(int irq, void *opaque_dev)
 	struct tapedev_device *dev = opaque_dev;
 	unsigned long flags;
 	uint32_t ir_status;
-	uint32_t num_sections;
-	uint32_t dev_status;
 
 	// TOdo:
 	// We must add here an if else statement checking if tapedev already initialized
@@ -97,46 +96,9 @@ static irqreturn_t tapedev_interrupt_handler(int irq, void *opaque_dev)
 	// TODO: move init handling to the separate function
 	if (!dev->init_done)
 	{
-		uint32_t is_init_done = ir_status & (1 << TAPEDEV_IRQ_INIT_DONE);
-
-		if (is_init_done)
-		{
-			tapedev_iow(dev, TAPEDEV_IRQ_CLEAR_ADDR, (1 << TAPEDEV_IRQ_INIT_DONE));
-			pr_info("%s:%u: init done\n", __func__, __LINE__);
-			dev->init_done = 1;
-
-			// Some debug printing for now
-			dev_status = tapedev_ior(dev, TAPEDEV_STATUS_ADDR);
-			num_sections = tapedev_ior(dev, TAPEDEV_SECTIONS_ADDR);
-
-			pr_info("%s:%u: device status: %u\n", __func__, __LINE__, dev_status);
-			pr_info("%s:%u: nbr of sections: %u\n", __func__, __LINE__, num_sections);
-
-			for (uint32_t s_id = 0; s_id < num_sections; s_id++)
-			{
-				
-				uint32_t n_tapes = section_ior(dev, GET_SECTION_ADDR(s_id),TAPEDEV_SECT_TAPES_ADDR);
-				// Todo: add checking if section type is within allowed range
-				uint32_t sec_type = section_ior(dev, GET_SECTION_ADDR(s_id),TAPEDEV_SECT_TAPE_SIZE_ADDR);
-				pr_info("%s:%u: section type: %u, num of tapes: %u\n", __func__, __LINE__, sec_type, n_tapes);
-			}
-
-			// TODO: maybe we should check if any HW error happened? But if init was
-			// successful, maybe we don't have to do it.
-			wake_up(&dev->wq_idle);
-			spin_unlock_irqrestore(&dev->s_lock, flags);
-			return IRQ_HANDLED;
-		}
-		else
-		{
-			// We got interrupt for the device but device is not initialized yet, 
-			// sth went wrong, creating this device should fail
-			dev->init_done = -1;
-			pr_err("Init failed, we got other interrupt before init interrupt\n");
-			wake_up(&dev->wq_idle);
-			spin_unlock_irqrestore(&dev->s_lock, flags);
-			return IRQ_NONE;
-		}
+		int err = _handle_tapedev_init(ir_status, dev);
+		spin_unlock_irqrestore(&dev->s_lock, flags);
+		return err;
 	}
 
 	// #############################################################################
@@ -156,7 +118,7 @@ static irqreturn_t tapedev_interrupt_handler(int irq, void *opaque_dev)
 		return IRQ_NONE;
 	}
 
-	num_sections = tapedev_ior(dev, TAPEDEV_SECTIONS_ADDR);
+	uint32_t num_sections = tapedev_ior(dev, TAPEDEV_SECTIONS_ADDR);
 	spin_unlock_irqrestore(&dev->s_lock, flags);
 	// #############################################################################
 	// 	We know there was NO HARDWARE ERROR in device
@@ -166,52 +128,7 @@ static irqreturn_t tapedev_interrupt_handler(int irq, void *opaque_dev)
 	// Max allowed number of sections is 8, we should check this
 	// We have this stored inside section
 
-	uint32_t section_done; 
-	uint32_t section_error;
-	uint32_t section_status;
-	// We need ejection queue, and once command for given section is done we take 
-	// spinlock, check if anyone wants to eject tape, if so we send command to eject 
-	// it, set variable in struct, wake up ejector, release spinlock, and end 
-	// handling this very section (once eject command is done it will raise an 
-	// interrupt and we will come back here)  
-
-	// In below loop we check if any section is DONE if so we can start next command.
-	// If given section is IDLE we firstly check if there are any new commands, if 
-	// there are we start new command, if not, we do nothing.
-
-	// We need a queue of 32-bit commands for every section
-	for (int sec_id = 0; sec_id < num_sections; sec_id++)
-	{
-		struct section *sec = dev->sections[sec_id];
-		
-		// section_done might have big value since we get exact bit that was set,
-		// thus we just check if value is greater than 0, if yes we section is done 
-
-		section_done = (ir_status & (1 << TAPEDEV_IRQ_SECT_X_DONE(sec_id))) > 0;
-		section_error = (ir_status & (1 << TAPEDEV_IRQ_SECT_X_ERROR(sec_id))) > 0;
-		section_status = section_read_from(TAPEDEV_SECT_STATUS_ADDR, sec);
-
-		// if (sec_id == 1)
-		// 	pr_warn("%s:%u: section: %u, section_done: %u, section_error: %u, section_status: %u \n", __func__, __LINE__, sec_id, section_done, section_error, section_status);
-
-		int err = 0;
-		if (section_done || section_error)
-		{
-			err = handle_section_interrupt(
-					section_done, 
-					section_error, 
-					section_status, 
-					sec				
-			);
-		}
-
-		if (err)
-		{
-			pr_err("Section handler error: %d\n", err);
-		}
-		// if section currently working we do nothing
-	}
-
+	handle_sections_interrupts(ir_status, num_sections, dev);
 
 	// return IRQ_RETVAL(ir_status);
 	return IRQ_HANDLED;
@@ -1507,6 +1424,50 @@ int add_section_disks(struct tapedev_device *tape_dev, int num_sections)
 		}
 	}
 	return 0;
+}
+
+int _handle_tapedev_init(uint32_t ir_status, struct tapedev_device *dev)
+{
+	uint32_t is_init_done = ir_status & (1 << TAPEDEV_IRQ_INIT_DONE);
+	uint32_t num_sections;
+	uint32_t dev_status;
+
+	if (is_init_done)
+	{
+		tapedev_iow(dev, TAPEDEV_IRQ_CLEAR_ADDR, (1 << TAPEDEV_IRQ_INIT_DONE));
+		pr_info("%s:%u: init done\n", __func__, __LINE__);
+		dev->init_done = 1;
+
+		// Some debug printing for now
+		dev_status = tapedev_ior(dev, TAPEDEV_STATUS_ADDR);
+		num_sections = tapedev_ior(dev, TAPEDEV_SECTIONS_ADDR);
+
+		pr_info("%s:%u: device status: %u\n", __func__, __LINE__, dev_status);
+		pr_info("%s:%u: nbr of sections: %u\n", __func__, __LINE__, num_sections);
+
+		for (uint32_t s_id = 0; s_id < num_sections; s_id++)
+		{
+			
+			uint32_t n_tapes = section_ior(dev, GET_SECTION_ADDR(s_id),TAPEDEV_SECT_TAPES_ADDR);
+			// Todo: add checking if section type is within allowed range
+			uint32_t sec_type = section_ior(dev, GET_SECTION_ADDR(s_id),TAPEDEV_SECT_TAPE_SIZE_ADDR);
+			pr_info("%s:%u: section type: %u, num of tapes: %u\n", __func__, __LINE__, sec_type, n_tapes);
+		}
+
+		// TODO: maybe we should check if any HW error happened? But if init was
+		// successful, maybe we don't have to do it.
+		wake_up(&dev->wq_idle);
+		return IRQ_HANDLED;
+	}
+	else
+	{
+		// We got interrupt for the device but device is not initialized yet, 
+		// sth went wrong, creating this device should fail
+		dev->init_done = -1;
+		pr_err("Init failed, we got other interrupt before init interrupt\n");
+		wake_up(&dev->wq_idle);
+		return IRQ_NONE;
+	}
 }
 
 

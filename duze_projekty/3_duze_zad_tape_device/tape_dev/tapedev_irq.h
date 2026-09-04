@@ -3,6 +3,6 @@
 
 #include "tapedev_defs.h"
 
-int handle_section_interrupt(uint32_t section_done, uint32_t section_error, uint32_t section_status, struct section *sec);
+int handle_sections_interrupts(uint32_t ir_status, uint32_t num_sections, struct tapedev_device *dev);
 
 #endif // TAPEDEV_IRQ_H
