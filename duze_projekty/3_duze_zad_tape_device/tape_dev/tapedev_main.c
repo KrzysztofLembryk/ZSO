@@ -26,6 +26,7 @@
 #include <linux/interrupt.h>
 #include <linux/mmzone.h>
 #include <linux/delay.h>
+#include <stdint.h>
 
 
 // Blk dev example impl
@@ -482,10 +483,41 @@ static int do_scatter_gather(struct request *req, u64 start_sector, struct secti
 	uint32_t cmd_total_blocks = 0;
 	const uint32_t blocks_in_tape = GET_NBR_OF_BLOCKS_IN_TAPE(sec->section_type, sec->blk_size);
 	uint32_t blocks_left_in_tape = blocks_in_tape - start_sector_within_tape;
+	uint32_t prev_tape_nbr = tape_nbr;
 
 	// mtip32xx.c - fill_command_sg
 	for_each_sg(main_sg, sg, nents, _i)
 	{
+		if (tape_nbr > sec->n_tapes)
+		{
+			// TOOD: add freeing memory etc
+			pr_err("%s:%u: tape_nbr: %u > %u :sec->n_tapes, even though for_each_sg still has more data\n", __func__, __LINE__, tape_nbr, sec->n_tapes);
+			return BLK_STS_IOERR;
+		}
+		if (prev_tape_nbr < tape_nbr)
+		{
+			prev_tape_nbr = tape_nbr;
+			uint32_t cmd = create_tapedev_cmd(TAPEDEV_CMD_EJECT_TAPE, 0, 0);
+			if (enqueue_new_cmd(cmd, cmd_lst_head))
+			{
+				pr_err("%s:%u: enqueue EJECT_TAPE failed during for_each_sg \n", __func__, __LINE__);
+				return BLK_STS_IOERR;
+			}
+
+			cmd = create_tapedev_cmd(TAPEDEV_CMD_TAKE_TAPE, tape_nbr, 0);
+			if (enqueue_new_cmd(cmd, cmd_lst_head))
+			{
+				pr_err("%s:%u: enqueue TAKE_TAPE failed during for_each_sg \n", __func__, __LINE__);
+				return BLK_STS_IOERR;
+			}
+
+			cmd = create_tapedev_cmd(TAPEDEV_CMD_REWIND, 0, 0);
+			if (enqueue_new_cmd(cmd, cmd_lst_head))
+			{
+				pr_err("%s:%u: enqueue REWIND failed during for_each_sg \n", __func__, __LINE__);
+				return BLK_STS_IOERR;
+			}
+		}
 		dma_addr_t dma_addr = sg_dma_address(sg);
 		uint32_t dma_len = sg_dma_len(sg);
 		uint32_t nbr_of_blocks = dma_len / section_blk_size;
@@ -536,35 +568,6 @@ static int do_scatter_gather(struct request *req, u64 start_sector, struct secti
 				pgt_buf[ent_id] = ((dma_addr + inserted_blocks * section_blk_size) >> 9);
 				pgt_buf[ent_id] = pgt_buf[ent_id] << 32;
 				pgt_buf[ent_id] = pgt_buf[ent_id] | overflow_blocks;
-			}
-
-
-			if (tape_nbr > sec->n_tapes)
-			{
-				pr_err("%s:%u: we wanted to insert tape with greater number than n_tapes, tape_nbr: %u > %u :sec->n_tapes \n", __func__, __LINE__, tape_nbr, sec->n_tapes);
-				return BLK_STS_IOERR;
-			}
-
-			// TODO: instead of 0 create constant NO_ARG
-			cmd = create_tapedev_cmd(TAPEDEV_CMD_EJECT_TAPE, 0, 0);
-			if (enqueue_new_cmd(cmd, cmd_lst_head))
-			{
-				pr_err("%s:%u: enqueue EJECT_TAPE failed during for_each_sg \n", __func__, __LINE__);
-				return BLK_STS_IOERR;
-			}
-
-			cmd = create_tapedev_cmd(TAPEDEV_CMD_TAKE_TAPE, tape_nbr, 0);
-			if (enqueue_new_cmd(cmd, cmd_lst_head))
-			{
-				pr_err("%s:%u: enqueue TAKE_TAPE failed during for_each_sg \n", __func__, __LINE__);
-				return BLK_STS_IOERR;
-			}
-
-			cmd = create_tapedev_cmd(TAPEDEV_CMD_REWIND, 0, 0);
-			if (enqueue_new_cmd(cmd, cmd_lst_head))
-			{
-				pr_err("%s:%u: enqueue REWIND failed during for_each_sg \n", __func__, __LINE__);
-				return BLK_STS_IOERR;
 			}
 		}
 		else
