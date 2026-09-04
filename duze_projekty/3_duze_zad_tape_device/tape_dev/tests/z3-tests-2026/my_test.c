@@ -26,6 +26,7 @@ int main(int argc, char** argv)
 
     uint64_t blksize;
     int ret = ioctl(fd, BLKGETSIZE64, &blksize);
+    printf("device size in bytes: %llu\n", blksize);
     if (ret < 0) {
         perror("failed to get size");
         return -1;

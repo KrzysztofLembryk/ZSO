@@ -29,8 +29,9 @@
 #define GET_BLOCK_SIZE(blk_type) ((1 << blk_type) * 512)
 #define GET_SECTION_ADDR(s_id) ((s_id + 1) * 0x100)
 #define SIZE_OF_TAPE(s_type) ((1 << s_type) * BASE_TAPE_SIZE)
-#define GET_NBR_OF_SECTORS(s_type, n_tapes) ((SIZE_OF_TAPE(s_type) / 512) * n_tapes)
-#define SIZE_OF_SECTION(s_type, n_tapes) (SIZE_OF_TAPE(s_type) * n_tapes)
+#define GET_TOTAL_NBR_OF_512B_SECTORS(s_type, n_tapes) ((SIZE_OF_TAPE(s_type) / 512) * n_tapes)
+#define SIZE_OF_SECTION_IN_BYTES(s_type, n_tapes) (SIZE_OF_TAPE(s_type) * n_tapes)
+#define GET_NBR_OF_BLOCKS_IN_TAPE(s_type, blk_size) (SIZE_OF_TAPE(s_type) / blk_size)
 
 #define TAPEDEV_IRQ_SECT_X_DONE(i)  (TAPEDEV_IRQ_SECT_0_DONE  + (i))
 #define TAPEDEV_IRQ_SECT_X_ERROR(i) (TAPEDEV_IRQ_SECT_0_ERROR + (i))

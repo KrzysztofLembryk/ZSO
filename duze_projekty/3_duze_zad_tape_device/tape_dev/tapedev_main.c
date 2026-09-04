@@ -1,5 +1,6 @@
 #include "linux/dma-mapping.h"
 #include "linux/list.h"
+#include "linux/page-flags.h"
 #include "linux/scatterlist.h"
 #include "tapedev.h"
 #include "linux/blk-mq.h"
@@ -435,7 +436,38 @@ static void _free_enqueued_cmds(struct list_head *cmd_lst_head)
 	}
 }
 
-static int do_scatter_gather(struct request *req, struct section *sec, int write, struct list_head *cmd_lst_head)
+static int calc_start_pos_within_section(u64 start_sector, uint32_t *start_sector_within_tape, uint32_t *tape_nbr, struct section *sec)
+{
+	uint32_t all_512byte_sectors = GET_TOTAL_NBR_OF_512B_SECTORS(sec->section_type, sec->n_tapes);
+
+	// We count sectors from 0
+	if (start_sector >= all_512byte_sectors)
+	{
+		pr_err("%s:%u: start_sector: %llu >= %u all_sectors available in this section\n", __func__, __LINE__, start_sector, all_512byte_sectors);
+		return -EINVAL;
+	}
+
+	// TODO: change so that it works with other blocksizes
+	// For now we will operate on 512 blocks
+	// how many 512 byte sectors one tape has
+	uint32_t tape_sectors = (SIZE_OF_TAPE(sec->section_type) / sec->blk_size);
+
+	// i.e. if tapes have 200 sectors, and our start_sector is 198 we will get 0 
+	// from below division and that's correct since we want tape of number 0
+	*tape_nbr = start_sector / tape_sectors;
+	// i.e. if start_sector is 403, we get tape 2, and we should start from 
+	// 	403 - 2 * 200 = 3 sector within tape 2
+	*start_sector_within_tape = start_sector - (*tape_nbr) * tape_sectors;
+
+	// We count tapes starting from 1
+	tape_nbr++;
+
+	pr_warn("%s:%u: section: %u, tape_sectors: %u, wanted tape_nbr: %u, start_sector: %llu, start_sector_within_tape: %u\n", __func__, __LINE__, sec->idx, tape_sectors, *tape_nbr, start_sector, *start_sector_within_tape);
+
+	return 0;
+}
+
+static int do_scatter_gather(struct request *req, u64 start_sector, struct section *sec, int write, struct list_head *cmd_lst_head)
 {
 	/*
 		struct request has the following interesting us fields:
@@ -483,10 +515,15 @@ static int do_scatter_gather(struct request *req, struct section *sec, int write
 
 	struct tapedev_device *dev = sec->private_data; 
 	uint64_t *pgt_buf = sec->cpu_dma_buf;
-	uint32_t section_blk_type = section_read_from(TAPEDEV_SECT_TAPE_BLOCKSIZE_ADDR, sec);
-	uint32_t section_blk_size = sec->blk_size;
+	const uint32_t section_blk_type = section_read_from(TAPEDEV_SECT_TAPE_BLOCKSIZE_ADDR, sec);
+	const uint32_t section_blk_size = sec->blk_size;
+	uint32_t tape_nbr; 
+	uint32_t start_sector_within_tape;
 
-	pr_warn("%s:%u: DOING SCATTER GATHER section: %u, section size: %u, blk_type: %u, blk_size: %u, one tape has: %u sectors \n", __func__, __LINE__, sec->idx, SIZE_OF_SECTION(sec->section_type, sec->n_tapes), section_blk_type, section_blk_size, (SIZE_OF_TAPE(sec->section_type) / 512));
+	if (calc_start_pos_within_section(start_sector, &start_sector_within_tape, &tape_nbr, sec))
+		return BLK_STS_INVAL;
+
+	pr_warn("%s:%u: DOING SCATTER GATHER section: %u, section size bytes: %u, blk_type: %u, blk_size: %u, one tape has: %u sectors \n", __func__, __LINE__, sec->idx, SIZE_OF_SECTION_IN_BYTES(sec->section_type, sec->n_tapes), section_blk_type, section_blk_size, (SIZE_OF_TAPE(sec->section_type) / 512));
 	// TODO:
 	// Even kmalloc inside queue_rq is BAD --> what we should do is preallocate sg
 	// 	array inside requests private memory,
@@ -501,9 +538,8 @@ static int do_scatter_gather(struct request *req, struct section *sec, int write
 	// mtip32xx.c - mtip_hw_submit_io 
 	struct scatterlist *main_sg = kzalloc((sizeof(*main_sg) * MAX_SG_PGT_ENTRIES), GFP_KERNEL);
 	if (!main_sg)
-	{
 		return BLK_STS_IOERR;
-	}
+
 	sg_init_table(main_sg, MAX_SG_PGT_ENTRIES);
 
 	int n_collapsed_segments = blk_rq_map_sg(req, main_sg);
@@ -517,14 +553,20 @@ static int do_scatter_gather(struct request *req, struct section *sec, int write
 
 	if (!nents)
 		return BLK_STS_IOERR;
+	if (nents > MAX_SG_PGT_ENTRIES)
+		return BLK_STS_IOERR;
 
 	pr_warn("%s:%u: final nbr of nents: %d\n", __func__, __LINE__, nents);
 	struct scatterlist *sg;
-	int i;
-	uint32_t total_blocks = 0;
+	int ent_id = 0;
+	int _i;
+	int cmd_start_pos = 0;
+	uint32_t cmd_total_blocks = 0;
+	const uint32_t blocks_in_tape = GET_NBR_OF_BLOCKS_IN_TAPE(sec->section_type, sec->blk_size);
+	uint32_t blocks_left_in_tape = blocks_in_tape - start_sector_within_tape;
 
 	// mtip32xx.c - fill_command_sg
-	for_each_sg(main_sg, sg, nents, i)
+	for_each_sg(main_sg, sg, nents, _i)
 	{
 		dma_addr_t dma_addr = sg_dma_address(sg);
 		uint32_t dma_len = sg_dma_len(sg);
@@ -538,36 +580,94 @@ static int do_scatter_gather(struct request *req, struct section *sec, int write
 		{
 			pr_err("%s:%u: dma_len is not multiple of block size\n", __func__, __LINE__);
 		}
+
+		cmd_total_blocks += nbr_of_blocks;
+
+		if (cmd_total_blocks >= blocks_left_in_tape)
+		{
+			uint64_t overflow_blocks = cmd_total_blocks - blocks_left_in_tape;
+			uint64_t inserted_blocks = (uint64_t)nbr_of_blocks - overflow_blocks; 
+			// uint32_t overflow_bytes = overflow_blocks * section_blk_size;
+			cmd_total_blocks = blocks_left_in_tape;
+
+			pgt_buf[ent_id] = (dma_addr  >> 9);
+			pgt_buf[ent_id] = pgt_buf[ent_id] << 32;
+			pgt_buf[ent_id] = pgt_buf[ent_id] | inserted_blocks;
+
+			uint32_t cmd = create_tapedev_cmd(write ? TAPEDEV_CMD_WRITE : TAPEDEV_CMD_READ, cmd_start_pos, cmd_total_blocks);
+
+			if (enqueue_new_cmd(cmd, cmd_lst_head))
+			{
+				pr_err("%s:%u: enqueue new cmd failed during for_each_sg \n", __func__, __LINE__);
+				return BLK_STS_IOERR;
+			}
+
+			cmd_start_pos = ent_id + 1;
+			cmd_total_blocks = overflow_blocks;
+			// TODO: check if we need to move dma_addr by overflow_bytes in pgt or 
+			// once we read some blocks from pgt_buf[], next read will start from 
+			// place where last ended
+			blocks_left_in_tape = blocks_in_tape;
+			tape_nbr++;
+
+			if (overflow_blocks != 0)
+			{
+				ent_id++;
+
+				if (ent_id > MAX_SG_PGT_ENTRIES)
+				{
+					pr_err("%s:%u: ent_id > MAX_SG_PGT_ENTRIES when overflow blocks \n", __func__, __LINE__);
+					return BLK_STS_IOERR;
+				}
+	
+				pgt_buf[ent_id] = ((dma_addr + inserted_blocks * section_blk_size) >> 9);
+				pgt_buf[ent_id] = pgt_buf[ent_id] << 32;
+				pgt_buf[ent_id] = pgt_buf[ent_id] | overflow_blocks;
+			}
+
+
+			if (tape_nbr > sec->n_tapes)
+			{
+				pr_err("%s:%u: we wanted to insert tape with greater number than n_tapes \n", __func__, __LINE__);
+				return BLK_STS_IOERR;
+			}
+
+			// TODO: instead of 0 create constant NO_ARG
+			cmd = create_tapedev_cmd(TAPEDEV_CMD_EJECT_TAPE, 0, 0);
+			if (enqueue_new_cmd(cmd, cmd_lst_head))
+			{
+				pr_err("%s:%u: enqueue EJECT_TAPE failed during for_each_sg \n", __func__, __LINE__);
+				return BLK_STS_IOERR;
+			}
+
+			cmd = create_tapedev_cmd(TAPEDEV_CMD_TAKE_TAPE, tape_nbr, 0);
+			if (enqueue_new_cmd(cmd, cmd_lst_head))
+			{
+				pr_err("%s:%u: enqueue TAKE_TAPE failed during for_each_sg \n", __func__, __LINE__);
+				return BLK_STS_IOERR;
+			}
+
+			cmd = create_tapedev_cmd(TAPEDEV_CMD_REWIND, 0, 0);
+			if (enqueue_new_cmd(cmd, cmd_lst_head))
+			{
+				pr_err("%s:%u: enqueue REWIND failed during for_each_sg \n", __func__, __LINE__);
+				return BLK_STS_IOERR;
+			}
+		}
+		else
+		{
+			pgt_buf[ent_id] = (dma_addr  >> 9);
+			pgt_buf[ent_id] = pgt_buf[ent_id] << 32;
+			pgt_buf[ent_id] = pgt_buf[ent_id] | ((uint64_t)nbr_of_blocks);
+		}
 		// TODO: conitnue with this approach then see if works and change to better
 		// 	state machine with pre-allocation so that in queue_rq there is no alloc
-		pgt_buf[i] = (dma_addr  >> 9);
-		pgt_buf[i] = pgt_buf[i] << 32;
-		pgt_buf[i] = pgt_buf[i] | ((uint64_t)nbr_of_blocks);
-		total_blocks += nbr_of_blocks;
-	}
-
-	pr_warn("%s:%u: total blocks we will read/write: %u\n", __func__, __LINE__, total_blocks);
-	uint32_t cmd = create_tapedev_cmd(write ? TAPEDEV_CMD_WRITE : TAPEDEV_CMD_READ, 0, total_blocks);
-
-	if (enqueue_new_cmd(cmd, cmd_lst_head))
-	{
-		_free_enqueued_cmds(cmd_lst_head);
-		dma_unmap_sg(
-			&dev->pdev->dev, 
-			main_sg, 
-			n_collapsed_segments, 
-			write ? DMA_TO_DEVICE : DMA_FROM_DEVICE
-		);
-		return BLK_STS_IOERR;
+		ent_id++;
 	}
 
 	uint32_t nodes_in_lst = list_count_nodes(cmd_lst_head);
 	pr_warn("%s:%u: nodes in cmd qeueu AFTER sg: %u \n", __func__, __LINE__, nodes_in_lst);
-	// // after shifting there should be no 1 bits in high range
-	// u64 high_addr = (hw_mem_addr >> 9) & 0xffffffff00000000;
-	// u64 low_addr = (hw_mem_addr >> 9) & 0xffffffffULL;
 
-	pr_warn("%s:%u: scheduling read/write command\n", __func__, __LINE__);
 	unsigned long flags;
 	spin_lock_irqsave(&sec->lock, flags);
 
@@ -579,19 +679,13 @@ static int do_scatter_gather(struct request *req, struct section *sec, int write
 		section_send_cmd(node->cmd.cmd, sec);
 	}
 
-	uint32_t cmd_queue_size = list_count_nodes(&sec->cmd_queue_head);
-	pr_warn("%s:%u: cmd_queue_size BEFORE adding new cmds: %u \n", __func__, __LINE__, cmd_queue_size);
 	// otherwise we just add new commands
 	list_splice_tail_init(cmd_lst_head, &sec->cmd_queue_head);
-
-	cmd_queue_size = list_count_nodes(&sec->cmd_queue_head);
-	pr_warn("%s:%u: cmd_queue_size AFTER list_splice_tail_init: %u \n", __func__, __LINE__, cmd_queue_size);
 
 	spin_unlock_irqrestore(&sec->lock, flags);
 
 	return BLK_STS_OK;
 }
-
 
 static int create_start_pos_setup_cmds(u64 start_sector, struct list_head *cmd_lst_head, struct section *sec)
 {
@@ -604,34 +698,16 @@ static int create_start_pos_setup_cmds(u64 start_sector, struct list_head *cmd_l
 	// 		writing at start_sector
 	// TODO: if we change blocksize do sectors also change?
 	// uint32_t n_tapes = sec->n_tapes;
-	uint32_t all_512byte_sectors = GET_NBR_OF_SECTORS(sec->section_type, sec->n_tapes);
 
-	// We count sectors from 0
-	if (start_sector >= all_512byte_sectors)
+	uint32_t tape_nbr; 
+	uint32_t start_sector_within_tape;
+	uint32_t cmd;
+
+	if (calc_start_pos_within_section(start_sector, &start_sector_within_tape, &tape_nbr, sec))
 	{
-		pr_err("%s:%u: start_sector: %llu >= %u all_sectors available in this section\n", __func__, __LINE__, start_sector, all_512byte_sectors);
 		err = -EINVAL;
 		goto ret;
 	}
-
-	// TODO: change so that it works with other blocksizes
-	// For now we will operate on 512 blocks
-	// how many 512 byte sectors one tape has
-	uint32_t tape_512byte_sectors = (SIZE_OF_TAPE(sec->section_type) / 512);
-
-	// i.e. if tapes have 200 sectors, and our start_sector is 198 we will get 0 
-	// from below division and that's correct since we want tape of number 0
-	uint32_t tape_nbr = start_sector / tape_512byte_sectors;
-	// i.e. if start_sector is 403, we get tape 2, and we should start from 
-	// 	403 - 2 * 200 = 3 sector within tape 2
-	uint32_t start_sector_within_tape = start_sector - tape_nbr * tape_512byte_sectors;
-
-	// We count tapes starting from 1
-	tape_nbr++;
-
-	pr_warn("%s:%u: section: %u, tape_sectors: %u, wanted tape_nbr: %u, start_sector: %llu, start_sector_within_tape: %u\n", __func__, __LINE__, sec->idx, tape_512byte_sectors, tape_nbr, start_sector, start_sector_within_tape);
-
-	uint32_t cmd;
 
 	cmd = create_tapedev_cmd(TAPEDEV_CMD_EJECT_TAPE, 0, 0);
 	if (enqueue_new_cmd(cmd, cmd_lst_head))
@@ -742,13 +818,13 @@ static inline int submit_request_sg(struct request *req, struct section *sec)
 		pr_warn("%s:%u: WRITE %llu sectors starting at %llu\n",
 			__func__, __LINE__, sectors_to_read, start_sector);
 
-		err = do_scatter_gather(req, sec, 1, &cmd_lst_head);
+		err = do_scatter_gather(req, start_sector, sec, 1, &cmd_lst_head);
 		break;
 	case REQ_OP_READ:
 		pr_warn("%s:%u: READ %llu sectors starting at %llu\n",
 			__func__, __LINE__, sectors_to_read, start_sector);
 
-		err = do_scatter_gather(req, sec, 0, &cmd_lst_head);
+		err = do_scatter_gather(req, start_sector, sec, 0, &cmd_lst_head);
 		break;
 	default:
 		pr_warn("%s:%u: submitted bad request, supported requests are READ and WRITE\n", __func__, __LINE__);
@@ -1234,7 +1310,7 @@ static int create_section(
 	sec->n_tapes = n_tapes;
 	sec->section_type = sec_type;
 	sec->blk_size = blksize;
-	sec->n_sectors = GET_NBR_OF_SECTORS(sec_type, n_tapes);
+	sec->n_sectors = GET_TOTAL_NBR_OF_512B_SECTORS(sec_type, n_tapes);
 	sec->current_tape = 0;
 	sec->ejection_cmds = 0;
 
@@ -1319,7 +1395,7 @@ static int create_section(
 	// we pass HOW MANY 512 byte SECTORS our disk has; 8192 / 512 = 16, so by using 
 	// TAPEDEV_SECT_TAPE_SIZE we can calculate how many sectors our tape has
 	// Each tape has SIZE_OF_TAPE so every tape will have SIZE_OF_TAPE / 512 sectors
-	set_capacity(sec->gdisk, GET_NBR_OF_SECTORS(sec_type, n_tapes));
+	set_capacity(sec->gdisk, GET_TOTAL_NBR_OF_512B_SECTORS(sec_type, n_tapes));
 
 
 	*new_section = sec;
