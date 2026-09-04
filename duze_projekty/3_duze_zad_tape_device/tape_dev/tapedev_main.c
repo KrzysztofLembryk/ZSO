@@ -367,6 +367,7 @@ static int calc_start_pos_within_section(u64 start_sector, uint32_t *start_secto
 	// TODO: change so that it works with other blocksizes
 	// For now we will operate on 512 blocks
 	// how many 512 byte sectors one tape has
+	pr_warn("%s:%u: section block size: %u\n", __func__, __LINE__, sec->blk_size);
 	uint32_t tape_sectors = (SIZE_OF_TAPE(sec->section_type) / sec->blk_size);
 
 	// i.e. if tapes have 200 sectors, and our start_sector is 198 we will get 0 
@@ -377,9 +378,9 @@ static int calc_start_pos_within_section(u64 start_sector, uint32_t *start_secto
 	*start_sector_within_tape = start_sector - (*tape_nbr) * tape_sectors;
 
 	// We count tapes starting from 1
-	tape_nbr++;
+	*tape_nbr = *tape_nbr + 1;
 
-	pr_warn("%s:%u: section: %u, tape_sectors: %u, wanted tape_nbr: %u, start_sector: %llu, start_sector_within_tape: %u\n", __func__, __LINE__, sec->idx, tape_sectors, *tape_nbr, start_sector, *start_sector_within_tape);
+	pr_warn("%s:%u: section: %u, wanted tape_nbr: %u, nbr of tapes in section: %u, nbr of sectors in one tape: %u, n_sectors in section: %u,  start_sector: %llu, start_sector_within_tape: %u\n", __func__, __LINE__, sec->idx, *tape_nbr, sec->n_tapes, tape_sectors, all_512byte_sectors,  start_sector, *start_sector_within_tape);
 
 	return 0;
 }
@@ -440,6 +441,7 @@ static int do_scatter_gather(struct request *req, u64 start_sector, struct secti
 	if (calc_start_pos_within_section(start_sector, &start_sector_within_tape, &tape_nbr, sec))
 		return BLK_STS_INVAL;
 
+	pr_warn("%s:%u: tape nbr: %u\n", __func__, __LINE__, tape_nbr);
 	pr_warn("%s:%u: DOING SCATTER GATHER section: %u, section size bytes: %u, blk_type: %u, blk_size: %u, one tape has: %u sectors \n", __func__, __LINE__, sec->idx, SIZE_OF_SECTION_IN_BYTES(sec->section_type, sec->n_tapes), section_blk_type, section_blk_size, (SIZE_OF_TAPE(sec->section_type) / 512));
 	// TODO:
 	// Even kmalloc inside queue_rq is BAD --> what we should do is preallocate sg
@@ -473,7 +475,6 @@ static int do_scatter_gather(struct request *req, u64 start_sector, struct secti
 	if (nents > MAX_SG_PGT_ENTRIES)
 		return BLK_STS_IOERR;
 
-	pr_warn("%s:%u: final nbr of nents: %d\n", __func__, __LINE__, nents);
 	struct scatterlist *sg;
 	int ent_id = 0;
 	int _i;
@@ -490,13 +491,9 @@ static int do_scatter_gather(struct request *req, u64 start_sector, struct secti
 		uint32_t nbr_of_blocks = dma_len / section_blk_size;
 
 		if (!IS_ALIGNED(dma_addr, 512)) 
-		{
 			pr_err("%s:%u: dma_addr is not 512 byte aligned\n", __func__, __LINE__);
-		}
 		if (dma_len % section_blk_size != 0)
-		{
 			pr_err("%s:%u: dma_len is not multiple of block size\n", __func__, __LINE__);
-		}
 
 		cmd_total_blocks += nbr_of_blocks;
 
@@ -504,7 +501,6 @@ static int do_scatter_gather(struct request *req, u64 start_sector, struct secti
 		{
 			uint64_t overflow_blocks = cmd_total_blocks - blocks_left_in_tape;
 			uint64_t inserted_blocks = (uint64_t)nbr_of_blocks - overflow_blocks; 
-			// uint32_t overflow_bytes = overflow_blocks * section_blk_size;
 			cmd_total_blocks = blocks_left_in_tape;
 
 			pgt_buf[ent_id] = (dma_addr  >> 9);
@@ -545,7 +541,7 @@ static int do_scatter_gather(struct request *req, u64 start_sector, struct secti
 
 			if (tape_nbr > sec->n_tapes)
 			{
-				pr_err("%s:%u: we wanted to insert tape with greater number than n_tapes \n", __func__, __LINE__);
+				pr_err("%s:%u: we wanted to insert tape with greater number than n_tapes, tape_nbr: %u > %u :sec->n_tapes \n", __func__, __LINE__, tape_nbr, sec->n_tapes);
 				return BLK_STS_IOERR;
 			}
 
@@ -582,8 +578,19 @@ static int do_scatter_gather(struct request *req, u64 start_sector, struct secti
 		ent_id++;
 	}
 
-	uint32_t nodes_in_lst = list_count_nodes(cmd_lst_head);
-	pr_warn("%s:%u: nodes in cmd qeueu AFTER sg: %u \n", __func__, __LINE__, nodes_in_lst);
+	// If there are any blocks left it means that we ended our loop without exceeding
+	// current tape's limit, so we must schedule new cmd
+	if (cmd_total_blocks)
+	{
+		uint32_t cmd = create_tapedev_cmd(write ? TAPEDEV_CMD_WRITE : TAPEDEV_CMD_READ, cmd_start_pos, cmd_total_blocks);
+
+		if (enqueue_new_cmd(cmd, cmd_lst_head))
+		{
+			pr_err("%s:%u: enqueue new cmd failed during for_each_sg \n", __func__, __LINE__);
+			return BLK_STS_IOERR;
+		}
+	}
+
 
 	unsigned long flags;
 	spin_lock_irqsave(&sec->lock, flags);
@@ -592,12 +599,14 @@ static int do_scatter_gather(struct request *req, u64 start_sector, struct secti
 	{
 		// We schedule commands if section cmd queue is emmpty 
 		struct lst_node *node = list_first_entry(cmd_lst_head, struct lst_node, lst_link);
-		pr_warn("%s:%u: cmd_qeueu list empty, scheduling cmd: %u \n", __func__, __LINE__, GET_CMD_TYPE(node->cmd.cmd));
 		section_send_cmd(node->cmd.cmd, sec);
 	}
 
 	// otherwise we just add new commands
 	list_splice_tail_init(cmd_lst_head, &sec->cmd_queue_head);
+
+	uint32_t nodes_in_lst = list_count_nodes(&sec->cmd_queue_head);
+	pr_warn("%s:%u: nodes in cmd qeueu after sg: %u \n", __func__, __LINE__, nodes_in_lst);
 
 	spin_unlock_irqrestore(&sec->lock, flags);
 
@@ -633,6 +642,7 @@ static int create_start_pos_setup_cmds(u64 start_sector, struct list_head *cmd_l
 		goto free_cmd_queue;
 	}
 
+	pr_warn("%s:%u: tape_nbr: %u\n", __func__, __LINE__, tape_nbr);
 	cmd = create_tapedev_cmd(TAPEDEV_CMD_TAKE_TAPE, tape_nbr, 0);
 	if (enqueue_new_cmd(cmd, cmd_lst_head))
 	{
