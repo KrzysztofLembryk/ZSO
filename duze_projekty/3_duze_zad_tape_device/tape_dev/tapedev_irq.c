@@ -316,7 +316,10 @@ int __handle_section_done(uint32_t section_status, struct section *sec)
 
 			// If current command was issued by ioctl we only wake up ioctl threads
 			if (curr_cmd.is_ioctl)
+			{
+				sec->ioctl_cmd_done = true;
 				wake_up(&sec->ioctl_eject_wait_q);
+			}
 
 			// If current command wasn't issued by ioctl, noone is waiting on queue
 			// so we don't need to do anything, tape was ejected, that's all we 
