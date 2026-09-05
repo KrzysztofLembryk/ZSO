@@ -1,6 +1,7 @@
 #ifndef TAPEDEV_SYSFS_H
 #define TAPEDEV_SYSFS_H
 
+#include "tapedev_iow_ior.h"
 #include "tapedev_defs.h"
 
 // https://medium.com/@emanuele.santini.88/sysfs-in-linux-kernel-a-complete-guide-part-1-c3629470fc84
@@ -24,7 +25,9 @@ static ssize_t current_tape_show(struct device *dev, struct device_attribute *at
 {
 	struct gendisk *disk = dev_to_disk(dev);
 	struct section *s = disk->private_data;
-	return sysfs_emit(buf, "%u\n", s->current_tape);
+	uint32_t tape_nbr = section_read_from(TAPEDEV_SECT_TAPE_NO_ADDR, s); 
+	pr_info("current_tape_show -- curr tape: %u\n", tape_nbr);
+	return sysfs_emit(buf, "%u\n", tape_nbr);
 }
 
 static DEVICE_ATTR_RO(tape_type);

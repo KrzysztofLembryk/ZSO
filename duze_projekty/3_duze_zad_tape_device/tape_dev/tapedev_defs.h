@@ -10,6 +10,7 @@
 // I would add it to tapedev.h but probably it will be replaced with default .h file
 #define TAPEDEV_CMD_NONE				0x06
 #define TAPEDEV_CMD_UNSUPPORTED			0xffffffff
+#define IS_NULL_REQ_STATE(state) ()
 
 #define MAX_DEVICES_TAPEDEV 256
 #define MAX_SG_PGT_ENTRIES 512
@@ -41,15 +42,17 @@
 // Bits 8-31 are used to pass command-specific information.
 #define GET_CMD_BODY(cmd) ((uint32_t)((cmd) & 0xffffff00U))
 
-struct section_cmd
+struct req_state
 {
 	uint32_t cmd_type;
 	uint32_t cmd;
 	bool is_ioctl;
-	int nents;
 	int sg_idx;
 	uint32_t blocks_sent;
+	bool is_write;
 	enum dma_data_direction dir;
+	int nents;
+	uint32_t tape_nbr;
 };
 
 // Add at the end with - list_add_tail(&node->link, &section->cmd_queue)
@@ -59,11 +62,11 @@ struct section_cmd
 // 	list_del(&node->link)
 struct lst_node
 {
-	struct section_cmd cmd;
+	struct req_state cmd;
 	struct list_head lst_link;
 };
 
-extern const struct section_cmd NO_CMD; 
+extern const struct req_state NULL_REQ_STATE; 
 
 // To create section object use create_section function
 struct section
@@ -73,16 +76,7 @@ struct section
 	// 0 to 4, to calc size of tape for this section use SIZE_OF_TAPE macro
 	uint32_t section_type; 	
 	uint32_t blk_size;
-	sector_t n_sectors;
-	// If 0 - no tape inserted in tapedevice
-	uint32_t current_tape;
-	// Number of ejection commands waiting to be executed, the same number of threads
-	// are waiting on ejection_queue
-	uint32_t ejection_cmds;
 	wait_queue_head_t ioctl_eject_wait_q;
-	wait_queue_head_t cmd_wait_q;
-	struct section_cmd curr_cmd;
-	struct section_cmd next_cmd;
 	bool ioctl_cmd_done;
 	int status;
 	int ioctl_status;
@@ -97,7 +91,9 @@ struct section
 	// data_cpu is our dma buff to which we will write/read scatter gather data
 	void *cpu_dma_buf;
 	struct blk_mq_tag_set tag_set; /* multi queue */
+	struct req_state req_state;
 	struct request *req; 
+	struct scatterlist *sg_arr;
 	struct list_head cmd_queue_head;
 	// private_data must be tapedev_device
 	void *private_data;

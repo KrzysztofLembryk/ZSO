@@ -13,7 +13,7 @@ int __handle_section_error(uint32_t section_status, struct section *sec);
 int __handle_section_done(uint32_t section_status, struct section *sec);
 void __handle_next_cmd(struct section *sec);
 void __abort_rest_of_req_cmds(struct section *sec);
-void __end_req_if_completed(struct section *sec, struct section_cmd *curr_cmd);
+void __end_req_if_completed(struct section *sec, struct req_state *curr_cmd);
 void clear_sec_done_intrpt(struct section* sec);
 void clear_sec_err_intrpt(struct section* sec);
 int _handle_section_interrupt(uint32_t section_done, uint32_t section_error, uint32_t section_status, struct section *sec);
@@ -129,7 +129,7 @@ int __handle_section_error(uint32_t section_status, struct section *sec)
 
 
 	struct lst_node *curr_cmd_node = list_first_entry(&sec->cmd_queue_head, struct lst_node, lst_link);
-	struct section_cmd curr_cmd = curr_cmd_node->cmd;
+	struct req_state curr_cmd = curr_cmd_node->cmd;
 	// pr_err("%s:%u: section: %d, we got error for current command: %u\n", __func__, __LINE__, sec->idx, curr_cmd.cmd);
 	// TODO: IDK how we should handle these things yet
 	switch (section_status)
@@ -270,13 +270,14 @@ int __handle_section_done(uint32_t section_status, struct section *sec)
 
 	sec->status = TAPEDEV_SECT_STATUS_DONE;
 	struct lst_node *node = list_first_entry(&sec->cmd_queue_head, struct lst_node, lst_link);
-	struct section_cmd curr_cmd = node->cmd;
+	struct req_state curr_cmd = node->cmd;
 	
 	list_del(&node->lst_link);
 	// After removing from queue list we must free memory of the node, we no longer
 	// need it here, just information aobut curr cmd is sufficient
 	kfree(node);
 
+	uint32_t tape_nbr = section_read_from(TAPEDEV_SECT_TAPE_NO_ADDR, sec); 
 	uint32_t curr_cmd_type = GET_CMD_TYPE(curr_cmd.cmd);
 	uint32_t curr_cmd_body = GET_CMD_BODY(curr_cmd.cmd);
 
@@ -286,12 +287,11 @@ int __handle_section_done(uint32_t section_status, struct section *sec)
 		{
 			pr_warn("%s:%u: cmd DONE: TAPEDEV_CMD_TAKE_TAPE \n", __func__, __LINE__);
 			curr_cmd_body = curr_cmd_body >> 8;
-			sec->current_tape = curr_cmd_body;
 			uint32_t tape = section_read_from(TAPEDEV_SECT_TAPE_NO_ADDR, sec); 
 	
-			if (tape != sec->current_tape)
+			if (tape != curr_cmd_body)
 			{
-				pr_err("%s:%u: take_tape was done but inserted tape: '%u' is different from requested tape: '%u' \n", __func__, __LINE__, tape, sec->current_tape);
+				pr_err("%s:%u: take_tape was done but inserted tape: '%u' is different from requested tape: '%u' \n", __func__, __LINE__, tape, curr_cmd_body);
 				// TODO: rework errors, add INTERNAL_ERROR or sth and return it here
 				// instead of -1
 				err = -1;
@@ -303,8 +303,6 @@ int __handle_section_done(uint32_t section_status, struct section *sec)
 		case TAPEDEV_CMD_EJECT_TAPE:
 		{
 			pr_warn("%s:%u: cmd DONE: TAPEDEV_CMD_EJECT_TAPE \n", __func__, __LINE__);
-			// TODO: add constant NO_TAPE instead of magic number 0
-			sec->current_tape = NO_TAPE;
 			uint32_t tape = section_read_from(TAPEDEV_SECT_TAPE_NO_ADDR, sec); 
 	
 			if (tape != NO_TAPE)
@@ -327,18 +325,18 @@ int __handle_section_done(uint32_t section_status, struct section *sec)
 			break;
 		}
 		case TAPEDEV_CMD_REWIND:
-			pr_warn("%s:%u: cmd DONE: TAPEDEV_CMD_REWIND, tape: %u rewinded \n", __func__, __LINE__, sec->current_tape);
+			pr_warn("%s:%u: cmd DONE: TAPEDEV_CMD_REWIND, tape: %u rewinded \n", __func__, __LINE__, tape_nbr);
 			break;
 		case TAPEDEV_CMD_FAST_FWD:
-			pr_warn("%s:%u: cmd DONE: TAPEDEV_CMD_FAST_FWD. tape: %u forwarded by %u blocks\n", __func__, __LINE__, sec->current_tape, curr_cmd_body >> 8);
+			pr_warn("%s:%u: cmd DONE: TAPEDEV_CMD_FAST_FWD. tape: %u forwarded by %u blocks\n", __func__, __LINE__, tape_nbr, curr_cmd_body >> 8);
 			break;
 		case TAPEDEV_CMD_READ:
 			// In read/write we probably will need to do something with checking how
 			// many bytes or sth was read/done etc
-			pr_warn("%s:%u: cmd DONE TAPEDEV_CMD_READ, tape: %u has been read\n", __func__, __LINE__, sec->current_tape);
+			pr_warn("%s:%u: cmd DONE TAPEDEV_CMD_READ, tape: %u has been read\n", __func__, __LINE__, tape_nbr);
 			break;
 		case TAPEDEV_CMD_WRITE:
-			pr_warn("%s:%u: cmd DONE TAPEDEV_CMD_WRITE, tape: %u has been written\n", __func__, __LINE__, sec->current_tape);
+			pr_warn("%s:%u: cmd DONE TAPEDEV_CMD_WRITE, tape: %u has been written\n", __func__, __LINE__, tape_nbr);
 			break;	
 		default:
 			pr_err("%s:%u: got unsupported cmd: '%u' \n", __func__, __LINE__, curr_cmd_type);
@@ -408,7 +406,7 @@ void __abort_rest_of_req_cmds(struct section *sec)
 	sec->req = NULL;
 }
 
-void __end_req_if_completed(struct section *sec, struct section_cmd *curr_cmd)
+void __end_req_if_completed(struct section *sec, struct req_state *curr_cmd)
 {
 
 	// After handling current command we check if list empty 

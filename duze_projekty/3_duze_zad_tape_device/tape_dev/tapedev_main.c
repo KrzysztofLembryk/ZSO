@@ -1,3 +1,4 @@
+#include "linux/blkdev.h"
 #include "linux/dma-mapping.h"
 #include "linux/list.h"
 #include "linux/page-flags.h"
@@ -183,7 +184,8 @@ static int tapedev_ioctl(struct block_device *bdev, blk_mode_t mode, unsigned cm
 		struct tapedev_sect_info sec_info = {
 			.tapes = sec->n_tapes,
 			.tape_type = sec->section_type,
-			.current_tape = sec->current_tape
+			.current_tape = section_read_from(TAPEDEV_SECT_TAPE_NO_ADDR, sec)
+
 		};
 
 		spin_unlock_irqrestore(&sec->lock, flags);
@@ -204,16 +206,15 @@ static int tapedev_ioctl(struct block_device *bdev, blk_mode_t mode, unsigned cm
 
 		spin_lock_irqsave(&sec->lock, flags);
 
-		uint32_t current_tape = sec->current_tape;
+		uint32_t current_tape = section_read_from(TAPEDEV_SECT_TAPE_NO_ADDR, sec);
 
 		pr_info("%s:%u: got EJECT_TAPE ioctl cmd. Current tape: %u  (if 0 no tape inserted)\n", __func__, __LINE__, current_tape);
 
 
-		node->cmd = (struct section_cmd) {
+		node->cmd = (struct req_state) {
 			.cmd = TAPEDEV_CMD_EJECT_TAPE,
 			.is_ioctl = true
 		};
-		sec->ejection_cmds += 1;
 		// We must send command to the section ONLY when command list is empty  
 		// otherwise our command will be done in near future, we just add it at the
 		// end of the queue
@@ -230,7 +231,6 @@ static int tapedev_ioctl(struct block_device *bdev, blk_mode_t mode, unsigned cm
 			spin_lock_irqsave(&sec->lock, flags);
 		}
 
-		sec->ejection_cmds--;
 		sec->ioctl_cmd_done = false;
 
 		// TODO: this is prone to some data races - we ejected tape but before we are
@@ -333,7 +333,7 @@ static int enqueue_new_cmd(uint32_t cmd, struct list_head *cmd_lst_head)
 		pr_err("%s:%u: failed to alloc node for cmd\n", __func__, __LINE__);
 		return -ENOMEM;
 	}
-	new_lst_node->cmd = (struct section_cmd) {
+	new_lst_node->cmd = (struct req_state) {
 			.cmd = cmd,
 			.is_ioctl = false
 	};
@@ -735,7 +735,7 @@ static inline int submit_request_sg(struct request *req, struct section *sec)
 
 	pr_warn("%s:%u: start_sector: %llu, sectors_to_read: %llu\n", __func__, __LINE__, start_sector, sectors_to_read);
 
-	// We must create sequence of commands and blk_mq_tag_setadd the to the cmd queue
+	// We must create sequence of commands and blk_mq_tag_set add the to the cmd queue
 	// After set_section_start_pos if we had a lock we still have it
 	if (create_start_pos_setup_cmds(start_sector, &cmd_lst_head, sec))
 	{
@@ -1071,10 +1071,6 @@ static int tapedev_probe(
 
 		section_iow(tape_dev, GET_SECTION_ADDR(sec_id), 	
 			TAPEDEV_SECT_BUFFER_PTR_ADDR, dma_hw_buf_addr);
-		
-		tape_dev->sections[sec_id]->current_tape = section_read_from(TAPEDEV_SECT_TAPE_NO_ADDR, tape_dev->sections[sec_id]);
-
-		pr_warn("%s:%u: section: %u, current tape: %u\n", __func__, __LINE__, sec_id, tape_dev->sections[sec_id]->current_tape);
 	}
 
 	pr_warn("%s:%u: BEFORE add_section_disks\n", __func__, __LINE__);
@@ -1207,6 +1203,25 @@ module_init(init_tapedev);
 module_exit(cleanup_tapedev);
 
 
+/*
+	We expect passed section to be successfully allocated
+*/
+static void _free_section(struct section *sec, bool was_disk_added) 
+{
+	struct tapedev_device *tape_dev = sec->private_data;
+
+	// put_disk decrements gendisk refcount, if it reaches 0 gendisk is 
+	// freed.
+	// If haven't used add_disk, we wouldn't need to use del_gendisk
+	if (was_disk_added)
+		del_gendisk(sec->gdisk);
+	put_disk(sec->gdisk);
+	blk_mq_free_tag_set(&sec->tag_set);
+	dma_free_coherent(&tape_dev->pdev->dev, TAPEDEV_BUF_PGTABLE_SIZE, sec->cpu_dma_buf, sec->dma_addr);
+	kfree(sec->sg_arr);
+	kfree(sec);
+}
+
 // Each tape type is a separate section with gdisk which is our block device, 
 // tape_types":[0,1,2,3,4],"tapes":[50,40,30,20,10]}
 // Each minor of this gdisk is a SECTION, each section will have file /dev/tapedevXsN
@@ -1216,17 +1231,17 @@ static int create_section(
 	uint32_t sec_type, 
 	uint32_t n_tapes,
 	uint32_t device_id,
-	int *first_minor,
 	struct tapedev_device *tape_dev
 )
 {
+    int err;
 	// I assume that blksize (512, 1024, 2048, 4096, 8192) is set in stone at 
 	// tapedevice start, thus based on this value we can setup queue_limits so that
 	// block layer can serve us correctly aligned data
 	uint32_t blksize = GET_BLOCK_SIZE(section_ior(tape_dev, GET_SECTION_ADDR(section_id), TAPEDEV_SECT_TAPE_BLOCKSIZE_ADDR));
 
 	// Knowing how many blocks we can read/write per one command and knowing block
-	// size we can calculate how many 512byte sectors at most we can handle
+	// size we can calculate how many 512byte sectors at most we can handle.
 	// max_hw_sectors is always in 512-byte units
 	uint32_t max_nbr_of_sectors = (MAX_BLOCKS_PER_ONE_CMD * blksize) / 512;
 
@@ -1239,7 +1254,6 @@ static int create_section(
 		.dma_alignment = 511, // so that dma addresses are 512 byte aligned
 	};
 
-    int err;
 	struct section *sec = kzalloc(sizeof(struct section), GFP_KERNEL);
 
 	if (!sec)
@@ -1255,22 +1269,24 @@ static int create_section(
 	sec->n_tapes = n_tapes;
 	sec->section_type = sec_type;
 	sec->blk_size = blksize;
-	sec->n_sectors = GET_TOTAL_NBR_OF_512B_SECTORS(sec_type, n_tapes);
-	sec->current_tape = 0;
-	sec->ejection_cmds = 0;
 
 	init_waitqueue_head(&sec->ioctl_eject_wait_q);
-	init_waitqueue_head(&sec->cmd_wait_q);
 
-	sec->curr_cmd = NO_CMD;
-	sec->next_cmd = NO_CMD;
 	sec->ioctl_cmd_done = false;
-	sec->req = NULL;
-	INIT_LIST_HEAD(&sec->cmd_queue_head);
-	sec->private_data = tape_dev;
 	sec->status = 0;
 	sec->ioctl_status = 0;
-	// s->data_buf = kzalloc(SIZE_OF_TAPE(s->section_type) * s->n_sectors, GFP_KERNEL);
+	sec->req_state = NULL_REQ_STATE;
+	sec->req = NULL;
+	sec->sg_arr = kzalloc((sizeof(*sec->sg_arr) * MAX_SG_PGT_ENTRIES), GFP_KERNEL);
+
+	if (!sec->sg_arr)
+	{
+		err = -ENOMEM;
+		goto free_alloc_s;
+	}
+
+	INIT_LIST_HEAD(&sec->cmd_queue_head);
+	sec->private_data = tape_dev;
 
 	// dma_alloc_coherent - allocates a memory region accessible simultaneously by 
 	// both the CPU and hardware, of size DMA_BUF_SIZE. Cpu (so our programme) must
@@ -1284,7 +1300,7 @@ static int create_section(
 	{
 		pr_err("%s:%u: Failed to dma_alloc_coherent\n", __func__, __LINE__);
 		err = -ENOMEM;
-		goto free_alloc_s;
+		goto free_sg_arr;
 	}
 
 	if (!IS_ALIGNED(sec->dma_addr, 512)) 
@@ -1297,8 +1313,6 @@ static int create_section(
 	// To be 512 byte aligned our first 9 bits (0 - 8) need to be zeroed, so that 
 	// in our address = 2^i + 2^(i+1) + ..., i >= 9, since 2^9 = 512, and if i >= 9
 	// all addresses will be divisible by 512 so aligned to 512 byte boundary
-
-	// err = init_tag_set(&sec->tag_set, sec);
 
 	// Each section device can process only ONE request at the time, thus we set 
 	// queue_depth as 1
@@ -1317,19 +1331,6 @@ static int create_section(
 		goto free_tag_set;
 	}
 
-	// s->gdisk = blk_alloc_disk(NULL, NUMA_NO_NODE);
-	// if (IS_ERR_OR_NULL(s->gdisk)) 
-	// {
-	// 	err = s->gdisk ? PTR_ERR(s->gdisk) : -ENOMEM;
-	// 	pr_err("%s :: blk_alloc_disk failed with error: %d\n", __func__, err);
-	// 	goto free_alloc_s;
-	// }
-
-	// Should not be done by us as gendisk struct says
-	// s->gdisk->major = tapedev_major;
-	// s->gdisk->first_minor = *first_minor;
-	// *first_minor += n_tapes;
-	// s->gdisk->minors = n_tapes;
 	sec->gdisk->fops = &tapedev_ops;
 	sec->gdisk->private_data = sec;
 
@@ -1337,11 +1338,8 @@ static int create_section(
 	snprintf(sec->gdisk->disk_name, 15, "tapedev%us%u", device_id, section_id);
 
 	// We should set capacity of the disk by using set_capacity, to this function 
-	// we pass HOW MANY 512 byte SECTORS our disk has; 8192 / 512 = 16, so by using 
-	// TAPEDEV_SECT_TAPE_SIZE we can calculate how many sectors our tape has
-	// Each tape has SIZE_OF_TAPE so every tape will have SIZE_OF_TAPE / 512 sectors
+	// we pass HOW MANY 512 byte SECTORS our disk has.
 	set_capacity(sec->gdisk, GET_TOTAL_NBR_OF_512B_SECTORS(sec_type, n_tapes));
-
 
 	*new_section = sec;
 
@@ -1353,6 +1351,8 @@ free_tag_set:
 	blk_mq_free_tag_set(&sec->tag_set);
 free_dma_alloc:
 	dma_free_coherent(&tape_dev->pdev->dev, TAPEDEV_BUF_PGTABLE_SIZE, sec->cpu_dma_buf, sec->dma_addr);
+free_sg_arr:
+	kfree(sec->sg_arr);
 free_alloc_s:
 	kfree(sec);
 fail:
@@ -1362,7 +1362,6 @@ fail:
 int create_sections(struct tapedev_device *tape_dev, int num_sections)
 {
 	int err;
-	int first_minor = 0;
 	uint32_t s_id;
 
 	// Create all sections for this device
@@ -1374,27 +1373,15 @@ int create_sections(struct tapedev_device *tape_dev, int num_sections)
 
 		pr_info("create_sections :: s_id: %u, n_tapes: %u, sec_type: %u\n", s_id, n_tapes, sec_type);
 
-		err = create_section(&(tape_dev->sections[s_id]), s_id, sec_type, n_tapes, tape_dev->idx, &first_minor, tape_dev);
+		err = create_section(&(tape_dev->sections[s_id]), s_id, sec_type, n_tapes, tape_dev->idx, tape_dev);
 
 		if (err < 0)
 		{
 			pr_err("%s:%u: failed to create_section for id: %d, err: %d\n", __func__, __LINE__, s_id, err);
 
-			// We must deallocate all previous ones
-			// TODO: add helper function for this
 			for (int i = 0; i < s_id; i++)
-			{
-				// put_disk decrements gendisk refcount, if it reaches 0 gendisk is 
-				// freed, since we've just allocated gendisk struct there might at 
-				// most 1 ref to it thus put_disk will free dev.gendisk
-				// We didnt use add_disk yet so we dont need to use del_gendisk
-				// del_gendisk(tape_dev->sections[i]->gdisk);
+				_free_section(tape_dev->sections[i], false);
 
-				blk_mq_free_tag_set(&tape_dev->sections[i]->tag_set);
-				dma_free_coherent(&tape_dev->pdev->dev, PAGE_SIZE, tape_dev->sections[i]->cpu_dma_buf, tape_dev->sections[i]->dma_addr);
-				put_disk(tape_dev->sections[i]->gdisk);
-				kfree(tape_dev->sections[i]);
-			}
 			return err;
 		}
 	}
