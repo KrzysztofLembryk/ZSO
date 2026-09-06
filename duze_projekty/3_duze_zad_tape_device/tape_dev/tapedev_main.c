@@ -27,6 +27,7 @@
 #include <linux/interrupt.h>
 #include <linux/mmzone.h>
 #include <linux/delay.h>
+#include <stdint.h>
 
 
 // Blk dev example impl
@@ -218,10 +219,10 @@ static int tapedev_ioctl(struct block_device *bdev, blk_mode_t mode, unsigned cm
 		// We must send command to the section ONLY when command list is empty  
 		// otherwise our command will be done in near future, we just add it at the
 		// end of the queue
-		if (list_empty(&sec->cmd_queue_head))
+		if (list_empty(&sec->ioctl_cmd_queue_head))
 			section_send_cmd(TAPEDEV_CMD_EJECT_TAPE, sec);
 
-		list_add_tail(&node->lst_link, &sec->cmd_queue_head);
+		list_add_tail(&node->lst_link, &sec->ioctl_cmd_queue_head);
 
 		while (!sec->ioctl_cmd_done) 
 		{
@@ -385,19 +386,73 @@ static int calc_start_pos_within_section(u64 start_sector, uint32_t *start_secto
 	return 0;
 }
 
+/*
+	SECTION LOCK must be acquired before using this function
+*/
+static int init_req_state(u64 start_sector, int write, int original_nents, int nents, struct section *sec)
+{
+	pr_warn("%s:%u: Initializing request state\n", __func__, __LINE__);
+
+	uint32_t tape_nbr; 
+	uint32_t start_sector_within_tape;
+	uint32_t cmd;
+
+	if (calc_start_pos_within_section(start_sector, &start_sector_within_tape, &tape_nbr, sec))
+		return -EINVAL;
+
+	const uint32_t blocks_in_tape = GET_NBR_OF_BLOCKS_IN_TAPE(sec->section_type, sec->blk_size);
+	uint32_t blocks_left_in_tape = blocks_in_tape - start_sector_within_tape;
+
+	cmd = create_tapedev_cmd(TAPEDEV_CMD_EJECT_TAPE, NO_ARG, NO_ARG);
+
+	sec->req_state.cmd = cmd;
+	sec->req_state.is_ioctl = false;
+	sec->req_state.tape_nbr = tape_nbr;
+	sec->req_state.start_sector_within_tape = start_sector_within_tape;
+
+	sec->req_state.is_write = write;
+	sec->req_state.dir = write ? DMA_TO_DEVICE : DMA_FROM_DEVICE;
+	sec->req_state.sg_idx = 0;
+	sec->req_state.left_blocks_in_tape = blocks_left_in_tape;
+	sec->req_state.total_blocks_in_tape = blocks_in_tape;
+	sec->req_state.original_nents = original_nents;
+	sec->req_state.nents = nents;
+
+	// if (enqueue_new_cmd(cmd, cmd_lst_head))
+	// {
+	// 	err = -ENOMEM;
+	// 	goto free_cmd_queue;
+	// }
+
+	// pr_warn("%s:%u: tape_nbr: %u\n", __func__, __LINE__, tape_nbr);
+	// cmd = create_tapedev_cmd(TAPEDEV_CMD_TAKE_TAPE, tape_nbr, 0);
+	// if (enqueue_new_cmd(cmd, cmd_lst_head))
+	// {
+	// 	err = -ENOMEM;
+	// 	goto free_cmd_queue;
+	// }
+
+	// cmd = create_tapedev_cmd(TAPEDEV_CMD_REWIND, 0, 0);
+	// if (enqueue_new_cmd(cmd, cmd_lst_head))
+	// {
+	// 	err = -ENOMEM;
+	// 	goto free_cmd_queue;
+	// }
+
+	// cmd = create_tapedev_cmd(TAPEDEV_CMD_FAST_FWD, start_sector_within_tape, 0);
+	// if (enqueue_new_cmd(cmd, cmd_lst_head))
+	// {
+	// 	err = -ENOMEM;
+	// 	goto free_cmd_queue;
+	// }
+
+	// pr_warn("%s:%u: Moving to correct pos ENDED\n", __func__, __LINE__);
+	return 0;
+}
+
 static int do_scatter_gather(struct request *req, u64 start_sector, struct section *sec, int write, struct list_head *cmd_lst_head)
 {
 	/*
-		struct request has the following interesting us fields:
-			- blk_opf_t cmd_flags -- type of request described by the struct 
-				request, we allow only REQ_OP_READ and REQ_OP_WRITE;
-			- struct request_queue *q -- from it we can get queuedata (our section*),
-				also it stores next requests
-			- struct bio *bio -- field indicating the first bio structure included 
-				in the request 
-			- struct request *rq_next -- points to the next struct request structure 
-				in the request queue
-	
 		What is struct bio_vec - a contiguous range of physical memory addresses
 		@bv_page:   First page associated with the address range.
 		@bv_len:    Number of bytes in the address range.
@@ -428,21 +483,20 @@ static int do_scatter_gather(struct request *req, u64 start_sector, struct secti
 		bio_vecs, and each bio_vec knows which part of given page we want to 
 		read/write
 	*/
-
-	pr_warn("%s:%u: Doing scatter gather\n", __func__, __LINE__);
-
+	int err = BLK_STS_OK;
 	struct tapedev_device *dev = sec->private_data; 
 	uint64_t *pgt_buf = sec->cpu_dma_buf;
-	const uint32_t section_blk_type = section_read_from(TAPEDEV_SECT_TAPE_BLOCKSIZE_ADDR, sec);
 	const uint32_t section_blk_size = sec->blk_size;
 	uint32_t tape_nbr; 
 	uint32_t start_sector_within_tape;
 
 	if (calc_start_pos_within_section(start_sector, &start_sector_within_tape, &tape_nbr, sec))
-		return BLK_STS_INVAL;
+	{
+		err = BLK_STS_INVAL;
+		goto fail;
+	}
 
-	pr_warn("%s:%u: tape nbr: %u\n", __func__, __LINE__, tape_nbr);
-	pr_warn("%s:%u: DOING SCATTER GATHER section: %u, section size bytes: %u, blk_type: %u, blk_size: %u, one tape has: %u sectors \n", __func__, __LINE__, sec->idx, SIZE_OF_SECTION_IN_BYTES(sec->section_type, sec->n_tapes), section_blk_type, section_blk_size, (SIZE_OF_TAPE(sec->section_type) / 512));
+	pr_warn("%s:%u: DOING SCATTER GATHER section: %u, section size bytes: %u,blk_size: %u, one tape has: %u sectors \n", __func__, __LINE__, sec->idx, SIZE_OF_SECTION_IN_BYTES(sec->section_type, sec->n_tapes), section_blk_size, (SIZE_OF_TAPE(sec->section_type) / 512));
 	// TODO:
 	// Even kmalloc inside queue_rq is BAD --> what we should do is preallocate sg
 	// 	array inside requests private memory,
@@ -451,29 +505,29 @@ static int do_scatter_gather(struct request *req, u64 start_sector, struct secti
 	// 	set state machine to eject and irq handler will handle the rest and 
 	// 	transition to the next steps
 
-	// TODO: maybe this sg should be inside section struct, but if it was we would
-	// 	need lock here, but on the other hand our section can do one request at a 
-	// 	time, so no-one will create more requests until we call blk_mq_end_request
-	// mtip32xx.c - mtip_hw_submit_io 
-	struct scatterlist *main_sg = kzalloc((sizeof(*main_sg) * MAX_SG_PGT_ENTRIES), GFP_KERNEL);
-	if (!main_sg)
-		return BLK_STS_IOERR;
+	// Clears provided ptr and initializes in 
+	sg_init_table(sec->sg_arr, MAX_SG_PGT_ENTRIES);
 
-	sg_init_table(main_sg, MAX_SG_PGT_ENTRIES);
+	int original_nents = blk_rq_map_sg(req, sec->sg_arr);
 
-	int n_collapsed_segments = blk_rq_map_sg(req, main_sg);
-	// nents might be less than n_collapsed_segments, if its 0 it means error
+	// nents might be less than original_nents, if its 0 it means error
 	int nents = dma_map_sg(
 		&dev->pdev->dev, 
-		main_sg, 
-		n_collapsed_segments, 
+		sec->sg_arr, 
+		original_nents, 
 		write ? DMA_TO_DEVICE : DMA_FROM_DEVICE
 	);
 
 	if (!nents)
-		return BLK_STS_IOERR;
+	{
+		err = BLK_STS_IOERR;
+		goto fail;
+	}
 	if (nents > MAX_SG_PGT_ENTRIES)
-		return BLK_STS_IOERR;
+	{
+		err = BLK_STS_IOERR;
+		goto unmap_sg;
+	}
 
 	struct scatterlist *sg;
 	int ent_id = 0;
@@ -484,47 +538,41 @@ static int do_scatter_gather(struct request *req, u64 start_sector, struct secti
 	uint32_t blocks_left_in_tape = blocks_in_tape - start_sector_within_tape;
 	uint32_t prev_tape_nbr = tape_nbr;
 
-	// mtip32xx.c - fill_command_sg
-	for_each_sg(main_sg, sg, nents, _i)
+	if (init_req_state(start_sector, write, original_nents, nents, sec))
 	{
-		if (tape_nbr > sec->n_tapes)
-		{
-			// TOOD: add freeing memory etc
-			pr_err("%s:%u: tape_nbr: %u > %u :sec->n_tapes, even though for_each_sg still has more data\n", __func__, __LINE__, tape_nbr, sec->n_tapes);
-			return BLK_STS_IOERR;
-		}
-		if (prev_tape_nbr < tape_nbr)
-		{
-			prev_tape_nbr = tape_nbr;
-			uint32_t cmd = create_tapedev_cmd(TAPEDEV_CMD_EJECT_TAPE, 0, 0);
-			if (enqueue_new_cmd(cmd, cmd_lst_head))
-			{
-				pr_err("%s:%u: enqueue EJECT_TAPE failed during for_each_sg \n", __func__, __LINE__);
-				return BLK_STS_IOERR;
-			}
+		err = BLK_STS_IOERR;
+		goto unmap_sg;
+	}
 
-			cmd = create_tapedev_cmd(TAPEDEV_CMD_TAKE_TAPE, tape_nbr, 0);
-			if (enqueue_new_cmd(cmd, cmd_lst_head))
-			{
-				pr_err("%s:%u: enqueue TAKE_TAPE failed during for_each_sg \n", __func__, __LINE__);
-				return BLK_STS_IOERR;
-			}
-
-			cmd = create_tapedev_cmd(TAPEDEV_CMD_REWIND, 0, 0);
-			if (enqueue_new_cmd(cmd, cmd_lst_head))
-			{
-				pr_err("%s:%u: enqueue REWIND failed during for_each_sg \n", __func__, __LINE__);
-				return BLK_STS_IOERR;
-			}
-		}
+	// mtip32xx.c - fill_command_sg
+	for_each_sg(sec->sg_arr, sg, nents, _i)
+	{
 		dma_addr_t dma_addr = sg_dma_address(sg);
 		uint32_t dma_len = sg_dma_len(sg);
 		uint32_t nbr_of_blocks = dma_len / section_blk_size;
 
+		if (tape_nbr > sec->n_tapes)
+		{
+			pr_err("%s:%u: tape_nbr: %u > %u :sec->n_tapes, even though for_each_sg still has more data\n", __func__, __LINE__, tape_nbr, sec->n_tapes);
+			err = BLK_STS_IOERR;
+			goto unmap_sg;
+		}
 		if (!IS_ALIGNED(dma_addr, 512)) 
+		{
 			pr_err("%s:%u: dma_addr is not 512 byte aligned\n", __func__, __LINE__);
+			err = BLK_STS_IOERR;
+			goto unmap_sg;
+		}
 		if (dma_len % section_blk_size != 0)
+		{
 			pr_err("%s:%u: dma_len is not multiple of block size\n", __func__, __LINE__);
+			err = BLK_STS_IOERR;
+			goto unmap_sg;
+		}
+
+		// This means that in previous loop step we changed tape 
+		if (prev_tape_nbr < tape_nbr)
+			prev_tape_nbr = tape_nbr;
 
 		cmd_total_blocks += nbr_of_blocks;
 
@@ -534,23 +582,14 @@ static int do_scatter_gather(struct request *req, u64 start_sector, struct secti
 			uint64_t inserted_blocks = (uint64_t)nbr_of_blocks - overflow_blocks; 
 			cmd_total_blocks = blocks_left_in_tape;
 
+			// We want to store bytes 40-9 in high 32 bits
+			// Low 32 bits are for number of blocks to read/write from this address
 			pgt_buf[ent_id] = (dma_addr  >> 9);
 			pgt_buf[ent_id] = pgt_buf[ent_id] << 32;
 			pgt_buf[ent_id] = pgt_buf[ent_id] | inserted_blocks;
 
-			uint32_t cmd = create_tapedev_cmd(write ? TAPEDEV_CMD_WRITE : TAPEDEV_CMD_READ, cmd_start_pos, cmd_total_blocks);
-
-			if (enqueue_new_cmd(cmd, cmd_lst_head))
-			{
-				pr_err("%s:%u: enqueue new cmd failed during for_each_sg \n", __func__, __LINE__);
-				return BLK_STS_IOERR;
-			}
-
 			cmd_start_pos = ent_id + 1;
 			cmd_total_blocks = overflow_blocks;
-			// TODO: check if we need to move dma_addr by overflow_bytes in pgt or 
-			// once we read some blocks from pgt_buf[], next read will start from 
-			// place where last ended
 			blocks_left_in_tape = blocks_in_tape;
 			tape_nbr++;
 
@@ -561,7 +600,8 @@ static int do_scatter_gather(struct request *req, u64 start_sector, struct secti
 				if (ent_id > MAX_SG_PGT_ENTRIES)
 				{
 					pr_err("%s:%u: ent_id > MAX_SG_PGT_ENTRIES when overflow blocks \n", __func__, __LINE__);
-					return BLK_STS_IOERR;
+					err = BLK_STS_IOERR;
+					goto unmap_sg;
 				}
 	
 				pgt_buf[ent_id] = ((dma_addr + inserted_blocks * section_blk_size) >> 9);
@@ -575,147 +615,40 @@ static int do_scatter_gather(struct request *req, u64 start_sector, struct secti
 			pgt_buf[ent_id] = pgt_buf[ent_id] << 32;
 			pgt_buf[ent_id] = pgt_buf[ent_id] | ((uint64_t)nbr_of_blocks);
 		}
-		// TODO: conitnue with this approach then see if works and change to better
-		// 	state machine with pre-allocation so that in queue_rq there is no alloc
 		ent_id++;
 	}
 
-	// If there are any blocks left it means that we ended our loop without exceeding
-	// current tape's limit, so we must schedule new cmd
-	if (cmd_total_blocks)
-	{
-		uint32_t cmd = create_tapedev_cmd(write ? TAPEDEV_CMD_WRITE : TAPEDEV_CMD_READ, cmd_start_pos, cmd_total_blocks);
-
-		if (enqueue_new_cmd(cmd, cmd_lst_head))
-		{
-			pr_err("%s:%u: enqueue new cmd failed during for_each_sg \n", __func__, __LINE__);
-			return BLK_STS_IOERR;
-		}
-	}
-
-
-	unsigned long flags;
-	spin_lock_irqsave(&sec->lock, flags);
-
-	if (list_empty(&sec->cmd_queue_head))
-	{
-		// We schedule commands if section cmd queue is emmpty 
-		struct lst_node *node = list_first_entry(cmd_lst_head, struct lst_node, lst_link);
-		section_send_cmd(node->cmd.cmd, sec);
-	}
-
-	// otherwise we just add new commands
-	list_splice_tail_init(cmd_lst_head, &sec->cmd_queue_head);
-
-	uint32_t nodes_in_lst = list_count_nodes(&sec->cmd_queue_head);
-	pr_warn("%s:%u: nodes in cmd qeueu after sg: %u \n", __func__, __LINE__, nodes_in_lst);
-
-	spin_unlock_irqrestore(&sec->lock, flags);
+	// If there are no ioctl commands currently running we must send cmd to tapedev
+	// to start the execution of our request
+	// If there are some ioctl cmds running, they will see that there is request 
+	// scheduled and will start its execution
+	if (list_empty(&sec->ioctl_cmd_queue_head))
+		section_send_cmd(sec->req_state.cmd, sec);
 
 	return BLK_STS_OK;
-}
-
-static int create_start_pos_setup_cmds(u64 start_sector, struct list_head *cmd_lst_head, struct section *sec)
-{
-	// For reading section_type, n_tapes, idx, WE DON'T NEED A LOCK of sec
-	int err = 0;
-	pr_warn("%s:%u: Starting creating start pos setup cmds\n", __func__, __LINE__);
-	// Each sector is 512 bytes, each tape has (SIZE_OF_TAPE(s_type) / 512) sectors
-	// - Firstly we need to find out which tape has our sector 
-	// - Then fastforward our tape by correct number of sectors to start reading/
-	// 		writing at start_sector
-	// TODO: if we change blocksize do sectors also change?
-	// uint32_t n_tapes = sec->n_tapes;
-
-	uint32_t tape_nbr; 
-	uint32_t start_sector_within_tape;
-	uint32_t cmd;
-
-	if (calc_start_pos_within_section(start_sector, &start_sector_within_tape, &tape_nbr, sec))
-	{
-		err = -EINVAL;
-		goto ret;
-	}
-
-	cmd = create_tapedev_cmd(TAPEDEV_CMD_EJECT_TAPE, 0, 0);
-	if (enqueue_new_cmd(cmd, cmd_lst_head))
-	{
-		err = -ENOMEM;
-		goto free_cmd_queue;
-	}
-
-	pr_warn("%s:%u: tape_nbr: %u\n", __func__, __LINE__, tape_nbr);
-	cmd = create_tapedev_cmd(TAPEDEV_CMD_TAKE_TAPE, tape_nbr, 0);
-	if (enqueue_new_cmd(cmd, cmd_lst_head))
-	{
-		err = -ENOMEM;
-		goto free_cmd_queue;
-	}
-
-	cmd = create_tapedev_cmd(TAPEDEV_CMD_REWIND, 0, 0);
-	if (enqueue_new_cmd(cmd, cmd_lst_head))
-	{
-		err = -ENOMEM;
-		goto free_cmd_queue;
-	}
-
-	cmd = create_tapedev_cmd(TAPEDEV_CMD_FAST_FWD, start_sector_within_tape, 0);
-	if (enqueue_new_cmd(cmd, cmd_lst_head))
-	{
-		err = -ENOMEM;
-		goto free_cmd_queue;
-	}
-
-	pr_warn("%s:%u: Moving to correct pos ENDED\n", __func__, __LINE__);
-	goto ret;
-
-free_cmd_queue:
-	_free_enqueued_cmds(cmd_lst_head);
-ret:
+unmap_sg:
+	dma_unmap_sg(
+		&dev->pdev->dev, 
+		sec->sg_arr, 
+		original_nents, 
+		write ? DMA_TO_DEVICE : DMA_FROM_DEVICE
+	);
+fail:
 	return err;
 }
 
+
+/*
+	SECTION LOCK must be acquired before using this function
+*/
 static inline int submit_request_sg(struct request *req, struct section *sec)
 {
-	unsigned long flags;
-	spin_lock_irqsave(&sec->lock, flags);
+	int err = BLK_STS_OK;
 
 	sec->req = req;
 
-	spin_unlock_irqrestore(&sec->lock, flags);
-	// TODO:
-	// !!!!!!!!!!!!!!!!! CHECK MORE IN DEPTH !!!!!!!!!!!!!!!!!!!!!
-	// blk_rq_map_sg - maybe we should change workflow to use blk_rq_map_sg, and 
-	// 	then operate and calculate stuff using these scatter gather entities
-	// !!!!!!!!!!!!!!!!! !!!!!!!!!!!!!!!!!!! !!!!!!!!!!!!!!!!!!!!!
 	pr_warn("%s:%u: START submit_request_sg\n", __func__, __LINE__);
 
-	int err = BLK_STS_OK;
-	// struct bio_vec bvec;
-	// struct req_iterator iter;
-	// TODO: We should probably use here TAPEDEV_SECT_PTR_SHIFT instead of SECTOR_SHIFT????
-	// loff_t pos = blk_rq_pos(req) << TAPEDEV_SECT_PTR_SHIFT;
-	// loff_t dev_size = (s->n_sectors << TAPEDEV_SECT_PTR_SHIFT);
-
-
-	// Plan:
-	// 1) Inside section we need to store list of commands
-	// 2) Here in submit_request_sg we will create a list of commands that
-	// 		will set correct tape fastforward it etc and add it to the list
-	// 3) after that (while still having a lock) we will iterate over biovecs using
-	// 		blk_rq_map_sg to create scatter gather list
-	// 4) Then we will iterate over created scatter gather list and create read/
-	// 		write commands while simultaneously checking if we are still on correct
-	// 		tape, if not we will add command to the list of commands and then add 
-	// 		commands that change tapes
-	// 5) Once all commands are added we can safely return from submit_request_sg 
-	// 		without any waiting in here, since we cannot wait in this context, kernel
-	// 		throws some warnings/errors when we do
-	// 6) We need to remember req so that later we can do blk_mq_end_request(req, 
-	// 		status);
-	// 7) Before calling blk_mq_end_request() we shouldn't get other queue_rq call
-
-	// TODO: check this, why is it like that etc.
 	// start sector is always in 512byte sectors (we set that value in queue_lim)
 	// i.e.
 	// | ----------- 0	  | sector 0
@@ -725,54 +658,43 @@ static inline int submit_request_sg(struct request *req, struct section *sec)
 	// | 				  | 
 	// | ----------- 1023 |
 	uint64_t start_sector = blk_rq_pos(req); 
-	// To get POSITION in our file from the sector, we multiple it by 512 = 2^9
-	// uint64_t pos = start_sector << 9;
-	uint64_t sectors_to_read = blk_rq_sectors(req);
 
-	struct list_head cmd_lst_head;
-	INIT_LIST_HEAD(&cmd_lst_head);
 	// TODO: ADD SANITY CHECKS EVERYWHERE whether given addresses are 512byte aligned
-
-	pr_warn("%s:%u: start_sector: %llu, sectors_to_read: %llu\n", __func__, __LINE__, start_sector, sectors_to_read);
 
 	// We must create sequence of commands and blk_mq_tag_set add the to the cmd queue
 	// After set_section_start_pos if we had a lock we still have it
-	if (create_start_pos_setup_cmds(start_sector, &cmd_lst_head, sec))
-	{
-		err = BLK_STS_IOERR;
-		goto ret;
-	}
 
-	uint32_t nodes_in_lst = list_count_nodes(&cmd_lst_head);
-	pr_warn("%s:%u: nodes in cmd qeueu AFTER pos setup: %u \n", __func__, __LINE__, nodes_in_lst);
-
+	int is_write;
 
 	switch (req_op(req)) 
 	{
 	case REQ_OP_WRITE:
-		pr_warn("%s:%u: WRITE %llu sectors starting at %llu\n",
-			__func__, __LINE__, sectors_to_read, start_sector);
-
-		err = do_scatter_gather(req, start_sector, sec, 1, &cmd_lst_head);
+		is_write = 1;
 		break;
 	case REQ_OP_READ:
-		pr_warn("%s:%u: READ %llu sectors starting at %llu\n",
-			__func__, __LINE__, sectors_to_read, start_sector);
-
-		err = do_scatter_gather(req, start_sector, sec, 0, &cmd_lst_head);
+		is_write = 0;
 		break;
 	default:
-		pr_warn("%s:%u: submitted bad request, supported requests are READ and WRITE\n", __func__, __LINE__);
+		pr_warn("%s:%u: submitted bad request, supported requests are REQ_OP_READ and REQ_OP_WRITE\n", __func__, __LINE__);
 		err = BLK_STS_NOTSUPP;
-		goto ret;
+		goto cleanup;
 	}
 
-	// We will add scatter gather table, add commands and remember req
-	// if needed we will start commands execution if sec->cmd_lst empty
-ret:
+	err = do_scatter_gather(req, start_sector, sec, is_write);
+
+	if (err)
+		goto cleanup;
+
+	return err;
+
+cleanup:
+	sec->req_state = NULL_REQ_STATE;
 	return err;
 }
 
+/*
+	SECTION LOCK must be acquired before using this function
+*/
 static inline int process_request(struct request *req, struct section *sec)
 {
 	switch (req_op(req)) {
@@ -790,24 +712,21 @@ static blk_status_t tapedev_queue_rq(struct blk_mq_hw_ctx *hctx, const struct bl
 {
 	struct request_queue *q = hctx->queue;
 	struct section *sec = q->queuedata;
-	// struct tapedev_device *dev = sec->private_data;
-	// unsigned int nr_bytes = 0;
 	blk_status_t status = BLK_STS_OK;
 	struct request *req = bd->rq;
 
-	// might_sleep();
-	// cant_sleep(); /* cannot use any locks that make the thread sleep */
 
 	pr_warn("%s:%u: starting request for section: %u\n", __func__, __LINE__, sec->idx);
+
+	unsigned long flags;
+	spin_lock_irqsave(&sec->lock, flags);
+
 	blk_mq_start_request(req);
 
 	status = process_request(req, sec);
 
 	if (status)
 	{
-		unsigned long flags;
-		spin_lock_irqsave(&sec->lock, flags);
-
 		if (sec->req != NULL)
 		{
 			pr_warn("%s:%u: doing blk_mq_end_request\n", __func__, __LINE__);
@@ -819,9 +738,9 @@ static blk_status_t tapedev_queue_rq(struct blk_mq_hw_ctx *hctx, const struct bl
 			pr_err("%s:%u: wanted to do blk_mq_end_request but sec->req WAS NULL\n", __func__, __LINE__);
 		}
 
-		spin_unlock_irqrestore(&sec->lock, flags);
 	}
 
+	spin_unlock_irqrestore(&sec->lock, flags);
 	pr_warn("%s:%u: ENDED request creation and scheduling for section: %u\n", __func__, __LINE__, sec->idx);
 	return status;
 }
@@ -1277,7 +1196,7 @@ static int create_section(
 	sec->ioctl_status = 0;
 	sec->req_state = NULL_REQ_STATE;
 	sec->req = NULL;
-	sec->sg_arr = kzalloc((sizeof(*sec->sg_arr) * MAX_SG_PGT_ENTRIES), GFP_KERNEL);
+	sec->sg_arr = kzalloc((sizeof(*(sec->sg_arr)) * MAX_SG_PGT_ENTRIES), GFP_KERNEL);
 
 	if (!sec->sg_arr)
 	{
@@ -1285,7 +1204,7 @@ static int create_section(
 		goto free_alloc_s;
 	}
 
-	INIT_LIST_HEAD(&sec->cmd_queue_head);
+	INIT_LIST_HEAD(&sec->ioctl_cmd_queue_head);
 	sec->private_data = tape_dev;
 
 	// dma_alloc_coherent - allocates a memory region accessible simultaneously by 

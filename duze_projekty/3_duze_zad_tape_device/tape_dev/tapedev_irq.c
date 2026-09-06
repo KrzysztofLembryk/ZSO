@@ -82,7 +82,7 @@ int _handle_section_interrupt(uint32_t section_done, uint32_t section_error, uin
         goto release_lock;
     }
 
-	uint32_t nodes_in_lst = list_count_nodes(&sec->cmd_queue_head);
+	uint32_t nodes_in_lst = list_count_nodes(&sec->ioctl_cmd_queue_head);
 	pr_warn("%s:%u: nodes in cmd qeueu: %u \n", __func__, __LINE__, nodes_in_lst);
 
 	if (section_error)
@@ -128,7 +128,7 @@ int __handle_section_error(uint32_t section_status, struct section *sec)
 	int err = 0x8A;
 
 
-	struct lst_node *curr_cmd_node = list_first_entry(&sec->cmd_queue_head, struct lst_node, lst_link);
+	struct lst_node *curr_cmd_node = list_first_entry(&sec->ioctl_cmd_queue_head, struct lst_node, lst_link);
 	struct req_state curr_cmd = curr_cmd_node->cmd;
 	// pr_err("%s:%u: section: %d, we got error for current command: %u\n", __func__, __LINE__, sec->idx, curr_cmd.cmd);
 	// TODO: IDK how we should handle these things yet
@@ -237,7 +237,7 @@ int __handle_section_error(uint32_t section_status, struct section *sec)
 
 	__abort_rest_of_req_cmds(sec);
 
-	if (list_empty(&sec->cmd_queue_head))
+	if (list_empty(&sec->ioctl_cmd_queue_head))
 		_end_request_helper(sec, BLK_STS_IOERR);
 
 	return -err;
@@ -260,7 +260,7 @@ int __handle_section_done(uint32_t section_status, struct section *sec)
 		err = -1;
 		goto ret;
 	}
-	if (list_empty(&sec->cmd_queue_head))
+	if (list_empty(&sec->ioctl_cmd_queue_head))
 	{
 		pr_err("%s:%u: cmd queue is EMPTY even though section just completed command \n", __func__, __LINE__);
 		err = -1;
@@ -269,7 +269,7 @@ int __handle_section_done(uint32_t section_status, struct section *sec)
 
 
 	sec->status = TAPEDEV_SECT_STATUS_DONE;
-	struct lst_node *node = list_first_entry(&sec->cmd_queue_head, struct lst_node, lst_link);
+	struct lst_node *node = list_first_entry(&sec->ioctl_cmd_queue_head, struct lst_node, lst_link);
 	struct req_state curr_cmd = node->cmd;
 	
 	list_del(&node->lst_link);
@@ -353,7 +353,7 @@ ret:
 // To use this function you MUST FIRST ACQUIRE LOCK
 void __handle_next_cmd(struct section *sec)
 {
-	if (list_empty(&sec->cmd_queue_head))
+	if (list_empty(&sec->ioctl_cmd_queue_head))
 	{
 		pr_warn("%s:%u: section: %u, no more cmds to schedule, cmd queue EMPTY\n", __func__, __LINE__, sec->idx);
 		return;
@@ -362,7 +362,7 @@ void __handle_next_cmd(struct section *sec)
 	pr_warn("%s:%u: Will schedule next cmd for section: %u\n", __func__, __LINE__, sec->idx);
 	// We get first command in queue, but not remove it from the list.
 	// Removal will only happen once command is done.
-	struct lst_node *node = list_first_entry(&sec->cmd_queue_head, struct lst_node, lst_link);
+	struct lst_node *node = list_first_entry(&sec->ioctl_cmd_queue_head, struct lst_node, lst_link);
 
 	pr_warn("%s:%u: cmd that will be scheduled is: %u\n", __func__, __LINE__, GET_CMD_TYPE(node->cmd.cmd));
 	section_send_cmd(node->cmd.cmd, sec);
@@ -387,9 +387,9 @@ void clear_sec_err_intrpt(struct section* sec)
 void __abort_rest_of_req_cmds(struct section *sec)
 {
 	pr_err("%s:%u: ABORTING rest commands of current request\n", __func__, __LINE__);
-	while (!list_empty(&sec->cmd_queue_head))
+	while (!list_empty(&sec->ioctl_cmd_queue_head))
 	{
-		struct lst_node *node = list_first_entry(&sec->cmd_queue_head, struct lst_node, lst_link);
+		struct lst_node *node = list_first_entry(&sec->ioctl_cmd_queue_head, struct lst_node, lst_link);
 
 		// Once we got to the ioctl commands we stop removing from list, since it
 		// means we removed whole request
@@ -410,7 +410,7 @@ void __end_req_if_completed(struct section *sec, struct req_state *curr_cmd)
 {
 
 	// After handling current command we check if list empty 
-	if (list_empty(&sec->cmd_queue_head))
+	if (list_empty(&sec->ioctl_cmd_queue_head))
 	{
 		pr_warn("%s:%u: After handling current command cmd queue is EMPTY\n", __func__, __LINE__);
 		// If there is no next command, we check if just ended command is ioctl,
@@ -425,7 +425,7 @@ void __end_req_if_completed(struct section *sec, struct req_state *curr_cmd)
 		// If list is not empty, we must check if next command is ioctl, if it is
 		// it means that just ended command was the last one in our request so we
 		// must end this request
-		struct lst_node *next_node = list_first_entry(&sec->cmd_queue_head, struct lst_node, lst_link);
+		struct lst_node *next_node = list_first_entry(&sec->ioctl_cmd_queue_head, struct lst_node, lst_link);
 
 		// next and curr cmd should NEVER BOTH BE IOCTL, but still better to check it
 		if (next_node->cmd.is_ioctl && !curr_cmd->is_ioctl)

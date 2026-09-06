@@ -10,7 +10,6 @@
 // I would add it to tapedev.h but probably it will be replaced with default .h file
 #define TAPEDEV_CMD_NONE				0x06
 #define TAPEDEV_CMD_UNSUPPORTED			0xffffffff
-#define IS_NULL_REQ_STATE(state) ()
 
 #define MAX_DEVICES_TAPEDEV 256
 #define MAX_SG_PGT_ENTRIES 512
@@ -23,6 +22,7 @@
 #define BAR_ID 0
 #define BAR_MAXLEN 0
 #define NO_TAPE 0 
+#define NO_ARG 0
 
 #define PHYSICAL_BLOCK_SIZE 8192
 #define BASE_TAPE_SIZE (32 * 8192)
@@ -41,18 +41,23 @@
 #define GET_CMD_TYPE(cmd) ((uint32_t)((cmd) & 0xffU))
 // Bits 8-31 are used to pass command-specific information.
 #define GET_CMD_BODY(cmd) ((uint32_t)((cmd) & 0xffffff00U))
+// State must be of type struct req_state
+#define IS_NULL_REQ_STATE(state) (GET_CMD_TYPE(state.cmd) == TAPEDEV_CMD_NONE)
 
 struct req_state
 {
-	uint32_t cmd_type;
 	uint32_t cmd;
 	bool is_ioctl;
 	int sg_idx;
-	uint32_t blocks_sent;
+	int original_nents;
+	int nents;
 	bool is_write;
 	enum dma_data_direction dir;
-	int nents;
 	uint32_t tape_nbr;
+	uint32_t start_sector_within_tape;
+	uint32_t total_blocks_in_tape;
+	uint32_t left_blocks_in_tape;
+	// uint32_t overflow_blocks;
 };
 
 // Add at the end with - list_add_tail(&node->link, &section->cmd_queue)
@@ -94,7 +99,7 @@ struct section
 	struct req_state req_state;
 	struct request *req; 
 	struct scatterlist *sg_arr;
-	struct list_head cmd_queue_head;
+	struct list_head ioctl_cmd_queue_head;
 	// private_data must be tapedev_device
 	void *private_data;
 };

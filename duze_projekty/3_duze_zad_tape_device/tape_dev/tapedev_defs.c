@@ -3,6 +3,14 @@
 const struct req_state NULL_REQ_STATE = {
 	.cmd = TAPEDEV_CMD_NONE,
 	.is_ioctl = false,
+	.sg_idx = 0,
+	.original_nents = 0,
 	.nents = 0,
-	.dir = DMA_NONE
+	.is_write = false,
+	.dir = DMA_NONE,
+	.tape_nbr = 0,
+	.start_sector_within_tape = 0,
+	.total_blocks_in_tape = 0,
+	.left_blocks_in_tape = 0,
+	// .overflow_blocks = 0,
 };
