@@ -94,8 +94,7 @@ static irqreturn_t tapedev_interrupt_handler(int irq, void *opaque_dev)
 
 	ir_status = tapedev_ior(dev, TAPEDEV_IRQ_STATUS_ADDR);
 
-	// Below if only happens ONCE, when we use probe function for given device. 
-	// TODO: move init handling to the separate function
+	// Below happens only ONCE, when we use probe function for given device. 
 	if (!dev->init_done)
 	{
 		int err = _handle_tapedev_init(ir_status, dev);
@@ -207,23 +206,25 @@ static int tapedev_ioctl(struct block_device *bdev, blk_mode_t mode, unsigned cm
 
 		spin_lock_irqsave(&sec->lock, flags);
 
-		uint32_t current_tape = section_read_from(TAPEDEV_SECT_TAPE_NO_ADDR, sec);
-
-		pr_info("%s:%u: got EJECT_TAPE ioctl cmd. Current tape: %u  (if 0 no tape inserted)\n", __func__, __LINE__, current_tape);
+		pr_info("%s:%u: got EJECT_TAPE ioctl cmd for section %u)\n", __func__, __LINE__, sec->idx);
 
 
 		node->cmd = (struct req_state) {
 			.cmd = TAPEDEV_CMD_EJECT_TAPE,
-			.is_ioctl = true
+			.is_ioctl = true,
+			.is_being_executed = false,
 		};
 		// We must send command to the section ONLY when command list is empty  
 		// otherwise our command will be done in near future, we just add it at the
 		// end of the queue
-		if (list_empty(&sec->ioctl_cmd_queue_head))
-			section_send_cmd(TAPEDEV_CMD_EJECT_TAPE, sec);
-
 		list_add_tail(&node->lst_link, &sec->ioctl_cmd_queue_head);
 
+		if (sec->req == NULL && list_count_nodes(&sec->ioctl_cmd_queue_head) == 1)
+		{
+			node->cmd.is_being_executed = true;
+			section_send_cmd(TAPEDEV_CMD_EJECT_TAPE, sec);
+		}
+		
 		while (!sec->ioctl_cmd_done) 
 		{
 			spin_unlock_irqrestore(&sec->lock, flags);
@@ -325,35 +326,6 @@ static inline uint32_t create_tapedev_cmd(uint32_t cmd_type, uint32_t arg1, uint
 	return cmd;
 }
 
-static int enqueue_new_cmd(uint32_t cmd, struct list_head *cmd_lst_head)
-{
-	struct lst_node *new_lst_node = kzalloc(sizeof(*new_lst_node), GFP_KERNEL);
-
-	if (!new_lst_node) 
-	{
-		pr_err("%s:%u: failed to alloc node for cmd\n", __func__, __LINE__);
-		return -ENOMEM;
-	}
-	new_lst_node->cmd = (struct req_state) {
-			.cmd = cmd,
-			.is_ioctl = false
-	};
-	list_add_tail(&new_lst_node->lst_link, cmd_lst_head);
-
-	return 0;
-}
-
-static void _free_enqueued_cmds(struct list_head *cmd_lst_head)
-{
-	while (!list_empty(cmd_lst_head))
-	{
-		struct lst_node *node = list_first_entry(cmd_lst_head, struct lst_node, lst_link);
-
-		list_del(&node->lst_link);
-		kfree(node);
-	}
-}
-
 static int calc_start_pos_within_section(u64 start_sector, uint32_t *start_sector_within_tape, uint32_t *tape_nbr, struct section *sec)
 {
 	uint32_t all_512byte_sectors = GET_TOTAL_NBR_OF_512B_SECTORS(sec->section_type, sec->n_tapes);
@@ -407,11 +379,12 @@ static int init_req_state(u64 start_sector, int write, int original_nents, int n
 
 	sec->req_state.cmd = cmd;
 	sec->req_state.is_ioctl = false;
+	sec->req_state.is_being_executed = false;
 	sec->req_state.tape_nbr = tape_nbr;
 	sec->req_state.start_sector_within_tape = start_sector_within_tape;
 
 	sec->req_state.is_write = write;
-	sec->req_state.dir = write ? DMA_TO_DEVICE : DMA_FROM_DEVICE;
+	sec->req_state.data_direction = write ? DMA_TO_DEVICE : DMA_FROM_DEVICE;
 	sec->req_state.sg_idx = 0;
 	sec->req_state.left_blocks_in_tape = blocks_left_in_tape;
 	sec->req_state.total_blocks_in_tape = blocks_in_tape;
@@ -509,7 +482,6 @@ static int do_scatter_gather(struct request *req, u64 start_sector, struct secti
 	sg_init_table(sec->sg_arr, MAX_SG_PGT_ENTRIES);
 
 	int original_nents = blk_rq_map_sg(req, sec->sg_arr);
-
 	// nents might be less than original_nents, if its 0 it means error
 	int nents = dma_map_sg(
 		&dev->pdev->dev, 
@@ -544,7 +516,7 @@ static int do_scatter_gather(struct request *req, u64 start_sector, struct secti
 		goto unmap_sg;
 	}
 
-	// mtip32xx.c - fill_command_sg
+	// Exmpl usage of sg: mtip32xx.c - fill_command_sg
 	for_each_sg(sec->sg_arr, sg, nents, _i)
 	{
 		dma_addr_t dma_addr = sg_dma_address(sg);
@@ -623,7 +595,10 @@ static int do_scatter_gather(struct request *req, u64 start_sector, struct secti
 	// If there are some ioctl cmds running, they will see that there is request 
 	// scheduled and will start its execution
 	if (list_empty(&sec->ioctl_cmd_queue_head))
+	{
+		sec->req_state.is_being_executed = true;
 		section_send_cmd(sec->req_state.cmd, sec);
+	}
 
 	return BLK_STS_OK;
 unmap_sg:
@@ -1022,6 +997,34 @@ fail:
 	return err;
 }
 
+static void _free_section(struct section *sec, bool was_disk_added) 
+{
+	struct tapedev_device *tape_dev = sec->private_data;
+
+	// TODO: maybe we should acquire lock here
+	// put_disk decrements gendisk refcount, if it reaches 0 gendisk is 
+	// freed.
+	// If haven't used add_disk, we wouldn't need to use del_gendisk
+	if (was_disk_added)
+		del_gendisk(sec->gdisk);
+	put_disk(sec->gdisk);
+	blk_mq_free_tag_set(&sec->tag_set);
+	dma_free_coherent(&tape_dev->pdev->dev, TAPEDEV_BUF_PGTABLE_SIZE, sec->cpu_dma_buf, sec->dma_addr);
+
+	while (!list_empty(&sec->ioctl_cmd_queue_head)) {
+		struct lst_node *node = list_first_entry(
+			&sec->ioctl_cmd_queue_head,
+			struct lst_node,
+			lst_link
+		);
+
+		list_del(&node->lst_link);
+		kfree(node);
+	}
+
+	kfree(sec->sg_arr);
+	kfree(sec);
+}
 
 static void tapedev_remove(struct pci_dev *pdev)
 {
@@ -1035,11 +1038,7 @@ static void tapedev_remove(struct pci_dev *pdev)
 	for (int s_id = 0; s_id < tape_dev->n_sections; s_id++)
 	{
 		sysfs_remove_group(&disk_to_dev(tape_dev->sections[s_id]->gdisk)->kobj, &tape_attr_group);
-		del_gendisk(tape_dev->sections[s_id]->gdisk);
-		put_disk(tape_dev->sections[s_id]->gdisk);
-		kfree(tape_dev->sections[s_id]);
-		// TODO: inside section we also initialized some stuff like lists etc.
-		// they probably need to be deleted too
+		_free_section(tape_dev->sections[s_id], true);
 	}
 	kfree(tape_dev->sections);
 	// blk dev free
@@ -1125,21 +1124,6 @@ module_exit(cleanup_tapedev);
 /*
 	We expect passed section to be successfully allocated
 */
-static void _free_section(struct section *sec, bool was_disk_added) 
-{
-	struct tapedev_device *tape_dev = sec->private_data;
-
-	// put_disk decrements gendisk refcount, if it reaches 0 gendisk is 
-	// freed.
-	// If haven't used add_disk, we wouldn't need to use del_gendisk
-	if (was_disk_added)
-		del_gendisk(sec->gdisk);
-	put_disk(sec->gdisk);
-	blk_mq_free_tag_set(&sec->tag_set);
-	dma_free_coherent(&tape_dev->pdev->dev, TAPEDEV_BUF_PGTABLE_SIZE, sec->cpu_dma_buf, sec->dma_addr);
-	kfree(sec->sg_arr);
-	kfree(sec);
-}
 
 // Each tape type is a separate section with gdisk which is our block device, 
 // tape_types":[0,1,2,3,4],"tapes":[50,40,30,20,10]}

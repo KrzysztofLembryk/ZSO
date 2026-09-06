@@ -8,7 +8,7 @@
 #include "tapedev_iow_ior.h"
 
 
-void _end_request_helper(struct section *sec, blk_status_t status);
+void end_request(struct section *sec, blk_status_t status);
 int __handle_section_error(uint32_t section_status, struct section *sec);
 int __handle_section_done(uint32_t section_status, struct section *sec);
 void __handle_next_cmd(struct section *sec);
@@ -23,17 +23,7 @@ int handle_sections_interrupts(uint32_t ir_status, uint32_t num_sections, struct
 	uint32_t section_done; 
 	uint32_t section_error;
 	uint32_t section_status;
-	// We need ejection queue, and once command for given section is done we take 
-	// spinlock, check if anyone wants to eject tape, if so we send command to eject 
-	// it, set variable in struct, wake up ejector, release spinlock, and end 
-	// handling this very section (once eject command is done it will raise an 
-	// interrupt and we will come back here)  
 
-	// In below loop we check if any section is DONE if so we can start next command.
-	// If given section is IDLE we firstly check if there are any new commands, if 
-	// there are we start new command, if not, we do nothing.
-
-	// We need a queue of 32-bit commands for every section
 	for (int sec_id = 0; sec_id < num_sections; sec_id++)
 	{
 		struct section *sec = dev->sections[sec_id];
@@ -58,7 +48,7 @@ int handle_sections_interrupts(uint32_t ir_status, uint32_t num_sections, struct
 
 		if (err)
 		{
-			pr_err("Section handler error: %d\n", err);
+			pr_err("Section: %d handler error: %d\n", sec_id, err);
 		}
 		// if section currently working we do nothing
 	}
@@ -77,13 +67,11 @@ int _handle_section_interrupt(uint32_t section_done, uint32_t section_error, uin
 
     if (section_status == TAPEDEV_SECT_STATUS_WORKING)
     {
-		pr_warn("%s:%u: section_status == TAPEDEV_SECT_STATUS_WORKING, section_done: %u\n", __func__, __LINE__, section_done);
         sec->status = TAPEDEV_SECT_STATUS_WORKING;
         goto release_lock;
     }
 
-	uint32_t nodes_in_lst = list_count_nodes(&sec->ioctl_cmd_queue_head);
-	pr_warn("%s:%u: nodes in cmd qeueu: %u \n", __func__, __LINE__, nodes_in_lst);
+	// uint32_t nodes_in_lst = list_count_nodes(&sec->ioctl_cmd_queue_head);
 
 	if (section_error)
 	{
@@ -121,15 +109,40 @@ release_lock:
 	return err;
 }
 
+static int get_curr_req(struct req_state **curr_req, struct section *sec) 
+{
+	if (sec->req != NULL && sec->req_state.is_being_executed)
+	{
+		*curr_req = &(sec->req_state);
+	}
+	else
+	{
+		if (!list_empty(&sec->ioctl_cmd_queue_head))
+		{
+			struct lst_node *curr_cmd_node = 
+				list_first_entry(&sec->ioctl_cmd_queue_head, struct lst_node, lst_link);
+			*curr_req = &(curr_cmd_node->cmd);
+		}
+		else
+		{
+			pr_err("%s:%u: section: %d, cmd ended with ERROR but there is no cmd present\n", __func__, __LINE__, sec->idx);
+			return -1;
+		}
+	}
+	return 0;
+}
+
 // To use this function you MUST FIRST ACQUIRE LOCK
 int __handle_section_error(uint32_t section_status, struct section *sec)
 {
 	// If we got error we probably should ABORT ALL WAITING COMMANDS
-	int err = 0x8A;
+	int err = TAPEDEV_SECT_FATAL_ERROR;
+	struct req_state *curr_req;
 
+	if (get_curr_req(&curr_req, sec))
+		return -err;
 
-	struct lst_node *curr_cmd_node = list_first_entry(&sec->ioctl_cmd_queue_head, struct lst_node, lst_link);
-	struct req_state curr_cmd = curr_cmd_node->cmd;
+	// TODO:
 	// pr_err("%s:%u: section: %d, we got error for current command: %u\n", __func__, __LINE__, sec->idx, curr_cmd.cmd);
 	// TODO: IDK how we should handle these things yet
 	switch (section_status)
@@ -137,37 +150,40 @@ int __handle_section_error(uint32_t section_status, struct section *sec)
 		case TAPEDEV_SECT_STATUS_ERR_INVALID_CMD:
 			pr_err("%s:%u: section: %d, error: ERR_INVALID_CMD\n", __func__, __LINE__, sec->idx);
 
-			/* Invalid command received */
 			err = TAPEDEV_SECT_STATUS_ERR_INVALID_CMD;
 			break;
 
 		case TAPEDEV_SECT_STATUS_ERR_TAPE_ACTIVE:
 
 			pr_err("%s:%u: section: %d, error: ERR_TAPE_ACTIVE\n", __func__, __LINE__, sec->idx);
-			/* Tape is currently active/busy */
 			err = TAPEDEV_SECT_STATUS_ERR_TAPE_ACTIVE;
 			break;
 
 		case TAPEDEV_SECT_STATUS_ERR_NO_TAPE:
 
+			err = TAPEDEV_SECT_STATUS_ERR_NO_TAPE;
 			// TODO: if our request ejects tape and there is NO TAPE, we should 
 			// kinda ignore this error and continue with execution, since it doesn't
 			// matter, our next command will insert new tape 
 			pr_err("%s:%u: section: %d, error: ERR_NO_TAPE\n", __func__, __LINE__, sec->idx);
 			/* No tape present */
 			// We need to wake up ioctl thread if it issued this command
-			list_del(&curr_cmd_node->lst_link);
-			kfree(curr_cmd_node);
-			if (curr_cmd.is_ioctl)
+			if (curr_req->is_ioctl)
 			{
+				struct lst_node *curr_cmd_node = 
+					list_first_entry(&sec->ioctl_cmd_queue_head, struct lst_node, lst_link);
+				list_del(&curr_cmd_node->lst_link);
+				kfree(curr_cmd_node);
+
 				sec->ioctl_cmd_done = true;
 				sec->ioctl_status = TAPEDEV_SECT_STATUS_ERR_NO_TAPE;
 				wake_up(&sec->ioctl_eject_wait_q);
+				sec->status = -err;
+				return -err;
 			}
 			// otherwise we ignore this error, request that ejected tape will in next
 			// step insert new one
 
-			err = TAPEDEV_SECT_STATUS_ERR_NO_TAPE;
 			break;
 
 		case TAPEDEV_SECT_STATUS_ERR_RESET:
@@ -220,25 +236,8 @@ int __handle_section_error(uint32_t section_status, struct section *sec)
 	}
 	sec->status = -err;
 
-	if (curr_cmd.is_ioctl)
-		return -err;
-	// This allows us below flow:
-	// - at the start of the request we ALWAYS eject the tape, because sec->curr_tape
-	// 	might show the tape we want, BUT there might be an ioctl command running 
-	// 	and it might end while we are creating our request commands, and we will get
-	// 	situation where we assumed we have a tape, but when our command is being 
-	// 	computed there is no tape inserted
-	// - so we always EJECT tape, and only after that we insert our tape
-	if (section_status == TAPEDEV_SECT_STATUS_ERR_NO_TAPE)
-	{
-		pr_err("%s:%u: request wanted to EJECT TAPE, but there was no tape, if next command inserts tape it's fine, returning \n", __func__, __LINE__);
-		return -err;
-	}
-
-	__abort_rest_of_req_cmds(sec);
-
-	if (list_empty(&sec->ioctl_cmd_queue_head))
-		_end_request_helper(sec, BLK_STS_IOERR);
+	// If we encountered an error we end current request with error
+	end_request(sec, BLK_STS_IOERR);
 
 	return -err;
 }
@@ -353,21 +352,25 @@ ret:
 // To use this function you MUST FIRST ACQUIRE LOCK
 void __handle_next_cmd(struct section *sec)
 {
-	if (list_empty(&sec->ioctl_cmd_queue_head))
+	// If we have request we do request (both of these checks should have ALWAYS
+	// the same value)
+	if (sec->req != NULL && !IS_NULL_REQ_STATE(sec->req_state))
 	{
-		pr_warn("%s:%u: section: %u, no more cmds to schedule, cmd queue EMPTY\n", __func__, __LINE__, sec->idx);
+		sec->req_state.is_being_executed = true;
+		section_send_cmd(sec->req_state.cmd, sec);
+	}
+	else if (!list_empty(&sec->ioctl_cmd_queue_head))
+	{
+		struct lst_node *node = list_first_entry(&sec->ioctl_cmd_queue_head, struct lst_node, lst_link);
+		node->cmd.is_being_executed = true;
+		section_send_cmd(node->cmd.cmd, sec);
+	}
+	else if ((sec->req == NULL && !IS_NULL_REQ_STATE(sec->req_state)) 
+		|| (sec->req != NULL && IS_NULL_REQ_STATE(sec->req_state)))
+	{
+		pr_err("%s:%u: INVALID STATE in section: %u, sec->req and sec->req_state have different states \n", __func__, __LINE__, sec->idx);
 		return;
 	}
-
-	pr_warn("%s:%u: Will schedule next cmd for section: %u\n", __func__, __LINE__, sec->idx);
-	// We get first command in queue, but not remove it from the list.
-	// Removal will only happen once command is done.
-	struct lst_node *node = list_first_entry(&sec->ioctl_cmd_queue_head, struct lst_node, lst_link);
-
-	pr_warn("%s:%u: cmd that will be scheduled is: %u\n", __func__, __LINE__, GET_CMD_TYPE(node->cmd.cmd));
-	section_send_cmd(node->cmd.cmd, sec);
-
-	return; 
 }
 
 void clear_sec_done_intrpt(struct section* sec)
@@ -395,7 +398,7 @@ void __abort_rest_of_req_cmds(struct section *sec)
 		// means we removed whole request
 		if (node->cmd.is_ioctl)
 		{
-			_end_request_helper(sec, BLK_STS_IOERR);
+			end_request(sec, BLK_STS_IOERR);
 			break;
 		}
 
@@ -417,7 +420,7 @@ void __end_req_if_completed(struct section *sec, struct req_state *curr_cmd)
 		// if it is we do nothing, otherwise we inform that request has ended 
 		// successfullynow we use queue of cmds,
 		if (!curr_cmd->is_ioctl)
-			_end_request_helper(sec, BLK_STS_OK);
+			end_request(sec, BLK_STS_OK);
 	
 	}
 	else
@@ -429,20 +432,27 @@ void __end_req_if_completed(struct section *sec, struct req_state *curr_cmd)
 
 		// next and curr cmd should NEVER BOTH BE IOCTL, but still better to check it
 		if (next_node->cmd.is_ioctl && !curr_cmd->is_ioctl)
-			_end_request_helper(sec, BLK_STS_OK);
+			end_request(sec, BLK_STS_OK);
 	}
 }
 
 /*
 	Must be used with already acquired sec->lock
 */
-void _end_request_helper(struct section *sec, blk_status_t status)
+void end_request(struct section *sec, blk_status_t status)
 {
 	if (sec->req != NULL)
 	{
-		pr_warn("%s:%u: doing blk_mq_end_request\n", __func__, __LINE__);
+		struct tapedev_device *dev = sec->private_data;
+		dma_unmap_sg(
+			&dev->pdev->dev, 
+			sec->sg_arr, 
+			sec->req_state.original_nents, 
+			sec->req_state.data_direction
+		);
 		blk_mq_end_request(sec->req, status);
 		sec->req = NULL;
+		sec->req_state = NULL_REQ_STATE;
 	}
 	else
 	{

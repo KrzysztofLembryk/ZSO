@@ -10,6 +10,7 @@
 // I would add it to tapedev.h but probably it will be replaced with default .h file
 #define TAPEDEV_CMD_NONE				0x06
 #define TAPEDEV_CMD_UNSUPPORTED			0xffffffff
+#define TAPEDEV_SECT_FATAL_ERROR		0x8A
 
 #define MAX_DEVICES_TAPEDEV 256
 #define MAX_SG_PGT_ENTRIES 512
@@ -48,11 +49,12 @@ struct req_state
 {
 	uint32_t cmd;
 	bool is_ioctl;
+	bool is_being_executed;
 	int sg_idx;
 	int original_nents;
 	int nents;
 	bool is_write;
-	enum dma_data_direction dir;
+	enum dma_data_direction data_direction;
 	uint32_t tape_nbr;
 	uint32_t start_sector_within_tape;
 	uint32_t total_blocks_in_tape;
