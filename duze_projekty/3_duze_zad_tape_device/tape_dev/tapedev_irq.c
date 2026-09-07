@@ -320,7 +320,7 @@ int __handle_section_done(uint32_t section_status, struct section *sec)
 			pr_warn("%s:%u: cmd DONE: TAPEDEV_CMD_REWIND, tape: %u rewinded \n", __func__, __LINE__, tape_nbr);
 
 			// After rewind we must fast forward to correct sector
-			uint32_t cmd = create_tapedev_cmd(TAPEDEV_CMD_FAST_FWD, curr_req->start_sector_within_tape, NO_ARG);
+			uint32_t cmd = create_tapedev_cmd(TAPEDEV_CMD_FAST_FWD, curr_req->start_block_within_tape, NO_ARG);
 			curr_req->cmd = cmd;
 			break;
 		case TAPEDEV_CMD_FAST_FWD:
@@ -362,7 +362,7 @@ int __handle_section_done(uint32_t section_status, struct section *sec)
 						curr_req->cmd = cmd;
 						curr_req->left_blocks_in_tape = curr_req->total_blocks_in_tape;
 						curr_req->tape_nbr++;
-						curr_req->start_sector_within_tape = 0;
+						curr_req->start_block_within_tape = 0;
 						n_blocks_in_cmd = 0;
 
 						break;

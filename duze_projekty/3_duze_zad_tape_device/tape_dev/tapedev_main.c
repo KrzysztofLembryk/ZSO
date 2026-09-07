@@ -261,35 +261,29 @@ static const struct block_device_operations tapedev_ops = {
 };
 
 
-static int calc_start_pos_within_section(u64 start_sector, uint32_t *start_sector_within_tape, uint32_t *tape_nbr, struct section *sec)
+static int calc_start_block_within_section(u64 start_sector, uint32_t *start_block_within_tape, uint32_t *tape_nbr, struct section *sec)
 {
-	uint32_t all_512byte_sectors = GET_TOTAL_NBR_OF_512B_SECTORS(sec->section_type, sec->n_tapes);
+	uint32_t section_512byte_sectors = GET_TOTAL_NBR_OF_512B_SECTORS(sec->section_type, sec->n_tapes);
+	uint32_t tape_512byte_sectors = SIZE_OF_TAPE(sec->section_type) / 512;
+	uint32_t block_512byte_sectors = sec->blk_size / 512;
 
 	// We count sectors from 0
-	if (start_sector >= all_512byte_sectors)
+	if (start_sector >= section_512byte_sectors)
 	{
-		pr_err("%s:%u: start_sector: %llu >= %u all_sectors available in this section\n", __func__, __LINE__, start_sector, all_512byte_sectors);
+		pr_err("%s:%u: start_sector: %llu >= %u all_sectors available in this section\n", __func__, __LINE__, start_sector, section_512byte_sectors);
 		return -EINVAL;
 	}
 
-	pr_warn("%s:%u: section block size: %u\n", __func__, __LINE__, sec->blk_size);
-	// tape_sectors - how many 512byte sectors there is in a tape, start_sector is 
-	// 	given in 512bytes, thus we calculate starting position also in 512bytes 
-	// 	sectors, even if we read blocks of blk_size different than 512
-	// uint32_t tape_sectors = (SIZE_OF_TAPE(sec->section_type) / sec->blk_size);
-	uint32_t tape_sectors = (SIZE_OF_TAPE(sec->section_type) / 512);
-
-	// i.e. if tapes have 200 sectors, and our start_sector is 198 we will get 0 
-	// from below division and that's correct since we want tape of number 0
-	*tape_nbr = start_sector / tape_sectors;
-	// i.e. if start_sector is 403, we get tape 2, and we should start from 
-	// 	403 - 2 * 200 = 3 sector within tape 2
-	*start_sector_within_tape = start_sector - (*tape_nbr) * tape_sectors;
-
 	// We count tapes starting from 1
-	*tape_nbr = *tape_nbr + 1;
+	*tape_nbr = start_sector / tape_512byte_sectors + 1;
+	uint32_t start_sector_in_tape = start_sector % tape_512byte_sectors;
 
-	pr_warn("%s:%u: section: %u, wanted tape_nbr: %u, nbr of tapes in section: %u, nbr of sectors in one tape: %u, n_sectors in section: %u,  start_sector: %llu, start_sector_within_tape: %u\n", __func__, __LINE__, sec->idx, *tape_nbr, sec->n_tapes, tape_sectors, all_512byte_sectors,  start_sector, *start_sector_within_tape);
+	if (start_sector_in_tape % block_512byte_sectors != 0) {
+        pr_err("%s:%u: request not aligned to block size, start_sector_in_tape is not a multiple of 512 byte block sectors inside tape\n", __func__, __LINE__);
+        return -EINVAL;
+    }
+
+	*start_block_within_tape = start_sector_in_tape / block_512byte_sectors;
 
 	return 0;
 }
@@ -302,14 +296,14 @@ static int init_req_state(u64 start_sector, int write, int original_nents, int n
 	pr_warn("%s:%u: Initializing request state\n", __func__, __LINE__);
 
 	uint32_t tape_nbr; 
-	uint32_t start_sector_within_tape;
+	uint32_t start_block_within_tape;
 	uint32_t cmd;
 
-	if (calc_start_pos_within_section(start_sector, &start_sector_within_tape, &tape_nbr, sec))
+	if (calc_start_block_within_section(start_sector, &start_block_within_tape, &tape_nbr, sec))
 		return -EINVAL;
 
 	const uint32_t blocks_in_tape = GET_NBR_OF_BLOCKS_IN_TAPE(sec->section_type, sec->blk_size);
-	uint32_t blocks_left_in_tape = blocks_in_tape - start_sector_within_tape;
+	uint32_t blocks_left_in_tape = blocks_in_tape - start_block_within_tape;
 
 	cmd = create_tapedev_cmd(TAPEDEV_CMD_EJECT_TAPE, NO_ARG, NO_ARG);
 
@@ -318,7 +312,7 @@ static int init_req_state(u64 start_sector, int write, int original_nents, int n
 	sec->req_state.is_being_executed = false;
 	sec->req_state.tape_nbr = tape_nbr;
 	sec->req_state.prev_tape_nbr = tape_nbr;
-	sec->req_state.start_sector_within_tape = start_sector_within_tape;
+	sec->req_state.start_block_within_tape = start_block_within_tape;
 
 	sec->req_state.is_write = write;
 	sec->req_state.data_direction = write ? DMA_TO_DEVICE : DMA_FROM_DEVICE;
@@ -371,9 +365,9 @@ static int do_scatter_gather(struct request *req, u64 start_sector, struct secti
 	uint64_t *pgt_buf = sec->cpu_dma_buf;
 	const uint32_t section_blk_size = sec->blk_size;
 	uint32_t tape_nbr; 
-	uint32_t start_sector_within_tape;
+	uint32_t start_block_within_tape;
 
-	if (calc_start_pos_within_section(start_sector, &start_sector_within_tape, &tape_nbr, sec))
+	if (calc_start_block_within_section(start_sector, &start_block_within_tape, &tape_nbr, sec))
 	{
 		err = BLK_STS_INVAL;
 		goto fail;
@@ -417,7 +411,7 @@ static int do_scatter_gather(struct request *req, u64 start_sector, struct secti
 	int cmd_start_pos = 0;
 	uint32_t cmd_total_blocks = 0;
 	const uint32_t blocks_in_tape = GET_NBR_OF_BLOCKS_IN_TAPE(sec->section_type, sec->blk_size);
-	uint32_t blocks_left_in_tape = blocks_in_tape - start_sector_within_tape;
+	uint32_t blocks_left_in_tape = blocks_in_tape - start_block_within_tape;
 	uint32_t prev_tape_nbr = tape_nbr;
 
 	if (init_req_state(start_sector, write, original_nents, nents, sec))

@@ -58,7 +58,7 @@ struct req_state
 	enum dma_data_direction data_direction;
 	uint32_t tape_nbr;
 	uint32_t prev_tape_nbr;
-	uint32_t start_sector_within_tape;
+	uint32_t start_block_within_tape;
 	uint32_t total_blocks_in_tape;
 	uint32_t left_blocks_in_tape;
 	bool completed;
