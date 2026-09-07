@@ -458,11 +458,11 @@ static int do_scatter_gather(struct request *req, u64 start_sector, struct secti
 			uint64_t inserted_blocks = (uint64_t)nbr_of_blocks - overflow_blocks; 
 			cmd_total_blocks = blocks_left_in_tape;
 
-			// We want to store bytes 40-9 in high 32 bits
+			// We want to store bits 40-9 in high 32 bits
 			// Low 32 bits are for number of blocks to read/write from this address
 			pgt_buf[ent_id] = (dma_addr  >> 9);
 			pgt_buf[ent_id] = pgt_buf[ent_id] << 32;
-			pgt_buf[ent_id] = pgt_buf[ent_id] | inserted_blocks;
+			pgt_buf[ent_id] = pgt_buf[ent_id] | (uint64_t)inserted_blocks;
 
 			cmd_start_pos = ent_id + 1;
 			cmd_total_blocks = overflow_blocks;

@@ -348,14 +348,17 @@ int __handle_section_done(uint32_t section_status, struct section *sec)
 				{
 					// nbr of blocks in 64bit pgt_buf elem is at low 32 bits
 					uint32_t n_blocks = (uint32_t)(pgt_buf[i] & 0xffffffffULL);
+
+
 					n_blocks_in_cmd += n_blocks;
 
 					// We should have exactly this number of commands, since when 
 					// populating pgt_buf we partitioned it in this way 
-					if (n_blocks_in_cmd == curr_req->left_blocks_in_tape)
+					if (n_blocks_in_cmd >= curr_req->left_blocks_in_tape)
 					{
 						uint32_t cmd = create_tapedev_cmd(
-							curr_req->is_write ? TAPEDEV_CMD_WRITE : TAPEDEV_CMD_READ, curr_req->sg_idx, 
+							curr_req->is_write ? TAPEDEV_CMD_WRITE : TAPEDEV_CMD_READ, 
+							curr_req->total_blocks_seen, 
 							n_blocks_in_cmd
 						);
 						curr_req->sg_idx = i + 1;
@@ -364,6 +367,28 @@ int __handle_section_done(uint32_t section_status, struct section *sec)
 						curr_req->tape_nbr++;
 						curr_req->start_block_within_tape = 0;
 						n_blocks_in_cmd = 0;
+
+						curr_req->total_blocks_seen += n_blocks;
+
+						// When creating READ/WRITE cmd we have only 23-31 bits for 
+						// offset in page table counted in BLOCKS, so we can at most hold
+						// offset of 511 blocks, therefore, if we exceed this number our
+						// stored value will be truncated and we will get incorrect 
+						// offset
+						if (curr_req->total_blocks_seen >= 512)
+						{
+							curr_req->total_blocks_seen -= n_blocks;
+							curr_req->stopped_at_idx = i;
+							curr_req->rewind_pgt_buff = true;
+							uint32_t cmd = create_tapedev_cmd(
+								curr_req->is_write ? TAPEDEV_CMD_WRITE : TAPEDEV_CMD_READ, 
+								curr_req->total_blocks_seen, 
+								n_blocks_in_cmd
+							);
+							curr_req->cmd = cmd;
+							curr_req->left_blocks_in_tape = curr_req->total_blocks_in_tape - n_blocks_in_cmd;
+							break;
+						}
 
 						break;
 					}
@@ -375,11 +400,13 @@ int __handle_section_done(uint32_t section_status, struct section *sec)
 						goto ret;
 					}
 				}
+
 				if (n_blocks_in_cmd != 0)			
 				{
 					// we will be sending LAST cmd, no more blocks
 					uint32_t cmd = create_tapedev_cmd(
-						curr_req->is_write ? TAPEDEV_CMD_WRITE : TAPEDEV_CMD_READ, curr_req->sg_idx, 
+						curr_req->is_write ? TAPEDEV_CMD_WRITE : TAPEDEV_CMD_READ, 
+						curr_req->total_blocks_seen, 
 						n_blocks_in_cmd
 					);
 					curr_req->sg_idx = curr_req->nents;

@@ -14,7 +14,7 @@
 #define IOCTL_STATUS_OK					0
 
 #define MAX_DEVICES_TAPEDEV 256
-#define MAX_SG_PGT_ENTRIES 512
+#define MAX_SG_PGT_ENTRIES 1024
 // From task description we have 8-22 bits for number of blocks to read, thus we have
 // 15 bits to encode this number, max number we can encode is 0x7fff (all 15 bits 1)
 #define MAX_BLOCKS_PER_ONE_CMD 0x7fff 
@@ -51,18 +51,36 @@ struct req_state
 	uint32_t cmd;
 	bool is_ioctl;
 	bool is_being_executed;
+
+	// Current idx we must use when iterating pgt_buf
 	int sg_idx;
+	// Needed to unmap dmap
 	int original_nents;
+	// Number of elements in pgt_buf
 	int nents;
+
 	bool is_write;
 	enum dma_data_direction data_direction;
+
 	uint32_t tape_nbr;
 	uint32_t prev_tape_nbr;
+
+	// Used in fast forward cmds, we forward tape to the starting block
 	uint32_t start_block_within_tape;
 	uint32_t total_blocks_in_tape;
+	// Used to monitor how many blocks are left in current tape, thanks to that we 
+	// know when to take next tape
 	uint32_t left_blocks_in_tape;
+	// Used for setting correct offset in READ/WRITE commands 
+	uint32_t total_blocks_seen;
+
+	// Used to check if request completed, if so, we can end it and free resources
 	bool completed;
-	// uint32_t overflow_blocks;
+
+	// Used to rewind pgt_buf when total_blocks_seen >= 512, otherwise our offset
+	// would be truncated, since we have only bits 23-31 to store offset in a cmd
+	int stopped_at_idx;
+	bool rewind_pgt_buff;
 };
 
 // Add at the end with - list_add_tail(&node->link, &section->cmd_queue)
