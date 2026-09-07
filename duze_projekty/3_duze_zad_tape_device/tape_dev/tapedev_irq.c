@@ -6,14 +6,15 @@
 #include "tapedev.h"
 #include "tapedev_defs.h"
 #include "tapedev_iow_ior.h"
+#include <stdint.h>
 
 
-void end_request(struct section *sec, blk_status_t status);
+void _end_request(struct section *sec, blk_status_t status);
 int __handle_section_error(uint32_t section_status, struct section *sec);
 int __handle_section_done(uint32_t section_status, struct section *sec);
 void __handle_next_cmd(struct section *sec);
 void __abort_rest_of_req_cmds(struct section *sec);
-void __end_req_if_completed(struct section *sec, struct req_state *curr_cmd);
+void end_req_if_completed(struct section *sec, struct req_state *curr_cmd);
 void clear_sec_done_intrpt(struct section* sec);
 void clear_sec_err_intrpt(struct section* sec);
 int _handle_section_interrupt(uint32_t section_done, uint32_t section_error, uint32_t section_status, struct section *sec);
@@ -237,7 +238,7 @@ int __handle_section_error(uint32_t section_status, struct section *sec)
 	sec->status = -err;
 
 	// If we encountered an error we end current request with error
-	end_request(sec, BLK_STS_IOERR);
+	_end_request(sec, BLK_STS_IOERR);
 
 	return -err;
 }
@@ -252,43 +253,55 @@ int __handle_section_done(uint32_t section_status, struct section *sec)
 	// 	can safely assume that everything is OK.
 	// TAPEDEV_IRQ_SECT_n_ERROR - Section error, check status.
 
-
 	if (section_status != TAPEDEV_SECT_STATUS_DONE)
 	{
 		pr_err("%s:%u: section_status (%d) is not equal to TAPEDEV_SECT_STATUS_DONE even though it should be \n", __func__, __LINE__, section_status);
 		err = -1;
 		goto ret;
 	}
-	if (list_empty(&sec->ioctl_cmd_queue_head))
+
+	sec->status = TAPEDEV_SECT_STATUS_DONE;
+	struct req_state *curr_req; 
+
+	// get_curr_req guarantees that curr_req != NULL
+	if (get_curr_req(&curr_req, sec))
 	{
-		pr_err("%s:%u: cmd queue is EMPTY even though section just completed command \n", __func__, __LINE__);
 		err = -1;
 		goto ret;
 	}
 
-
-	sec->status = TAPEDEV_SECT_STATUS_DONE;
-	struct lst_node *node = list_first_entry(&sec->ioctl_cmd_queue_head, struct lst_node, lst_link);
-	struct req_state curr_cmd = node->cmd;
-	
-	list_del(&node->lst_link);
-	// After removing from queue list we must free memory of the node, we no longer
-	// need it here, just information aobut curr cmd is sufficient
-	kfree(node);
-
 	uint32_t tape_nbr = section_read_from(TAPEDEV_SECT_TAPE_NO_ADDR, sec); 
-	uint32_t curr_cmd_type = GET_CMD_TYPE(curr_cmd.cmd);
-	uint32_t curr_cmd_body = GET_CMD_BODY(curr_cmd.cmd);
+	uint32_t curr_cmd_type = GET_CMD_TYPE(curr_req->cmd);
+	uint32_t curr_cmd_body = GET_CMD_BODY(curr_req->cmd);
 
+	// !!!!! SENDING COMMANDS is done in handle_next_cmd, here we only set correct
+	// values and cmds
 	switch(curr_cmd_type)
 	{
+		case TAPEDEV_CMD_EJECT_TAPE:
+		{
+			pr_warn("%s:%u: cmd DONE: TAPEDEV_CMD_EJECT_TAPE \n", __func__, __LINE__);
+
+			if (curr_req->is_ioctl)
+			{
+				sec->ioctl_cmd_done = true;
+				sec->ioctl_status = IOCTL_STATUS_OK;
+				wake_up(&sec->ioctl_eject_wait_q);
+			}
+			else
+			{
+				// If just completed cmd was eject tape, we must then INSERT TAPE
+				uint32_t cmd = create_tapedev_cmd(TAPEDEV_CMD_TAKE_TAPE, curr_req->tape_nbr, NO_ARG);
+				curr_req->cmd = cmd;
+			}
+			break;
+		}
 		case TAPEDEV_CMD_TAKE_TAPE:
 		{
-			pr_warn("%s:%u: cmd DONE: TAPEDEV_CMD_TAKE_TAPE \n", __func__, __LINE__);
-			curr_cmd_body = curr_cmd_body >> 8;
+			pr_warn("%s:%u: cmd DONE: TAPEDEV_CMD_TAKE_TAPE, inserted tape: %u \n", __func__, __LINE__, curr_req->tape_nbr);
 			uint32_t tape = section_read_from(TAPEDEV_SECT_TAPE_NO_ADDR, sec); 
 	
-			if (tape != curr_cmd_body)
+			if (tape != curr_req->tape_nbr)
 			{
 				pr_err("%s:%u: take_tape was done but inserted tape: '%u' is different from requested tape: '%u' \n", __func__, __LINE__, tape, curr_cmd_body);
 				// TODO: rework errors, add INTERNAL_ERROR or sth and return it here
@@ -297,53 +310,90 @@ int __handle_section_done(uint32_t section_status, struct section *sec)
 				goto ret;
 			}
 
-			break;
-		}
-		case TAPEDEV_CMD_EJECT_TAPE:
-		{
-			pr_warn("%s:%u: cmd DONE: TAPEDEV_CMD_EJECT_TAPE \n", __func__, __LINE__);
-			uint32_t tape = section_read_from(TAPEDEV_SECT_TAPE_NO_ADDR, sec); 
-	
-			if (tape != NO_TAPE)
-			{
-				pr_err("something went wrong, eject_tape was done but  %u tape is still inserted\n", tape);
-				err = -1;
-				goto ret;
-			}
+			// After we've inserted tape we must rewind it 
+			uint32_t cmd = create_tapedev_cmd(TAPEDEV_CMD_REWIND, NO_ARG, NO_ARG);
+			curr_req->cmd = cmd;
 
-			// If current command was issued by ioctl we only wake up ioctl threads
-			if (curr_cmd.is_ioctl)
-			{
-				sec->ioctl_cmd_done = true;
-				wake_up(&sec->ioctl_eject_wait_q);
-			}
-
-			// If current command wasn't issued by ioctl, noone is waiting on queue
-			// so we don't need to do anything, tape was ejected, that's all we 
-			// wanted, we can continue with next command
 			break;
 		}
 		case TAPEDEV_CMD_REWIND:
 			pr_warn("%s:%u: cmd DONE: TAPEDEV_CMD_REWIND, tape: %u rewinded \n", __func__, __LINE__, tape_nbr);
+
+			// After rewind we must fast forward to correct sector
+			uint32_t cmd = create_tapedev_cmd(TAPEDEV_CMD_FAST_FWD, curr_req->start_sector_within_tape, NO_ARG);
+			curr_req->cmd = cmd;
 			break;
 		case TAPEDEV_CMD_FAST_FWD:
-			pr_warn("%s:%u: cmd DONE: TAPEDEV_CMD_FAST_FWD. tape: %u forwarded by %u blocks\n", __func__, __LINE__, tape_nbr, curr_cmd_body >> 8);
-			break;
 		case TAPEDEV_CMD_READ:
-			// In read/write we probably will need to do something with checking how
-			// many bytes or sth was read/done etc
-			pr_warn("%s:%u: cmd DONE TAPEDEV_CMD_READ, tape: %u has been read\n", __func__, __LINE__, tape_nbr);
-			break;
 		case TAPEDEV_CMD_WRITE:
-			pr_warn("%s:%u: cmd DONE TAPEDEV_CMD_WRITE, tape: %u has been written\n", __func__, __LINE__, tape_nbr);
-			break;	
+			if (curr_req->sg_idx >= curr_req->nents)
+			{
+				curr_req->completed = true;
+			}
+			else if (curr_req->prev_tape_nbr != curr_req->tape_nbr)
+			{
+				// This case means that we've just ended read/write, and there is no
+				// more space on the tape, so we must change it
+				curr_req->prev_tape_nbr = curr_req->tape_nbr;
+				uint32_t cmd = create_tapedev_cmd(TAPEDEV_CMD_EJECT_TAPE, NO_ARG, NO_ARG);
+				curr_req->cmd = cmd;
+			}
+			else
+			{
+				pr_warn("%s:%u: cmd DONE: TAPEDEV_CMD_FAST_FWD. tape: %u forwarded by %u blocks\n", __func__, __LINE__, tape_nbr, curr_cmd_body >> 8);
+
+				uint64_t *pgt_buf = sec->cpu_dma_buf;
+				uint32_t n_blocks_in_cmd = 0;
+				for (int i = curr_req->sg_idx; i < curr_req->nents; i++)
+				{
+					// nbr of blocks in 64bit pgt_buf elem is at low 32 bits
+					uint32_t n_blocks = (uint32_t)(pgt_buf[i] & 0xffffffffULL);
+					n_blocks_in_cmd += n_blocks;
+
+					// We should have exactly this number of commands, since when 
+					// populating pgt_buf we partitioned it in this way 
+					if (n_blocks_in_cmd == curr_req->left_blocks_in_tape)
+					{
+						uint32_t cmd = create_tapedev_cmd(
+							curr_req->is_write ? TAPEDEV_CMD_WRITE : TAPEDEV_CMD_READ, curr_req->sg_idx, 
+							n_blocks_in_cmd
+						);
+						curr_req->sg_idx = i + 1;
+						curr_req->cmd = cmd;
+						curr_req->left_blocks_in_tape = curr_req->total_blocks_in_tape;
+						curr_req->tape_nbr++;
+						curr_req->start_sector_within_tape = 0;
+						n_blocks_in_cmd = 0;
+
+						break;
+					}
+					else if (n_blocks_in_cmd > curr_req->left_blocks_in_tape)
+					{
+						pr_err("%s:%u: n_blocks_in_cmd > curr_req->left_blocks_in_tape, THIS SHOULD NEVER HAPPEN, there is a logic error somewhere\n", __func__, __LINE__);
+						_end_request(sec, BLK_STS_IOERR);
+						err = -2;
+						goto ret;
+					}
+				}
+				if (n_blocks_in_cmd != 0)			
+				{
+					// we will be sending LAST cmd, no more blocks
+					uint32_t cmd = create_tapedev_cmd(
+						curr_req->is_write ? TAPEDEV_CMD_WRITE : TAPEDEV_CMD_READ, curr_req->sg_idx, 
+						n_blocks_in_cmd
+					);
+					curr_req->sg_idx = curr_req->nents;
+					curr_req->cmd = cmd;
+				}
+			}
+			break;
 		default:
 			pr_err("%s:%u: got unsupported cmd: '%u' \n", __func__, __LINE__, curr_cmd_type);
 			err = -2;
 			goto ret;
 	}
 
-	__end_req_if_completed(sec, &curr_cmd);
+	end_req_if_completed(sec, curr_req);
 
 ret:
 	return err;
@@ -371,6 +421,7 @@ void __handle_next_cmd(struct section *sec)
 		pr_err("%s:%u: INVALID STATE in section: %u, sec->req and sec->req_state have different states \n", __func__, __LINE__, sec->idx);
 		return;
 	}
+	// No next cmd present
 }
 
 void clear_sec_done_intrpt(struct section* sec)
@@ -387,59 +438,26 @@ void clear_sec_err_intrpt(struct section* sec)
 	);
 }
 
-void __abort_rest_of_req_cmds(struct section *sec)
+void end_req_if_completed(struct section *sec, struct req_state *curr_req)
 {
-	pr_err("%s:%u: ABORTING rest commands of current request\n", __func__, __LINE__);
-	while (!list_empty(&sec->ioctl_cmd_queue_head))
+	if (curr_req->is_ioctl)
 	{
 		struct lst_node *node = list_first_entry(&sec->ioctl_cmd_queue_head, struct lst_node, lst_link);
-
-		// Once we got to the ioctl commands we stop removing from list, since it
-		// means we removed whole request
-		if (node->cmd.is_ioctl)
-		{
-			end_request(sec, BLK_STS_IOERR);
-			break;
-		}
 
 		list_del(&node->lst_link);
 		kfree(node);
 	}
-
-	sec->req = NULL;
-}
-
-void __end_req_if_completed(struct section *sec, struct req_state *curr_cmd)
-{
-
-	// After handling current command we check if list empty 
-	if (list_empty(&sec->ioctl_cmd_queue_head))
+	else if (curr_req->completed)
 	{
-		pr_warn("%s:%u: After handling current command cmd queue is EMPTY\n", __func__, __LINE__);
-		// If there is no next command, we check if just ended command is ioctl,
-		// if it is we do nothing, otherwise we inform that request has ended 
-		// successfullynow we use queue of cmds,
-		if (!curr_cmd->is_ioctl)
-			end_request(sec, BLK_STS_OK);
-	
+		_end_request(sec, BLK_STS_OK);
 	}
-	else
-	{
-		// If list is not empty, we must check if next command is ioctl, if it is
-		// it means that just ended command was the last one in our request so we
-		// must end this request
-		struct lst_node *next_node = list_first_entry(&sec->ioctl_cmd_queue_head, struct lst_node, lst_link);
-
-		// next and curr cmd should NEVER BOTH BE IOCTL, but still better to check it
-		if (next_node->cmd.is_ioctl && !curr_cmd->is_ioctl)
-			end_request(sec, BLK_STS_OK);
-	}
+	// if nothing completed we do nothing
 }
 
 /*
 	Must be used with already acquired sec->lock
 */
-void end_request(struct section *sec, blk_status_t status)
+void _end_request(struct section *sec, blk_status_t status)
 {
 	if (sec->req != NULL)
 	{

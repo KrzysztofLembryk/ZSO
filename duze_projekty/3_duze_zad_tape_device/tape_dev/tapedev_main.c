@@ -245,12 +245,12 @@ static int tapedev_ioctl(struct block_device *bdev, blk_mode_t mode, unsigned cm
 		if (sec->ioctl_status == TAPEDEV_SECT_STATUS_ERR_NO_TAPE)
 		{
 			pr_warn("%s:%u: EJECT_TAPE ioctl cmd wanted to eject when there is NO TAPE inserted \n", __func__, __LINE__);
-			sec->ioctl_status = 0;
+			sec->ioctl_status = IOCTL_STATUS_OK;
 			spin_unlock_irqrestore(&sec->lock, flags);
 			return -EIO;
 		}
 
-		sec->ioctl_status = 0;
+		sec->ioctl_status = IOCTL_STATUS_OK;
 		// Once current tape is 0, we return success
 		spin_unlock_irqrestore(&sec->lock, flags);
 		return 0;
@@ -267,64 +267,6 @@ static const struct block_device_operations tapedev_ops = {
 	.ioctl = tapedev_ioctl
 };
 
-/*
-	Depending on the cmd type:
-		- arg1 is for 8-31 bits, arg2 NOT PRESENT 
-		- arg1 is for 23-31 bits, arg2 PRESENT
-		- arg2 is only for 8-22 bits (arg2 is number of blocks to READ/WRITE)
-*/
-static inline uint32_t create_tapedev_cmd(uint32_t cmd_type, uint32_t arg1, uint32_t arg2)
-{
-	uint32_t cmd;
-
-	switch (cmd_type) 
-	{
-		case TAPEDEV_CMD_TAKE_TAPE:
-			pr_warn("%s:%u: creating  TAPEDEV_CMD_TAKE_TAPE\n", __func__, __LINE__);
-			// arg1, bits 8-31, can only have first 24 bits non zero, but we don't 
-			// need to apply mask, since we are shifting to the left and if there are
-			// more non-zero bits, they will be discarded; so we just shift to the 
-			// left
-			cmd = arg1 << 8;
-			cmd = cmd | TAPEDEV_CMD_TAKE_TAPE;
-		break;
-		
-		case TAPEDEV_CMD_EJECT_TAPE:
-			pr_warn("%s:%u: creating TAPEDEV_CMD_EJECT_TAPE\n", __func__, __LINE__);
-			cmd = TAPEDEV_CMD_EJECT_TAPE;
-		break;
-
-		case TAPEDEV_CMD_REWIND:
-			pr_warn("%s:%u: creating TAPEDEV_CMD_REWIND\n", __func__, __LINE__);
-			cmd = TAPEDEV_CMD_REWIND;
-		break;
-
-		case TAPEDEV_CMD_FAST_FWD:
-			pr_warn("%s:%u: creating TAPEDEV_CMD_FAST_FWD\n", __func__, __LINE__);
-			cmd = arg1 << 8;
-			cmd = cmd | TAPEDEV_CMD_FAST_FWD;
-		break;
-
-		case TAPEDEV_CMD_READ:
-		case TAPEDEV_CMD_WRITE:
-			pr_warn("%s:%u: creating TAPEDEV_CMD_READ/WRITE\n", __func__, __LINE__);
-			// arg1 is offset counted in blocks, bits 23-31, should have only 9 bits
-			// thus as a safety check we allow it to have only first nine bits not 0
-			cmd = (arg1 & 0x1ff) << 23;
-			// arg2, bits 8-22, should have only 15 bits so we mask it
-			cmd = cmd | ((arg2 & 0x7fff) << 8);
-			cmd = cmd | cmd_type;
-		break;		
-
-		default:
-			// error,
-			pr_err("%s:%u: unsupported command: %u\n", __func__, __LINE__, cmd_type);
-			cmd = TAPEDEV_CMD_UNSUPPORTED;
-		break;
-	}
-
-	return cmd;
-}
 
 static int calc_start_pos_within_section(u64 start_sector, uint32_t *start_sector_within_tape, uint32_t *tape_nbr, struct section *sec)
 {
@@ -381,6 +323,7 @@ static int init_req_state(u64 start_sector, int write, int original_nents, int n
 	sec->req_state.is_ioctl = false;
 	sec->req_state.is_being_executed = false;
 	sec->req_state.tape_nbr = tape_nbr;
+	sec->req_state.prev_tape_nbr = tape_nbr;
 	sec->req_state.start_sector_within_tape = start_sector_within_tape;
 
 	sec->req_state.is_write = write;
@@ -390,34 +333,7 @@ static int init_req_state(u64 start_sector, int write, int original_nents, int n
 	sec->req_state.total_blocks_in_tape = blocks_in_tape;
 	sec->req_state.original_nents = original_nents;
 	sec->req_state.nents = nents;
-
-	// if (enqueue_new_cmd(cmd, cmd_lst_head))
-	// {
-	// 	err = -ENOMEM;
-	// 	goto free_cmd_queue;
-	// }
-
-	// pr_warn("%s:%u: tape_nbr: %u\n", __func__, __LINE__, tape_nbr);
-	// cmd = create_tapedev_cmd(TAPEDEV_CMD_TAKE_TAPE, tape_nbr, 0);
-	// if (enqueue_new_cmd(cmd, cmd_lst_head))
-	// {
-	// 	err = -ENOMEM;
-	// 	goto free_cmd_queue;
-	// }
-
-	// cmd = create_tapedev_cmd(TAPEDEV_CMD_REWIND, 0, 0);
-	// if (enqueue_new_cmd(cmd, cmd_lst_head))
-	// {
-	// 	err = -ENOMEM;
-	// 	goto free_cmd_queue;
-	// }
-
-	// cmd = create_tapedev_cmd(TAPEDEV_CMD_FAST_FWD, start_sector_within_tape, 0);
-	// if (enqueue_new_cmd(cmd, cmd_lst_head))
-	// {
-	// 	err = -ENOMEM;
-	// 	goto free_cmd_queue;
-	// }
+	sec->req_state.completed = false;
 
 	// pr_warn("%s:%u: Moving to correct pos ENDED\n", __func__, __LINE__);
 	return 0;
@@ -590,6 +506,7 @@ static int do_scatter_gather(struct request *req, u64 start_sector, struct secti
 		ent_id++;
 	}
 
+	sec->req_state.nents = ent_id;
 	// If there are no ioctl commands currently running we must send cmd to tapedev
 	// to start the execution of our request
 	// If there are some ioctl cmds running, they will see that there is request 

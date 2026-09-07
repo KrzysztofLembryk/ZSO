@@ -10,8 +10,9 @@ const struct req_state NULL_REQ_STATE = {
 	.is_write = false,
 	.data_direction = DMA_NONE,
 	.tape_nbr = 0,
+	.prev_tape_nbr = 0,
 	.start_sector_within_tape = 0,
 	.total_blocks_in_tape = 0,
 	.left_blocks_in_tape = 0,
-	// .overflow_blocks = 0,
+	.completed = false,
 };

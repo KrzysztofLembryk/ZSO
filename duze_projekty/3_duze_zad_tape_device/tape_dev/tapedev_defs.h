@@ -11,6 +11,7 @@
 #define TAPEDEV_CMD_NONE				0x06
 #define TAPEDEV_CMD_UNSUPPORTED			0xffffffff
 #define TAPEDEV_SECT_FATAL_ERROR		0x8A
+#define IOCTL_STATUS_OK					0
 
 #define MAX_DEVICES_TAPEDEV 256
 #define MAX_SG_PGT_ENTRIES 512
@@ -23,7 +24,7 @@
 #define BAR_ID 0
 #define BAR_MAXLEN 0
 #define NO_TAPE 0 
-#define NO_ARG 0
+#define NO_ARG 0	/* for create_tapedev_cmd function */
 
 #define PHYSICAL_BLOCK_SIZE 8192
 #define BASE_TAPE_SIZE (32 * 8192)
@@ -56,9 +57,11 @@ struct req_state
 	bool is_write;
 	enum dma_data_direction data_direction;
 	uint32_t tape_nbr;
+	uint32_t prev_tape_nbr;
 	uint32_t start_sector_within_tape;
 	uint32_t total_blocks_in_tape;
 	uint32_t left_blocks_in_tape;
+	bool completed;
 	// uint32_t overflow_blocks;
 };
 
