@@ -27,8 +27,6 @@
 #include <linux/interrupt.h>
 #include <linux/mmzone.h>
 #include <linux/delay.h>
-#include <stdint.h>
-
 
 // Blk dev example impl
 // https://github.com/CodeImp/sblkdev/blob/master/device.c
@@ -339,7 +337,7 @@ static int init_req_state(u64 start_sector, int write, int original_nents, int n
 	return 0;
 }
 
-static int do_scatter_gather(struct request *req, u64 start_sector, struct section *sec, int write, struct list_head *cmd_lst_head)
+static int do_scatter_gather(struct request *req, u64 start_sector, struct section *sec, int write)
 {
 	/*
 		What is struct bio_vec - a contiguous range of physical memory addresses

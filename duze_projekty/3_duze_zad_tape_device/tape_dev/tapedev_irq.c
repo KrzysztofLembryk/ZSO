@@ -6,8 +6,6 @@
 #include "tapedev.h"
 #include "tapedev_defs.h"
 #include "tapedev_iow_ior.h"
-#include <stdint.h>
-
 
 void _end_request(struct section *sec, blk_status_t status);
 int __handle_section_error(uint32_t section_status, struct section *sec);
@@ -76,7 +74,6 @@ int _handle_section_interrupt(uint32_t section_done, uint32_t section_error, uin
 
 	if (section_error)
 	{
-		pr_err("%s:%u: section_error \n", __func__, __LINE__);
 		clear_sec_err_intrpt(sec);
 		// After getting error from CURR_CMD we need to check if there are any eject 
 		// requests or start next_cmd 
@@ -182,11 +179,14 @@ int __handle_section_error(uint32_t section_status, struct section *sec)
 				sec->status = -err;
 				return -err;
 			}
-			// otherwise we ignore this error, request that ejected tape will in next
-			// step insert new one
-
-			break;
-
+			else
+			{
+				// Otherwise we ignore this error, since when handling request we 
+				// always firstly eject tape even if there is no tape inside.
+				uint32_t cmd = create_tapedev_cmd(TAPEDEV_CMD_TAKE_TAPE, curr_req->tape_nbr, NO_ARG);
+				curr_req->cmd = cmd;
+			}
+			return -1;
 		case TAPEDEV_SECT_STATUS_ERR_RESET:
 
 			pr_err("%s:%u: section: %d, error: ERR_RESET\n", __func__, __LINE__, sec->idx);
