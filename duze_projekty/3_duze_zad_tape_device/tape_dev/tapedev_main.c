@@ -227,19 +227,14 @@ static int tapedev_ioctl(struct block_device *bdev, blk_mode_t mode, unsigned cm
 		{
 			spin_unlock_irqrestore(&sec->lock, flags);
 			if (wait_event_interruptible(sec->ioctl_eject_wait_q, sec->ioctl_cmd_done))
+			{
 				return -ERESTARTSYS;
+			}
 			spin_lock_irqsave(&sec->lock, flags);
 		}
 
 		sec->ioctl_cmd_done = false;
 
-		// TODO: this is prone to some data races - we ejected tape but before we are
-		// 	able to acquire lock, comes request that inserts tape, so current tape is
-		// 	not 0, thus we cannot check current_tape value, we will check 
-		// 	ioctl_status, this is less likely to fail
-		// ----> probably we should create a queue of results for ioctl commands
-		// 	and simply remove first node from it and check status
-		// ----> for now below should probably work
 		if (sec->ioctl_status == TAPEDEV_SECT_STATUS_ERR_NO_TAPE)
 		{
 			pr_warn("%s:%u: EJECT_TAPE ioctl cmd wanted to eject when there is NO TAPE inserted \n", __func__, __LINE__);
@@ -277,11 +272,12 @@ static int calc_start_pos_within_section(u64 start_sector, uint32_t *start_secto
 		return -EINVAL;
 	}
 
-	// TODO: change so that it works with other blocksizes
-	// For now we will operate on 512 blocks
-	// how many 512 byte sectors one tape has
 	pr_warn("%s:%u: section block size: %u\n", __func__, __LINE__, sec->blk_size);
-	uint32_t tape_sectors = (SIZE_OF_TAPE(sec->section_type) / sec->blk_size);
+	// tape_sectors - how many 512byte sectors there is in a tape, start_sector is 
+	// 	given in 512bytes, thus we calculate starting position also in 512bytes 
+	// 	sectors, even if we read blocks of blk_size different than 512
+	// uint32_t tape_sectors = (SIZE_OF_TAPE(sec->section_type) / sec->blk_size);
+	uint32_t tape_sectors = (SIZE_OF_TAPE(sec->section_type) / 512);
 
 	// i.e. if tapes have 200 sectors, and our start_sector is 198 we will get 0 
 	// from below division and that's correct since we want tape of number 0
@@ -1208,8 +1204,11 @@ int create_sections(struct tapedev_device *tape_dev, int num_sections)
 
 int add_section_disks(struct tapedev_device *tape_dev, int num_sections)
 {
-	int err, err_add, err_sysfs;
+	int err = 0; 
+	int err_add = 0; 
+	int err_sysfs = 0;
 	uint32_t s_id;
+
 	// Adding all section disks
 	for (s_id = 0; s_id < num_sections; s_id++)
 	{
@@ -1221,42 +1220,40 @@ int add_section_disks(struct tapedev_device *tape_dev, int num_sections)
 		// why before running tests or anything and after insmod I got READ commands
 		err_add = add_disk(tape_dev->sections[s_id]->gdisk);
 
+		if (err_add < 0)
+		{
+			pr_err("%s:%u: add_disk failed for device: %d, s_id: %d, err: '%d'\n", __func__, __LINE__, tape_dev->idx, s_id, err_add);
+			err = err_add;
+			goto cleanup;
+		}
+
 		pr_warn("%s:%u: creating sysfs group\n", __func__, __LINE__);
 		err_sysfs = sysfs_create_group(
 			&disk_to_dev(tape_dev->sections[s_id]->gdisk)->kobj, 
 			&tape_attr_group
 		);
 
-		if (err_add < 0 || err_sysfs < 0)
+		if (err_sysfs < 0)
 		{
-			if (err_add < 0)
-			{
-				pr_err("%s:%u: add_disk failed for device: %d, s_id: %d, err: '%d'\n", __func__, __LINE__, tape_dev->idx, s_id, err_add);
-				err = err_add;
-			}
-			else if (err_sysfs < 0)
-			{
-				pr_err("%s:%u: sysfs_create_group failed for device: %d, s_id: %d, err: '%d'\n", __func__, __LINE__, tape_dev->idx, s_id, err_add);
-				err = err_sysfs;
-			}
-			
-			for (int i = 0; i < num_sections; i++)
-			{
-				struct section *s = tape_dev->sections[i];
-				// where add_disk was successful we need to call del_gendisk
-				if (i < s_id)
-					del_gendisk(tape_dev->sections[i]->gdisk);
-				// for the rest put_disk and kfree is enough
-
-				blk_mq_free_tag_set(&s->tag_set);
-				dma_free_coherent(&tape_dev->pdev->dev, PAGE_SIZE, s->cpu_dma_buf, s->dma_addr);
-				put_disk(s->gdisk);
-				kfree(s);
-			}
-			return err;	
+			pr_err("%s:%u: sysfs_create_group failed for device: %d, s_id: %d, err: '%d'\n", __func__, __LINE__, tape_dev->idx, s_id, err_add);
+			err = err_sysfs;
+			goto cleanup;
 		}
 	}
 	return 0;
+cleanup:
+	for (int i = 0; i < num_sections; i++)
+	{
+		struct section *s = tape_dev->sections[i];
+		// where add_disk was successful we need to call del_gendisk
+		if (i < s_id)
+			_free_section(s, true);
+		else if (i == s_id && err_sysfs < 0)
+			_free_section(s, true);
+		else
+			_free_section(s, false);
+	}
+	return err;	
 }
 
 int _handle_tapedev_init(uint32_t ir_status, struct tapedev_device *dev)

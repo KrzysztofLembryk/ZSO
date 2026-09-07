@@ -64,11 +64,11 @@ int _handle_section_interrupt(uint32_t section_done, uint32_t section_error, uin
 	unsigned long flags;
 	spin_lock_irqsave(&sec->lock, flags);
 
-    if (section_status == TAPEDEV_SECT_STATUS_WORKING)
-    {
-        sec->status = TAPEDEV_SECT_STATUS_WORKING;
-        goto release_lock;
-    }
+    // if (section_status == TAPEDEV_SECT_STATUS_WORKING)
+    // {
+    //     sec->status = TAPEDEV_SECT_STATUS_WORKING;
+    //     goto release_lock;
+    // }
 
 	// uint32_t nodes_in_lst = list_count_nodes(&sec->ioctl_cmd_queue_head);
 
@@ -90,10 +90,10 @@ int _handle_section_interrupt(uint32_t section_done, uint32_t section_error, uin
 		if (err)
 			goto release_lock;
 	}
-	else // section IDLE ???
+	else // section IDLE or working
 	{
-		// TODO: SOMETHING IS WRONG with section 1, section 0 completes but not section 1
 		sec->status = TAPEDEV_SECT_STATUS_IDLE;
+		goto release_lock;
 	}
 
 	// After handling curr command if it was DONE, we schedule next command in 
