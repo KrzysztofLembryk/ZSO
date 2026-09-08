@@ -361,6 +361,24 @@ int __handle_section_done(uint32_t section_status, struct section *sec)
 				uint64_t *pgt_buf = sec->cpu_dma_buf;
 				uint32_t blocks_in_cmd = 0;
 
+				if (curr_req->rewind_state.do_rewind)
+				{
+
+					// When creating READ/WRITE cmd we have only 23-31 bits for 
+					// offset in page table counted in BLOCKS, so we can at most 
+					// hold offset of 511 blocks, therefore, if we exceed this 
+					// number our stored value will be truncated and we will get 
+					// incorrect offset.
+					// Thanks to rewinding tape our device block offset will 
+					// always be either 0 or inserted blocks
+					_rewind_pgt(pgt_buf, curr_req->rewind_state.idx, &(curr_req->nents));
+				}
+
+				// TODO: currently we might never got ot sg_idx >= nents, we must 
+				// change the flow, since if there is no rewind and we get 
+				// blocks_in_cmd == left_blocks_in_tape and this is last cmd
+				// we will never set cmd_done = true
+
 				for (int i = curr_req->sg_idx; i < curr_req->nents; i++)
 				{
 					// nbr of blocks in 64bit pgt_buf elem is at low 32 bits
@@ -389,23 +407,24 @@ int __handle_section_done(uint32_t section_status, struct section *sec)
 						curr_req->start_block_within_tape = 0;
 						// We always want to start reading from 0
 
+						curr_req->device_pgt_offset = 0;
+						curr_req->rewind_state.do_rewind = true;
+						curr_req->rewind_state.overflow_blocks = overflow_blocks;
+						curr_req->rewind_state.inserted_blocks = inserted_blocks;
 						if (overflow_blocks == 0)
 						{
-							curr_req->device_pgt_offset = 0;
 							i++;
+							curr_req->rewind_state.idx = i + 1;
 						}
 						else
 						{
-							pr_err("%s:%u: OVERFLOW_BLOCKS: %llu != 0 \n", __func__, __LINE__, overflow_blocks);
-							pr_err("%s:%u: OVERFLOW_BLOCKS: %llu != 0 \n", __func__, __LINE__, overflow_blocks);
-							pr_err("%s:%u: OVERFLOW_BLOCKS: %llu != 0 \n", __func__, __LINE__, overflow_blocks);
+							curr_req->rewind_state.idx = i;
 							// We have still some more blocks to read from pgt_buf[i]
 							// but inserted blocks, which is our offset might be 
 							// greater than 511, thus we need to calculate new dma
 							// address already shifted by inserted_blocks, so that
 							// our offset is 0 and we will easily read/write overflow
 							// nbr of blocks
-							curr_req->device_pgt_offset = 0;
 
 							uint64_t old_addr = (pgt_buf[i] >> 32) << 9;
 							uint64_t new_addr = old_addr + inserted_blocks * ((uint64_t)sec->blk_size);
@@ -413,18 +432,11 @@ int __handle_section_done(uint32_t section_status, struct section *sec)
 							uint64_t new_pgt_entry = new_addr;
 							new_pgt_entry = new_pgt_entry << 32;
 							new_pgt_entry = new_pgt_entry | (u64)overflow_blocks;
-							pgt_buf[i] = new_pgt_entry;
+
+							curr_req->rewind_state.new_pgt_entry = new_pgt_entry;
 
 						}
 
-						// When creating READ/WRITE cmd we have only 23-31 bits for 
-						// offset in page table counted in BLOCKS, so we can at most 
-						// hold offset of 511 blocks, therefore, if we exceed this 
-						// number our stored value will be truncated and we will get 
-						// incorrect offset.
-						// Thanks to rewinding tape our device block offset will 
-						// always be either 0 or inserted blocks
-						_rewind_pgt(pgt_buf, i, &(curr_req->nents));
 						blocks_in_cmd = 0;
 						break;
 					}

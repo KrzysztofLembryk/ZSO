@@ -46,6 +46,15 @@
 // State must be of type struct req_state
 #define IS_NULL_REQ_STATE(state) (GET_CMD_TYPE(state.cmd) == TAPEDEV_CMD_NONE)
 
+struct rewind_data
+{
+	bool do_rewind;
+	uint64_t overflow_blocks;
+	uint64_t inserted_blocks;
+	uint64_t new_pgt_entry;
+	int idx;
+};
+
 struct req_state
 {
 	uint32_t cmd;
@@ -79,8 +88,7 @@ struct req_state
 
 	// Used to rewind pgt_buf when total_blocks_seen >= 512, otherwise our offset
 	// would be truncated, since we have only bits 23-31 to store offset in a cmd
-	int stopped_at_idx;
-	bool rewind_pgt_buff;
+	struct rewind_data rewind_state;
 };
 
 // Add at the end with - list_add_tail(&node->link, &section->cmd_queue)

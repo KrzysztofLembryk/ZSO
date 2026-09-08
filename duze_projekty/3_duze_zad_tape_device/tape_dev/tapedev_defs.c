@@ -16,6 +16,11 @@ const struct req_state NULL_REQ_STATE = {
 	.left_blocks_in_tape = 0,
 	.device_pgt_offset = 0,
 	.completed = false,
-	.stopped_at_idx = 0,
-	.rewind_pgt_buff = false,
+	.rewind_state = (struct rewind_data) {
+		.do_rewind = false,
+		.overflow_blocks = 0,
+		.inserted_blocks = 0,
+		.idx = 0,
+		.new_pgt_entry = 0
+	},
 };

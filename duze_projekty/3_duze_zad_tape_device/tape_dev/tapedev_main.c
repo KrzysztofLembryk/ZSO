@@ -322,7 +322,7 @@ static int init_req_state(u64 start_sector, int write, int original_nents, int n
 	sec->req_state.original_nents = original_nents;
 	sec->req_state.nents = nents;
 	sec->req_state.completed = false;
-
+	sec->req_state.device_pgt_offset = 0;
 	// pr_warn("%s:%u: Moving to correct pos ENDED\n", __func__, __LINE__);
 	return 0;
 }
@@ -425,12 +425,6 @@ static int do_scatter_gather(struct request *req, u64 start_sector, struct secti
 		uint32_t dma_len = sg_dma_len(sg);
 		uint32_t nbr_of_blocks = dma_len / section_blk_size;
 
-		// if (tape_nbr > sec->n_tapes)
-		// {
-		// 	pr_err("%s:%u: tape_nbr: %u > %u :sec->n_tapes, even though for_each_sg still has more data\n", __func__, __LINE__, tape_nbr, sec->n_tapes);
-		// 	err = BLK_STS_IOERR;
-		// 	goto unmap_sg;
-		// }
 		if (!IS_ALIGNED(dma_addr, 512)) 
 		{
 			pr_err("%s:%u: dma_addr is not 512 byte aligned\n", __func__, __LINE__);
@@ -444,50 +438,9 @@ static int do_scatter_gather(struct request *req, u64 start_sector, struct secti
 			goto unmap_sg;
 		}
 
-		// cmd_total_blocks += nbr_of_blocks;
 		pgt_buf[ent_id] = (dma_addr  >> 9);
 		pgt_buf[ent_id] = pgt_buf[ent_id] << 32;
 		pgt_buf[ent_id] = pgt_buf[ent_id] | ((uint64_t)nbr_of_blocks);
-
-		// if (cmd_total_blocks >= blocks_left_in_tape)
-		// {
-		// 	uint64_t overflow_blocks = cmd_total_blocks - blocks_left_in_tape;
-		// 	uint64_t inserted_blocks = (uint64_t)nbr_of_blocks - overflow_blocks; 
-		// 	cmd_total_blocks = blocks_left_in_tape;
-
-		// 	// We want to store bits 40-9 in high 32 bits
-		// 	// Low 32 bits are for number of blocks to read/write from this address
-		// 	pgt_buf[ent_id] = (dma_addr  >> 9);
-		// 	pgt_buf[ent_id] = pgt_buf[ent_id] << 32;
-		// 	pgt_buf[ent_id] = pgt_buf[ent_id] | (uint64_t)inserted_blocks;
-
-		// 	cmd_start_pos = ent_id + 1;
-		// 	cmd_total_blocks = overflow_blocks;
-		// 	blocks_left_in_tape = blocks_in_tape;
-
-		// 	if (overflow_blocks != 0)
-		// 	{
-		// 		ent_id++;
-
-		// 		if (ent_id > MAX_SG_PGT_ENTRIES)
-		// 		{
-		// 			pr_err("%s:%u: ent_id > MAX_SG_PGT_ENTRIES when overflow blocks \n", __func__, __LINE__);
-		// 			err = BLK_STS_IOERR;
-		// 			goto unmap_sg;
-		// 		}
-	
-		// 		pgt_buf[ent_id] = ((dma_addr + inserted_blocks * section_blk_size) >> 9);
-		// 		pgt_buf[ent_id] = pgt_buf[ent_id] << 32;
-		// 		pgt_buf[ent_id] = pgt_buf[ent_id] | overflow_blocks;
-		// 	}
-		// }
-		// else
-		// {
-		// 	pgt_buf[ent_id] = (dma_addr  >> 9);
-		// 	pgt_buf[ent_id] = pgt_buf[ent_id] << 32;
-		// 	pgt_buf[ent_id] = pgt_buf[ent_id] | ((uint64_t)nbr_of_blocks);
-		// }
-		// ent_id++;
 	}
 
 	// If there are no ioctl commands currently running we must send cmd to tapedev
