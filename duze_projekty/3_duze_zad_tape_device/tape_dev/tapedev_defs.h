@@ -72,7 +72,7 @@ struct req_state
 	// know when to take next tape
 	uint32_t left_blocks_in_tape;
 	// Used for setting correct offset in READ/WRITE commands 
-	uint32_t total_blocks_seen;
+	uint32_t device_pgt_offset;
 
 	// Used to check if request completed, if so, we can end it and free resources
 	bool completed;

@@ -406,13 +406,11 @@ static int do_scatter_gather(struct request *req, u64 start_sector, struct secti
 	}
 
 	struct scatterlist *sg;
-	int ent_id = 0;
-	int _i;
-	int cmd_start_pos = 0;
-	uint32_t cmd_total_blocks = 0;
-	const uint32_t blocks_in_tape = GET_NBR_OF_BLOCKS_IN_TAPE(sec->section_type, sec->blk_size);
-	uint32_t blocks_left_in_tape = blocks_in_tape - start_block_within_tape;
-	uint32_t prev_tape_nbr = tape_nbr;
+	int ent_id;
+	// int cmd_start_pos = 0;
+	// uint32_t cmd_total_blocks = 0;
+	// const uint32_t blocks_in_tape = GET_NBR_OF_BLOCKS_IN_TAPE(sec->section_type, sec->blk_size);
+	// uint32_t blocks_left_in_tape = blocks_in_tape - start_block_within_tape;
 
 	if (init_req_state(start_sector, write, original_nents, nents, sec))
 	{
@@ -421,18 +419,18 @@ static int do_scatter_gather(struct request *req, u64 start_sector, struct secti
 	}
 
 	// Exmpl usage of sg: mtip32xx.c - fill_command_sg
-	for_each_sg(sec->sg_arr, sg, nents, _i)
+	for_each_sg(sec->sg_arr, sg, nents, ent_id)
 	{
 		dma_addr_t dma_addr = sg_dma_address(sg);
 		uint32_t dma_len = sg_dma_len(sg);
 		uint32_t nbr_of_blocks = dma_len / section_blk_size;
 
-		if (tape_nbr > sec->n_tapes)
-		{
-			pr_err("%s:%u: tape_nbr: %u > %u :sec->n_tapes, even though for_each_sg still has more data\n", __func__, __LINE__, tape_nbr, sec->n_tapes);
-			err = BLK_STS_IOERR;
-			goto unmap_sg;
-		}
+		// if (tape_nbr > sec->n_tapes)
+		// {
+		// 	pr_err("%s:%u: tape_nbr: %u > %u :sec->n_tapes, even though for_each_sg still has more data\n", __func__, __LINE__, tape_nbr, sec->n_tapes);
+		// 	err = BLK_STS_IOERR;
+		// 	goto unmap_sg;
+		// }
 		if (!IS_ALIGNED(dma_addr, 512)) 
 		{
 			pr_err("%s:%u: dma_addr is not 512 byte aligned\n", __func__, __LINE__);
@@ -446,55 +444,52 @@ static int do_scatter_gather(struct request *req, u64 start_sector, struct secti
 			goto unmap_sg;
 		}
 
-		// This means that in previous loop step we changed tape 
-		if (prev_tape_nbr < tape_nbr)
-			prev_tape_nbr = tape_nbr;
+		// cmd_total_blocks += nbr_of_blocks;
+		pgt_buf[ent_id] = (dma_addr  >> 9);
+		pgt_buf[ent_id] = pgt_buf[ent_id] << 32;
+		pgt_buf[ent_id] = pgt_buf[ent_id] | ((uint64_t)nbr_of_blocks);
 
-		cmd_total_blocks += nbr_of_blocks;
+		// if (cmd_total_blocks >= blocks_left_in_tape)
+		// {
+		// 	uint64_t overflow_blocks = cmd_total_blocks - blocks_left_in_tape;
+		// 	uint64_t inserted_blocks = (uint64_t)nbr_of_blocks - overflow_blocks; 
+		// 	cmd_total_blocks = blocks_left_in_tape;
 
-		if (cmd_total_blocks >= blocks_left_in_tape)
-		{
-			uint64_t overflow_blocks = cmd_total_blocks - blocks_left_in_tape;
-			uint64_t inserted_blocks = (uint64_t)nbr_of_blocks - overflow_blocks; 
-			cmd_total_blocks = blocks_left_in_tape;
+		// 	// We want to store bits 40-9 in high 32 bits
+		// 	// Low 32 bits are for number of blocks to read/write from this address
+		// 	pgt_buf[ent_id] = (dma_addr  >> 9);
+		// 	pgt_buf[ent_id] = pgt_buf[ent_id] << 32;
+		// 	pgt_buf[ent_id] = pgt_buf[ent_id] | (uint64_t)inserted_blocks;
 
-			// We want to store bits 40-9 in high 32 bits
-			// Low 32 bits are for number of blocks to read/write from this address
-			pgt_buf[ent_id] = (dma_addr  >> 9);
-			pgt_buf[ent_id] = pgt_buf[ent_id] << 32;
-			pgt_buf[ent_id] = pgt_buf[ent_id] | (uint64_t)inserted_blocks;
+		// 	cmd_start_pos = ent_id + 1;
+		// 	cmd_total_blocks = overflow_blocks;
+		// 	blocks_left_in_tape = blocks_in_tape;
 
-			cmd_start_pos = ent_id + 1;
-			cmd_total_blocks = overflow_blocks;
-			blocks_left_in_tape = blocks_in_tape;
-			tape_nbr++;
+		// 	if (overflow_blocks != 0)
+		// 	{
+		// 		ent_id++;
 
-			if (overflow_blocks != 0)
-			{
-				ent_id++;
-
-				if (ent_id > MAX_SG_PGT_ENTRIES)
-				{
-					pr_err("%s:%u: ent_id > MAX_SG_PGT_ENTRIES when overflow blocks \n", __func__, __LINE__);
-					err = BLK_STS_IOERR;
-					goto unmap_sg;
-				}
+		// 		if (ent_id > MAX_SG_PGT_ENTRIES)
+		// 		{
+		// 			pr_err("%s:%u: ent_id > MAX_SG_PGT_ENTRIES when overflow blocks \n", __func__, __LINE__);
+		// 			err = BLK_STS_IOERR;
+		// 			goto unmap_sg;
+		// 		}
 	
-				pgt_buf[ent_id] = ((dma_addr + inserted_blocks * section_blk_size) >> 9);
-				pgt_buf[ent_id] = pgt_buf[ent_id] << 32;
-				pgt_buf[ent_id] = pgt_buf[ent_id] | overflow_blocks;
-			}
-		}
-		else
-		{
-			pgt_buf[ent_id] = (dma_addr  >> 9);
-			pgt_buf[ent_id] = pgt_buf[ent_id] << 32;
-			pgt_buf[ent_id] = pgt_buf[ent_id] | ((uint64_t)nbr_of_blocks);
-		}
-		ent_id++;
+		// 		pgt_buf[ent_id] = ((dma_addr + inserted_blocks * section_blk_size) >> 9);
+		// 		pgt_buf[ent_id] = pgt_buf[ent_id] << 32;
+		// 		pgt_buf[ent_id] = pgt_buf[ent_id] | overflow_blocks;
+		// 	}
+		// }
+		// else
+		// {
+		// 	pgt_buf[ent_id] = (dma_addr  >> 9);
+		// 	pgt_buf[ent_id] = pgt_buf[ent_id] << 32;
+		// 	pgt_buf[ent_id] = pgt_buf[ent_id] | ((uint64_t)nbr_of_blocks);
+		// }
+		// ent_id++;
 	}
 
-	sec->req_state.nents = ent_id;
 	// If there are no ioctl commands currently running we must send cmd to tapedev
 	// to start the execution of our request
 	// If there are some ioctl cmds running, they will see that there is request 

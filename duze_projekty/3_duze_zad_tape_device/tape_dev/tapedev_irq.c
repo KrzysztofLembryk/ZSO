@@ -243,6 +243,24 @@ int __handle_section_error(uint32_t section_status, struct section *sec)
 	return -err;
 }
 
+static int _rewind_pgt(uint64_t *pgt_buf, int start_idx, int *nents)
+{
+	if (start_idx > *nents)
+		return -1;
+
+	for (int i = start_idx; i < *nents; i++)
+	{
+		pgt_buf[i - start_idx] = pgt_buf[i];
+	}
+
+	// first start_idx elements will be discarded, since we move all of the elements
+	// starting with element at start_idx to the LEFT
+	*nents = *nents - start_idx;
+
+	pr_warn("%s:%u: start_idx: %d, nents_left: %d \n", __func__, __LINE__, start_idx, *nents);
+	return 0;
+}
+
 // To use this function you MUST FIRST ACQUIRE LOCK
 int __handle_section_done(uint32_t section_status, struct section *sec)
 {
@@ -340,74 +358,85 @@ int __handle_section_done(uint32_t section_status, struct section *sec)
 			}
 			else
 			{
-				pr_warn("%s:%u: cmd DONE: TAPEDEV_CMD_FAST_FWD. tape: %u forwarded by %u blocks\n", __func__, __LINE__, tape_nbr, curr_cmd_body >> 8);
-
 				uint64_t *pgt_buf = sec->cpu_dma_buf;
-				uint32_t n_blocks_in_cmd = 0;
+				uint32_t blocks_in_cmd = 0;
+
 				for (int i = curr_req->sg_idx; i < curr_req->nents; i++)
 				{
 					// nbr of blocks in 64bit pgt_buf elem is at low 32 bits
 					uint32_t n_blocks = (uint32_t)(pgt_buf[i] & 0xffffffffULL);
 
+					blocks_in_cmd += n_blocks;
 
-					n_blocks_in_cmd += n_blocks;
-
-					// We should have exactly this number of commands, since when 
-					// populating pgt_buf we partitioned it in this way 
-					if (n_blocks_in_cmd >= curr_req->left_blocks_in_tape)
+					if (blocks_in_cmd >= curr_req->left_blocks_in_tape)
 					{
+						pr_warn("%s:%u: blocks_in_cmd: %u >= %u : left_blks_in_tape rewinded \n", __func__, __LINE__, blocks_in_cmd, curr_req->left_blocks_in_tape);
+
+						uint64_t overflow_blocks = 
+							blocks_in_cmd - curr_req->left_blocks_in_tape;
+						uint64_t inserted_blocks = n_blocks - overflow_blocks;
+						blocks_in_cmd = curr_req->left_blocks_in_tape;
+
 						uint32_t cmd = create_tapedev_cmd(
 							curr_req->is_write ? TAPEDEV_CMD_WRITE : TAPEDEV_CMD_READ, 
-							curr_req->total_blocks_seen, 
-							n_blocks_in_cmd
+							curr_req->device_pgt_offset, 
+							blocks_in_cmd
 						);
-						curr_req->sg_idx = i + 1;
+						curr_req->sg_idx = 0;
 						curr_req->cmd = cmd;
 						curr_req->left_blocks_in_tape = curr_req->total_blocks_in_tape;
 						curr_req->tape_nbr++;
 						curr_req->start_block_within_tape = 0;
-						n_blocks_in_cmd = 0;
+						// We always want to start reading from 0
 
-						curr_req->total_blocks_seen += n_blocks;
-
-						// When creating READ/WRITE cmd we have only 23-31 bits for 
-						// offset in page table counted in BLOCKS, so we can at most hold
-						// offset of 511 blocks, therefore, if we exceed this number our
-						// stored value will be truncated and we will get incorrect 
-						// offset
-						if (curr_req->total_blocks_seen >= 512)
+						if (overflow_blocks == 0)
 						{
-							curr_req->total_blocks_seen -= n_blocks;
-							curr_req->stopped_at_idx = i;
-							curr_req->rewind_pgt_buff = true;
-							uint32_t cmd = create_tapedev_cmd(
-								curr_req->is_write ? TAPEDEV_CMD_WRITE : TAPEDEV_CMD_READ, 
-								curr_req->total_blocks_seen, 
-								n_blocks_in_cmd
-							);
-							curr_req->cmd = cmd;
-							curr_req->left_blocks_in_tape = curr_req->total_blocks_in_tape - n_blocks_in_cmd;
-							break;
+							curr_req->device_pgt_offset = 0;
+							i++;
+						}
+						else
+						{
+							pr_err("%s:%u: OVERFLOW_BLOCKS: %llu != 0 \n", __func__, __LINE__, overflow_blocks);
+							pr_err("%s:%u: OVERFLOW_BLOCKS: %llu != 0 \n", __func__, __LINE__, overflow_blocks);
+							pr_err("%s:%u: OVERFLOW_BLOCKS: %llu != 0 \n", __func__, __LINE__, overflow_blocks);
+							// We have still some more blocks to read from pgt_buf[i]
+							// but inserted blocks, which is our offset might be 
+							// greater than 511, thus we need to calculate new dma
+							// address already shifted by inserted_blocks, so that
+							// our offset is 0 and we will easily read/write overflow
+							// nbr of blocks
+							curr_req->device_pgt_offset = 0;
+
+							uint64_t old_addr = (pgt_buf[i] >> 32) << 9;
+							uint64_t new_addr = old_addr + inserted_blocks * ((uint64_t)sec->blk_size);
+							new_addr = new_addr >> 9;
+							uint64_t new_pgt_entry = new_addr;
+							new_pgt_entry = new_pgt_entry << 32;
+							new_pgt_entry = new_pgt_entry | (u64)overflow_blocks;
+							pgt_buf[i] = new_pgt_entry;
+
 						}
 
+						// When creating READ/WRITE cmd we have only 23-31 bits for 
+						// offset in page table counted in BLOCKS, so we can at most 
+						// hold offset of 511 blocks, therefore, if we exceed this 
+						// number our stored value will be truncated and we will get 
+						// incorrect offset.
+						// Thanks to rewinding tape our device block offset will 
+						// always be either 0 or inserted blocks
+						_rewind_pgt(pgt_buf, i, &(curr_req->nents));
+						blocks_in_cmd = 0;
 						break;
-					}
-					else if (n_blocks_in_cmd > curr_req->left_blocks_in_tape)
-					{
-						pr_err("%s:%u: n_blocks_in_cmd > curr_req->left_blocks_in_tape, THIS SHOULD NEVER HAPPEN, there is a logic error somewhere\n", __func__, __LINE__);
-						_end_request(sec, BLK_STS_IOERR);
-						err = -2;
-						goto ret;
 					}
 				}
 
-				if (n_blocks_in_cmd != 0)			
+				if (blocks_in_cmd != 0)			
 				{
 					// we will be sending LAST cmd, no more blocks
 					uint32_t cmd = create_tapedev_cmd(
 						curr_req->is_write ? TAPEDEV_CMD_WRITE : TAPEDEV_CMD_READ, 
-						curr_req->total_blocks_seen, 
-						n_blocks_in_cmd
+						curr_req->device_pgt_offset, 
+						blocks_in_cmd
 					);
 					curr_req->sg_idx = curr_req->nents;
 					curr_req->cmd = cmd;
