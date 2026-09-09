@@ -63,7 +63,7 @@ struct req_state
 	bool is_ioctl;
 	bool is_being_executed;
 
-	// Current idx we must use when iterating pgt_buf
+	// Current idx needed to know when there are no more entities to read in request
 	int sg_idx;
 	// Needed to unmap dmap
 	int original_nents;
@@ -144,11 +144,8 @@ struct tapedev_device {
 	void __iomem *bar;
 	spinlock_t s_lock;
 	uint32_t n_sections;
-	// struct gendisk *parent_gdisk;
 	// An array of sections, from 1 to 8 sections
 	struct section **sections;
-	// struct list_head buffers_free;
-	// struct list_head buffers_running;
 	wait_queue_head_t wq_free;
 	wait_queue_head_t wq_idle;
 	int init_done;	/* 0 - not done, 1 - done, -1 - failed*/

@@ -1,7 +1,6 @@
 #include "linux/blkdev.h"
 #include "linux/dma-mapping.h"
 #include "linux/list.h"
-#include "linux/page-flags.h"
 #include "linux/scatterlist.h"
 #include "tapedev.h"
 #include "linux/blk-mq.h"
@@ -54,38 +53,13 @@ int _handle_tapedev_init(uint32_t ir_status, struct tapedev_device *dev);
 // ############################## HANDLING INTERRUPTS ##############################
 // #################################################################################
 
-// 1) For kernel to allow us to use interrupts we need to invoke request_irq 
-// function, to do so we need to implement interrupt handler:
-// int request_irq(
-// 	unsigned int irq, -- interrupt number being requested
-// 	irqreturn_t (*handler)(int, void *, struct pt_regs *), -- ptr to handling func
-// 	unsigned long flags, -- options related to interrupt management
-// 	const char *dev_name, 
-// 	void *dev_id -- often points to our device struct: dev
-// );
-
-
-// TODO: maybe we should move it to tapedev_irq, or leave it here as a main interrupt
-// function
 static irqreturn_t tapedev_interrupt_handler(int irq, void *opaque_dev)
 {
-	// When invoking request_irq we passed tapedev_device*, however internally it was
-	// cast to void* and now we get this void* in interrupt handling function 
-	// so we need to cast it back
+	// When invoking request_irq we passed tapedev_device*, and it's stored in 
+	// opaque_dev now 
 	struct tapedev_device *dev = opaque_dev;
 	unsigned long flags;
 	uint32_t ir_status;
-
-	// TOdo:
-	// We must add here an if else statement checking if tapedev already initialized
-	// if intiialized we skip checking init_done flag
-	// And only check HW_ERROR, TAPEDEV_IRQ_SECT_X_DONE and TAPEDEV_IRQ_SECT_X_ERROR
-	// We should do this in a loop and add macros (that make substitution for x with 
-	// 0, 1, ... in TAPEDEV_IRQ_SECT_X_DONE) to this loop so that all done 
-	// sections are handled in this interrupt, and after all sections are done, and 
-	// we save its data or sth we take next command from some queue and make our 
-	// tapedev do another command
-
 	
 	// saves the interrupt state before taking the spin lock
 	spin_lock_irqsave(&dev->s_lock, flags);
@@ -105,7 +79,7 @@ static irqreturn_t tapedev_interrupt_handler(int irq, void *opaque_dev)
 	// #############################################################################
 
 	uint32_t is_hw_error = ir_status & (1 << TAPEDEV_IRQ_HW_ERROR);
-	// We always need to clear interrupt flag for given interrupt, so that this 
+	// !! We always need to clear interrupt flag for given interrupt, so that this 
 	// interrupt is not fired endlessly
 	if (is_hw_error)
 	{
@@ -124,13 +98,9 @@ static irqreturn_t tapedev_interrupt_handler(int irq, void *opaque_dev)
 	// 	We can check all TAPEDEV_IRQ_SECT_X_DONE and TAPEDEV_IRQ_SECT_X_ERROR 
 	// #############################################################################
 
-	// Max allowed number of sections is 8, we should check this
-	// We have this stored inside section
-
 	if (handle_sections_interrupts(ir_status, num_sections, dev))
 		return IRQ_NONE;
 
-	// return IRQ_RETVAL(ir_status);
 	return IRQ_HANDLED;
 }
 
@@ -151,20 +121,18 @@ static void tapedev_disk_release(struct gendisk *gd)
     return;
 }
 
-
+// Struct needed for IOCTL command
 struct tapedev_sect_info {
     uint32_t tapes;
     uint32_t tape_type;
     uint32_t current_tape;
 };
 
-// #define ioctl_cmd_name 	_IOX (type, nr, dataitem)
 #define TAPEDEV_IOCTL_GET_INFO             _IOR('~', 0, struct tapedev_sect_info)
 #define TAPEDEV_IOCTL_EJECT_TAPE           _IO('~', 1)
 
-// drivers/block/swim.c has floppy_ioctl impl for blk_dev
-// We assume that under variable: arg, user supplied ptr to buffer to which he wants
-// data to be written
+// Under variable: arg, user supplied ptr to buffer to which he wants data to be 
+// written
 static int tapedev_ioctl(struct block_device *bdev, blk_mode_t mode, unsigned cmd, unsigned long arg)
 {
 	// bd_disk is gendisk
@@ -197,6 +165,7 @@ static int tapedev_ioctl(struct block_device *bdev, blk_mode_t mode, unsigned cm
 	}
 	case TAPEDEV_IOCTL_EJECT_TAPE:
 	{
+		// We must alloc node BEFORE acquiring lock since kzalloc may sleep
 		struct lst_node *node = kzalloc(sizeof(*node), GFP_KERNEL);
 		if (!node) 
 		{
@@ -207,15 +176,14 @@ static int tapedev_ioctl(struct block_device *bdev, blk_mode_t mode, unsigned cm
 
 		pr_info("%s:%u: got EJECT_TAPE ioctl cmd for section %u)\n", __func__, __LINE__, sec->idx);
 
-
 		node->cmd = (struct req_state) {
 			.cmd = TAPEDEV_CMD_EJECT_TAPE,
 			.is_ioctl = true,
 			.is_being_executed = false,
 		};
-		// We must send command to the section ONLY when command list is empty  
-		// otherwise our command will be done in near future, we just add it at the
-		// end of the queue
+		// We send command to the section ONLY when command list is empty AND
+		// there is no request (req == NULL) otherwise our command will be done in 
+		// near future, we just add it at the end of the queue
 		list_add_tail(&node->lst_link, &sec->ioctl_cmd_queue_head);
 
 		if (sec->req == NULL && list_count_nodes(&sec->ioctl_cmd_queue_head) == 1)
@@ -224,6 +192,7 @@ static int tapedev_ioctl(struct block_device *bdev, blk_mode_t mode, unsigned cm
 			section_send_cmd(TAPEDEV_CMD_EJECT_TAPE, sec);
 		}
 		
+		// We wait for our command to be completed
 		while (!sec->ioctl_cmd_done) 
 		{
 			spin_unlock_irqrestore(&sec->lock, flags);
@@ -246,7 +215,6 @@ static int tapedev_ioctl(struct block_device *bdev, blk_mode_t mode, unsigned cm
 		}
 
 		sec->ioctl_status = IOCTL_STATUS_OK;
-		// Once current tape is 0, we return success
 		spin_unlock_irqrestore(&sec->lock, flags);
 		return 0;
 	}
@@ -269,15 +237,16 @@ static int calc_start_block_within_section(u64 start_sector, uint32_t *start_blo
 	uint32_t tape_512byte_sectors = SIZE_OF_TAPE(sec->section_type) / 512;
 	uint32_t block_512byte_sectors = sec->blk_size / 512;
 
-	// We count sectors from 0
+	// We count sectors from 0, thus last sector idx is section_512byte_sectors - 1
 	if (start_sector >= section_512byte_sectors)
 	{
 		pr_err("%s:%u: start_sector: %llu >= %u all_sectors available in this section\n", __func__, __LINE__, start_sector, section_512byte_sectors);
 		return -EINVAL;
 	}
 
-	// We count tapes starting from 1
+	// We count tapes starting from 1, 0 means no tape
 	*tape_nbr = start_sector / tape_512byte_sectors + 1;
+	// Once we have tape_nbr we must calculate sector within that tape, 
 	uint32_t start_sector_in_tape = start_sector % tape_512byte_sectors;
 
 	if (start_sector_in_tape % block_512byte_sectors != 0) {
@@ -285,6 +254,9 @@ static int calc_start_block_within_section(u64 start_sector, uint32_t *start_blo
         return -EINVAL;
     }
 
+	// Our device works in BLOCKS, thus knowing how big block is we calculate how 
+	// many blocks there are in the tape, than we calculate STARTING block based
+	// on our starting sector
 	*start_block_within_tape = start_sector_in_tape / block_512byte_sectors;
 
 	return 0;
@@ -295,8 +267,6 @@ static int calc_start_block_within_section(u64 start_sector, uint32_t *start_blo
 */
 static int init_req_state(u64 start_sector, int write, int original_nents, int nents, struct section *sec)
 {
-	pr_warn("%s:%u: Initializing request state\n", __func__, __LINE__);
-
 	uint32_t tape_nbr; 
 	uint32_t start_block_within_tape;
 	uint32_t cmd;
@@ -340,39 +310,11 @@ static int init_req_state(u64 start_sector, int write, int original_nents, int n
 	return 0;
 }
 
+/*
+	SECTION LOCK must be acquired before using this function
+*/
 static int do_scatter_gather(struct request *req, u64 start_sector, struct section *sec, int write)
 {
-	/*
-		What is struct bio_vec - a contiguous range of physical memory addresses
-		@bv_page:   First page associated with the address range.
-		@bv_len:    Number of bytes in the address range.
-		@bv_offset: Start of the address range relative to the start of @bv_page.
-				in bv_page might be data we dont want, thus we start reading from offset to read only specific data we want from this page
-				
-				page 
-			-------------
-			|			|
-			| some data	|
-			|			|
-			-------------  --
-			|  offset	|   |
-			|			|   |
-			| our data	|	| bv_len
-			|			|	|
-			|			|	|
-			-------------  --
-			|			|
-			| some data |
-			|			|
-			-------------
-	
-		All pages within a bio_vec starting from @bv_page are contiguous and
-		can simply be iterated.
-
-		Basically one request stores a list of bio, each bio stores a list of 
-		bio_vecs, and each bio_vec knows which part of given page we want to 
-		read/write
-	*/
 	int err = BLK_STS_OK;
 	struct tapedev_device *dev = sec->private_data; 
 	uint64_t *pgt_buf = sec->cpu_dma_buf;
@@ -387,14 +329,15 @@ static int do_scatter_gather(struct request *req, u64 start_sector, struct secti
 	}
 
 	pr_warn("%s:%u: DOING SCATTER GATHER section: %u, section size bytes: %u,blk_size: %u, one tape has: %u sectors \n", __func__, __LINE__, sec->idx, SIZE_OF_SECTION_IN_BYTES(sec->section_type, sec->n_tapes), section_blk_size, (SIZE_OF_TAPE(sec->section_type) / 512));
-	// 	kmalloc inside queue_rq is BAD --> what we should do is preallocate sg
-	// 	array inside requests private memory,
 
+	// We cannot use kmalloc inside queue_rq because it may SLEEP, that's why in 
+	// section struct we have pre-allocated sg array 
 	// Clears provided ptr and initializes in 
 	sg_init_table(sec->sg_arr, MAX_SG_PGT_ENTRIES);
 
 	int original_nents = blk_rq_map_sg(req, sec->sg_arr);
-	// nents might be less than original_nents, if its 0 it means error
+	// nents might be less than original_nents because dma_map_sg might merge 
+	// requests if they span continuous memory, if its 0 it means error
 	int nents = dma_map_sg(
 		&dev->pdev->dev, 
 		sec->sg_arr, 
@@ -423,6 +366,29 @@ static int do_scatter_gather(struct request *req, u64 start_sector, struct secti
 	}
 
 	// Exmpl usage of sg: mtip32xx.c - fill_command_sg
+	// In uint64_t *pgt_buf we store dma addresses of our request and how many blocks
+	// of section_size we must read from this address.
+	// In high 32 bits we store 9-40 bits of dma_addr, dma_addr are 512byte aligned
+	// so first 9 bits are zeroed. In low 32 bits we store number of blocks to read
+	// from this address.
+	// 
+	//			page 
+	//		-------------
+	//		|			|
+	//		| some data	|
+	//		|			|
+	//		-------------  -- dma_addr
+	//		| 	blk_1   |	|
+	//		| 	blk_2	|   |
+	//		| 	blk_3	|	| dma_len
+	//		|	blk_4	|	|
+	//		|	blk_5	|	|
+	//		-------------  --
+	//		|			|
+	//		| some data |
+	//		|			|
+	//		-------------
+	// From pgt_buf our tapedev will know from where to read/write
 	for_each_sg(sec->sg_arr, sg, nents, ent_id)
 	{
 		dma_addr_t dma_addr = sg_dma_address(sg);
@@ -476,7 +442,6 @@ fail:
 	return err;
 }
 
-
 /*
 	SECTION LOCK must be acquired before using this function
 */
@@ -484,8 +449,7 @@ static inline int submit_request_sg(struct request *req, struct section *sec)
 {
 	int err = BLK_STS_OK;
 
-
-	pr_warn("%s:%u: START submit_request_sg\n", __func__, __LINE__);
+	pr_warn("%s:%u: START submit_request_sg, section: %u\n", __func__, __LINE__, sec->idx);
 
 	// start sector is always in 512byte sectors (we set that value in queue_lim)
 	// i.e.
@@ -496,12 +460,6 @@ static inline int submit_request_sg(struct request *req, struct section *sec)
 	// | 				  | 
 	// | ----------- 1023 |
 	uint64_t start_sector = blk_rq_pos(req); 
-
-	// TODO: ADD SANITY CHECKS EVERYWHERE whether given addresses are 512byte aligned
-
-	// We must create sequence of commands and blk_mq_tag_set add the to the cmd queue
-	// After set_section_start_pos if we had a lock we still have it
-
 	int is_write;
 
 	switch (req_op(req)) 
@@ -539,7 +497,7 @@ static inline int process_request(struct request *req, struct section *sec)
 	switch (req_op(req)) {
 	case REQ_OP_READ:
 	case REQ_OP_WRITE:
-		pr_warn("%s:%u: got READ/WRITE request\n", __func__, __LINE__);
+		pr_warn("%s:%u: got READ/WRITE request, section: %u\n", __func__, __LINE__, sec->idx);
 		return submit_request_sg(req, sec);
 	default:
 		pr_err("%s:%u :: unsupported request type: %d\n", __func__, __LINE__, req_op(req));
@@ -616,7 +574,7 @@ static int tapedev_probe(
 	init_waitqueue_head(&tape_dev->wq_free);
 	init_waitqueue_head(&tape_dev->wq_idle);
 
-	// lock needed here since we may have many tapedevs added simultaneously
+	// Lock needed here since we may have many tapedevs added simultaneously.
 	// We allow many tapedev devices, but every such device we need to store 
 	// somewhere, so now we find first free index for our newly created device
 	mutex_lock(&tapedev_devices_lock);
@@ -655,13 +613,16 @@ static int tapedev_probe(
 	// We configure the DMA address range, which device can use for both streaming 
 	// and coherent DMA operations.
 	// (coherent - memory that is always visible to both the CPU and device without 
-	// 	explicit cache managemen)
+	// 	explicit cache management, from cpu perspective its just a simple array of 
+	// 	data, in it we will store dma addresses from which tapedev will read/write)
 	// Our tapedevices support 32 bit registers
 
-	// Our device has only 32-bit registers, so DMA mask needs to be 32 bit, thanks
-	// to that address returned by dma_alloc_coherent should be valid 32bit address 
-	// aligned to 512byte boundary stored in 64bit variable, meaning after shifting 
-	// 9 bits to the right we should get correct 32bit address
+	// In read/write requests we pass dma addresses in 32 high bits, but only 9-40 
+	// bits of dma address, dma address is 512byte aligned so first 9bits are 
+	// zeroed, DMA mask needs to be 41 bit so that it can store whole dma address 
+	// first 9 bits and 9-40 bits too.
+	// Address returned by dma_alloc_coherent should be valid 41bit address 
+	// aligned to 512byte boundary stored in 64bit variable, 
 	if ((err = dma_set_mask_and_coherent(&pdev->dev, DMA_BIT_MASK(41))))
 		goto out_dma_mask;
 
@@ -715,7 +676,6 @@ static int tapedev_probe(
 	unsigned long flags;
 	spin_lock_irqsave(&tape_dev->s_lock, flags);
 
-	// TODO: we shouldn't return here, it skips cleanup path, we should use goto
 	long wait_ret;
 	while (!tape_dev->init_done) 
 	{
@@ -749,10 +709,9 @@ static int tapedev_probe(
 
 	spin_unlock_irqrestore(&tape_dev->s_lock, flags);
 
-	pr_warn("%s:%u: device enabled, returned from waiting\n", __func__, __LINE__);
 	// After enabling device we need to read num_sections data from it
 	uint32_t num_sections = tapedev_ior(tape_dev, TAPEDEV_SECTIONS_ADDR);
-	pr_warn("%s:%u: device n_sections AFTER successfu; enabling the device: %u \n", __func__, __LINE__, num_sections);
+	pr_warn("%s:%u: device n_sections: %u \n", __func__, __LINE__, num_sections);
 
 	if (num_sections <= 0 || num_sections > 8)
 	{
@@ -774,14 +733,12 @@ static int tapedev_probe(
 		goto sections_alloc_fail;
 	}
 
+	// We create sections structs, allocate memory, gdisks for them etc. but we do
+	// not add disks yet
 	err = create_sections(tape_dev, num_sections);
 	if (err) goto free_sections;
 
-	pr_warn("%s:%u: after create_sections\n", __func__, __LINE__);
-
 	uint32_t irq_mask = (0xffffffff ^ (1 << TAPEDEV_IRQ_INIT_DONE)) ^ (1 << TAPEDEV_IRQ_HW_ERROR);
-
-	// TODO: add helper function: _enable_dev_interrupts
 
 	// Now we enable interrupts for this device's sections
 	for (int sec_id = 0; sec_id < num_sections; sec_id++)
@@ -796,14 +753,11 @@ static int tapedev_probe(
 		irq_mask	
 	);
 
-	// TODO: add helper function: _set_dma_hw_buff
-
 	// And now for each section we need to set its dma address, they need to be 
 	// aligned to 512 byte boundary
 	// Explanation of alignment (stackoverflow): 4-alignment simply means that the 
 	// pointer, when considered as a numeric address, is a multiple of 4. If the 
 	// pointer is not a multiple of the required alignment, then it is unaligned. 
-	pr_warn("%s:%u: setting section buffer ptr addresses\n", __func__, __LINE__);
 	for (int sec_id = 0; sec_id < num_sections; sec_id++)
 	{
 		// dma_addr is 64, it is 512 byte aligned, so bits 0-8 are zeroed, 
@@ -813,7 +767,6 @@ static int tapedev_probe(
 		if (!IS_ALIGNED(tape_dev->sections[sec_id]->dma_addr, 512))
 		{
 			pr_err("%s:%u: section: %u, dma_addr is not 512 aligned\n", __func__, __LINE__, sec_id);
-			// TODO: here we should free our sections CORRECTLY, not only tapedev->sections, but alos what is allocated INSIDE section struct
 			goto free_sections;
 		}
 		uint32_t dma_hw_buf_addr = 
@@ -823,11 +776,8 @@ static int tapedev_probe(
 			TAPEDEV_SECT_BUFFER_PTR_ADDR, dma_hw_buf_addr);
 	}
 
-	pr_warn("%s:%u: BEFORE add_section_disks\n", __func__, __LINE__);
 	err = add_section_disks(tape_dev, num_sections);
 	if (err) goto free_sections;
-
-	pr_warn("%s:%u: after add_section_disks\n", __func__, __LINE__);
 
 	return 0;
 free_sections:
@@ -858,6 +808,7 @@ static void _free_section(struct section *sec, bool was_disk_added)
 	struct tapedev_device *tape_dev = sec->private_data;
 
 	// TODO: maybe we should acquire lock here
+
 	// put_disk decrements gendisk refcount, if it reaches 0 gendisk is 
 	// freed.
 	// If haven't used add_disk, we wouldn't need to use del_gendisk
@@ -975,11 +926,6 @@ static void cleanup_tapedev(void)
 }
 module_init(init_tapedev);
 module_exit(cleanup_tapedev);
-
-
-/*
-	We expect passed section to be successfully allocated
-*/
 
 // Each tape type is a separate section with gdisk which is our block device, 
 // tape_types":[0,1,2,3,4],"tapes":[50,40,30,20,10]}
@@ -1128,7 +1074,6 @@ int create_sections(struct tapedev_device *tape_dev, int num_sections)
 	for (s_id = 0; s_id < num_sections; s_id++)
 	{
 		uint32_t n_tapes = section_ior(tape_dev, GET_SECTION_ADDR(s_id),TAPEDEV_SECT_TAPES_ADDR);
-		// Todo: add checking if section type is within allowed range
 		uint32_t sec_type = section_ior(tape_dev, GET_SECTION_ADDR(s_id),TAPEDEV_SECT_TAPE_SIZE_ADDR);
 
 		pr_info("create_sections :: s_id: %u, n_tapes: %u, sec_type: %u\n", s_id, n_tapes, sec_type);
@@ -1159,8 +1104,6 @@ int add_section_disks(struct tapedev_device *tape_dev, int num_sections)
 	for (s_id = 0; s_id < num_sections; s_id++)
 	{
 		pr_warn("%s:%u: adding section: %u\n", __func__, __LINE__,  s_id);
-		// err = device_add_disk(&tape_dev->pdev->dev, tape_dev->sections[s_id]->gdisk, NULL);
-		// pr_info("%s:%u: adding disk for section: %d \n", __func__, __LINE__, s_id);
 		// Once we expose block devices with add_disk(), block layer issues a read of
 		// sector 0 to look for a partition table or filesystem signature. This is 
 		// why before running tests or anything and after insmod I got READ commands
@@ -1225,13 +1168,10 @@ int _handle_tapedev_init(uint32_t ir_status, struct tapedev_device *dev)
 		{
 			
 			uint32_t n_tapes = section_ior(dev, GET_SECTION_ADDR(s_id),TAPEDEV_SECT_TAPES_ADDR);
-			// Todo: add checking if section type is within allowed range
 			uint32_t sec_type = section_ior(dev, GET_SECTION_ADDR(s_id),TAPEDEV_SECT_TAPE_SIZE_ADDR);
 			pr_info("%s:%u: section type: %u, num of tapes: %u\n", __func__, __LINE__, sec_type, n_tapes);
 		}
 
-		// TODO: maybe we should check if any HW error happened? But if init was
-		// successful, maybe we don't have to do it.
 		wake_up(&dev->wq_idle);
 		return IRQ_HANDLED;
 	}
@@ -1245,7 +1185,6 @@ int _handle_tapedev_init(uint32_t ir_status, struct tapedev_device *dev)
 		return IRQ_NONE;
 	}
 }
-
 
 MODULE_LICENSE("GPL");
 MODULE_AUTHOR("Krzysztof Lembryk");

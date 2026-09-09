@@ -29,7 +29,7 @@ int handle_sections_interrupts(uint32_t ir_status, uint32_t num_sections, struct
 		struct section *sec = dev->sections[sec_id];
 		
 		// section_done might have big value since we get exact bit that was set,
-		// thus we just check if value is greater than 0, if yes we section is done 
+		// thus we just check if value is greater than 0, if yes section is done 
 
 		section_done = (ir_status & (1 << TAPEDEV_IRQ_SECT_X_DONE(sec_id))) > 0;
 		section_error = (ir_status & (1 << TAPEDEV_IRQ_SECT_X_ERROR(sec_id))) > 0;
@@ -49,7 +49,6 @@ int handle_sections_interrupts(uint32_t ir_status, uint32_t num_sections, struct
 		{
 			pr_err("Section: %d handler error: %d\n", sec_id, err);
 		}
-		// if section currently working we do nothing
 	}
 	return err;
 }
@@ -67,8 +66,6 @@ int _handle_section_interrupt(uint32_t section_done, uint32_t section_error, uin
 	if (section_error)
 	{
 		clear_sec_err_intrpt(sec);
-		// After getting error from CURR_CMD we need to check if there are any eject 
-		// requests or start next_cmd 
 		err = __handle_section_error(section_status, sec);
 	}
 	else if (section_done)
@@ -88,9 +85,9 @@ int _handle_section_interrupt(uint32_t section_done, uint32_t section_error, uin
 		goto release_lock;
 	}
 
-	// After handling curr command if it was DONE, we schedule next command in 
-	// cmd_queue if present 
-	// If we got ERROR we probably should ABORT all next commands (apart from ioctl?)
+	// After handling curr command we schedule next command if present (section DONE 
+	// sets next command if there is one, section ERROR aborts all of the commands, 
+	// apart from ioctl commands that are still waiting on the queue)
 	__handle_next_cmd(sec);
 
 release_lock:
@@ -283,7 +280,7 @@ static void _handle_read_write(struct req_state *curr_req, struct section *sec)
 			// number our stored value will be truncated and we will get 
 			// incorrect block offset passed to our device.
 			// This will happen often since request can span LOADS of blocks.
-			// Thanks to rewinding tape our device block offset will 
+			// Thanks to rewinding pgt_buf our device block offset will 
 			// always be 0.
 
 			if (curr_req->rewind_state.overflow_blocks != 0)
@@ -374,7 +371,8 @@ static void _handle_read_write(struct req_state *curr_req, struct section *sec)
 				curr_req->device_pgt_offset, 
 				blocks_in_cmd
 			);
-			// Thanks to this assignment we will go into completed branch
+			// Thanks to this assignment we will go into completed branch once the
+			// command ends
 			curr_req->sg_idx = curr_req->nents;
 			curr_req->cmd = cmd;
 		}
@@ -484,8 +482,8 @@ ret:
 // To use this function you MUST FIRST ACQUIRE LOCK
 void __handle_next_cmd(struct section *sec)
 {
-	// If we have request we do request (both of these checks should have ALWAYS
-	// the same value)
+	// If we have request we do request, it has priority over ioctl commands 
+	// (both of these checks should have ALWAYS the same value)
 	if (sec->req != NULL && !IS_NULL_REQ_STATE(sec->req_state))
 	{
 		sec->req_state.is_being_executed = true;
@@ -493,6 +491,9 @@ void __handle_next_cmd(struct section *sec)
 	}
 	else if (!list_empty(&sec->ioctl_cmd_queue_head))
 	{
+		// If there is no request we can do ioctl command, after completing one 
+		// request we ALWAYS will schedule IOCTL request if present, in that way we 
+		// won't starve those requests.
 		pr_warn("%s:%u: next cmd is IOCTL for section: %u\n", __func__, __LINE__, sec->idx);
 		struct lst_node *node = list_first_entry(&sec->ioctl_cmd_queue_head, struct lst_node, lst_link);
 		node->cmd.is_being_executed = true;
