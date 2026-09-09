@@ -840,6 +840,14 @@ static void tapedev_remove(struct pci_dev *pdev)
 	pr_info("%s:%u: removing tape device: '%d'\n", __func__, __LINE__, tape_dev->idx);
 
 	tapedev_iow(tape_dev, TAPEDEV_ENABLE_ADDR, 0);
+
+	// We wait for device to shutdown before proceeding to remove rest of resources
+	wait_event_interruptible_timeout(
+		tape_dev->wq_idle,
+		tapedev_ior(tape_dev, TAPEDEV_STATUS_ADDR) == TAPEDEV_STATUS_DISABLED,
+		msecs_to_jiffies(1000)
+	);
+
 	free_irq(pdev->irq, tape_dev);
 
 	for (int s_id = 0; s_id < tape_dev->n_sections; s_id++)
