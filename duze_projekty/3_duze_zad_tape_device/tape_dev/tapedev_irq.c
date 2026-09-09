@@ -64,14 +64,6 @@ int _handle_section_interrupt(uint32_t section_done, uint32_t section_error, uin
 	unsigned long flags;
 	spin_lock_irqsave(&sec->lock, flags);
 
-    // if (section_status == TAPEDEV_SECT_STATUS_WORKING)
-    // {
-    //     sec->status = TAPEDEV_SECT_STATUS_WORKING;
-    //     goto release_lock;
-    // }
-
-	// uint32_t nodes_in_lst = list_count_nodes(&sec->ioctl_cmd_queue_head);
-
 	if (section_error)
 	{
 		clear_sec_err_intrpt(sec);
@@ -258,7 +250,7 @@ static int _rewind_pgt(uint64_t *pgt_buf, int start_idx, int *nents)
 	// starting with element at start_idx to the LEFT
 	*nents = *nents - start_idx;
 
-	pr_warn("%s:%u: start_idx: %d, nents_left: %d \n", __func__, __LINE__, start_idx, *nents);
+	pr_warn("%s:%u: REWIND: start_idx: %d, nents_left: %d \n", __func__, __LINE__, start_idx, *nents);
 	return 0;
 }
 
@@ -266,12 +258,14 @@ static void _handle_read_write(struct req_state *curr_req, struct section *sec)
 {
 	if (curr_req->sg_idx >= curr_req->nents)
 	{
+		pr_warn("%s:%u: section: %u completed request \n", __func__, __LINE__, sec->idx);
 		curr_req->completed = true;
 	}
 	else if (curr_req->prev_tape_nbr != curr_req->tape_nbr)
 	{
 		// This case means that we've just ended read/write, and there is no
 		// more space on the tape, so we must change it
+		pr_warn("%s:%u: section: %u needs to insert new tape \n", __func__, __LINE__, sec->idx);
 		curr_req->prev_tape_nbr = curr_req->tape_nbr;
 		uint32_t cmd = create_tapedev_cmd(TAPEDEV_CMD_EJECT_TAPE, NO_ARG, NO_ARG);
 		curr_req->cmd = cmd;
@@ -314,6 +308,11 @@ static void _handle_read_write(struct req_state *curr_req, struct section *sec)
 		{
 			// Nbr of blocks in 64bit pgt_buf elem is at low 32 bits
 			uint32_t n_blocks = (uint32_t)(pgt_buf[i] & 0xffffffffULL);
+
+			if (n_blocks == 0)
+			{
+				pr_err("%s:%u: section: %u got 0 blocks in pgt_buf, i= %d, nents= %u \n", __func__, __LINE__, sec->idx, i, curr_req->nents);
+			}
 
 			blocks_in_cmd += n_blocks;
 
@@ -413,7 +412,7 @@ int __handle_section_done(uint32_t section_status, struct section *sec)
 	{
 		case TAPEDEV_CMD_EJECT_TAPE:
 		{
-			pr_warn("%s:%u: cmd DONE: TAPEDEV_CMD_EJECT_TAPE \n", __func__, __LINE__);
+			pr_warn("%s:%u: cmd DONE: TAPEDEV_CMD_EJECT_TAPE, section: %u \n", __func__, __LINE__, sec->idx);
 
 			sec->curr_tape = 0;
 			if (curr_req->is_ioctl)
@@ -432,7 +431,7 @@ int __handle_section_done(uint32_t section_status, struct section *sec)
 		}
 		case TAPEDEV_CMD_TAKE_TAPE:
 		{
-			pr_warn("%s:%u: cmd DONE: TAPEDEV_CMD_TAKE_TAPE, inserted tape: %u \n", __func__, __LINE__, curr_req->tape_nbr);
+			pr_warn("%s:%u: cmd DONE: TAPEDEV_CMD_TAKE_TAPE, inserted tape: %u, section: %u \n", __func__, __LINE__, curr_req->tape_nbr, sec->idx);
 			uint32_t tape = section_read_from(TAPEDEV_SECT_TAPE_NO_ADDR, sec); 
 	
 			if (tape != curr_req->tape_nbr)
@@ -449,7 +448,7 @@ int __handle_section_done(uint32_t section_status, struct section *sec)
 			break;
 		}
 		case TAPEDEV_CMD_REWIND:
-			pr_warn("%s:%u: cmd DONE: TAPEDEV_CMD_REWIND, tape: %u rewinded \n", __func__, __LINE__, tape_nbr);
+			pr_warn("%s:%u: cmd DONE: TAPEDEV_CMD_REWIND, tape: %u rewinded, section: %u \n", __func__, __LINE__, tape_nbr, sec->idx);
 
 			// After rewind we must fast forward to correct sector
 			if (curr_req->start_block_within_tape != 0)

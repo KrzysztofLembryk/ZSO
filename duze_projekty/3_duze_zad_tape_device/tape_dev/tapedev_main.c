@@ -229,6 +229,7 @@ static int tapedev_ioctl(struct block_device *bdev, blk_mode_t mode, unsigned cm
 			spin_unlock_irqrestore(&sec->lock, flags);
 			if (wait_event_interruptible(sec->ioctl_eject_wait_q, sec->ioctl_cmd_done))
 			{
+				pr_warn("%s:%u: IOCTL got error while waiting \n", __func__, __LINE__);
 				return -ERESTARTSYS;
 			}
 			spin_lock_irqsave(&sec->lock, flags);
@@ -314,9 +315,8 @@ static int init_req_state(u64 start_sector, int write, int original_nents, int n
 	{
 		cmd = create_tapedev_cmd(TAPEDEV_CMD_TAKE_TAPE, tape_nbr, NO_ARG);
 	}
-	else
+	else /* sec->curr_tape != tape_nbr*/
 	{
-		// inserted tape is different than ours
 		cmd = create_tapedev_cmd(TAPEDEV_CMD_EJECT_TAPE, NO_ARG, NO_ARG);
 	}
 
@@ -571,8 +571,8 @@ static blk_status_t tapedev_queue_rq(struct blk_mq_hw_ctx *hctx, const struct bl
 		sec->req = NULL;
 	}
 
-	spin_unlock_irqrestore(&sec->lock, flags);
 	pr_warn("%s:%u: ENDED request creation and scheduling for section: %u\n", __func__, __LINE__, sec->idx);
+	spin_unlock_irqrestore(&sec->lock, flags);
 	return status;
 }
 
