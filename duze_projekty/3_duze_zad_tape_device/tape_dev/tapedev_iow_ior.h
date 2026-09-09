@@ -76,7 +76,7 @@ static inline uint32_t create_tapedev_cmd(uint32_t cmd_type, uint32_t arg1, uint
 		break;
 
 		case TAPEDEV_CMD_FAST_FWD:
-			pr_warn("%s:%u: creating TAPEDEV_CMD_FAST_FWD\n", __func__, __LINE__);
+			pr_warn("%s:%u: creating TAPEDEV_CMD_FAST_FWD, by %u blocks\n", __func__, __LINE__, arg1);
 			cmd = arg1 << 8;
 			cmd = cmd | TAPEDEV_CMD_FAST_FWD;
 		break;

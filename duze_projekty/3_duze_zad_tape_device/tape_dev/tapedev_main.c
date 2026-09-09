@@ -310,8 +310,13 @@ static int init_req_state(u64 start_sector, int write, int original_nents, int n
 	{
 		cmd = create_tapedev_cmd(TAPEDEV_CMD_REWIND, NO_ARG, NO_ARG);
 	}
+	else if (sec->curr_tape == 0)
+	{
+		cmd = create_tapedev_cmd(TAPEDEV_CMD_TAKE_TAPE, tape_nbr, NO_ARG);
+	}
 	else
 	{
+		// inserted tape is different than ours
 		cmd = create_tapedev_cmd(TAPEDEV_CMD_EJECT_TAPE, NO_ARG, NO_ARG);
 	}
 
