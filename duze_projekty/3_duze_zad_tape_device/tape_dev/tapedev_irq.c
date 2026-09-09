@@ -313,8 +313,6 @@ static void _handle_read_write(struct req_state *curr_req, struct section *sec)
 			if (n_blocks == 0)
 			{
 				pr_err("%s:%u: section: %u got 0 blocks in pgt_buf, i= %d, nents= %u \n", __func__, __LINE__, sec->idx, i, curr_req->nents);
-				pr_err("%s:%u: section: %u got 0 blocks in pgt_buf, i= %d, nents= %u \n", __func__, __LINE__, sec->idx, i, curr_req->nents);
-				pr_err("%s:%u: section: %u got 0 blocks in pgt_buf, i= %d, nents= %u \n", __func__, __LINE__, sec->idx, i, curr_req->nents);
 			}
 
 			blocks_in_cmd += n_blocks;
