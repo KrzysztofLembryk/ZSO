@@ -51,9 +51,11 @@ struct rewind_data
 	bool do_rewind;
 	uint64_t overflow_blocks;
 	uint64_t inserted_blocks;
-	uint64_t new_pgt_entry;
+	uint64_t old_pgt_entry;
 	int idx;
 };
+
+extern const struct rewind_data NO_REWIND; 
 
 struct req_state
 {
@@ -116,6 +118,7 @@ struct section
 	bool ioctl_cmd_done;
 	int status;
 	int ioctl_status;
+	uint32_t curr_tape;
 	/*
 		gendisk is kernel's representation of of an individual DISK DEVICE
 	*/

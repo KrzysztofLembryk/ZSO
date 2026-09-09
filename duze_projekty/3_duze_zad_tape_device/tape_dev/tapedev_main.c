@@ -110,7 +110,7 @@ static irqreturn_t tapedev_interrupt_handler(int irq, void *opaque_dev)
 	if (is_hw_error)
 	{
 		tapedev_iow(dev, TAPEDEV_IRQ_CLEAR_ADDR, (1 << TAPEDEV_IRQ_HW_ERROR));
-		pr_warn("%s:%u: hardware error\n", __func__, __LINE__);
+		pr_err("%s:%u: HARDWARE ERROR\n", __func__, __LINE__);
 		dev->status = -1;
 
 		spin_unlock_irqrestore(&dev->s_lock, flags);
@@ -127,7 +127,8 @@ static irqreturn_t tapedev_interrupt_handler(int irq, void *opaque_dev)
 	// Max allowed number of sections is 8, we should check this
 	// We have this stored inside section
 
-	handle_sections_interrupts(ir_status, num_sections, dev);
+	if (handle_sections_interrupts(ir_status, num_sections, dev))
+		return IRQ_NONE;
 
 	// return IRQ_RETVAL(ir_status);
 	return IRQ_HANDLED;
@@ -305,7 +306,14 @@ static int init_req_state(u64 start_sector, int write, int original_nents, int n
 	const uint32_t blocks_in_tape = GET_NBR_OF_BLOCKS_IN_TAPE(sec->section_type, sec->blk_size);
 	uint32_t blocks_left_in_tape = blocks_in_tape - start_block_within_tape;
 
-	cmd = create_tapedev_cmd(TAPEDEV_CMD_EJECT_TAPE, NO_ARG, NO_ARG);
+	if (sec->curr_tape == tape_nbr)
+	{
+		cmd = create_tapedev_cmd(TAPEDEV_CMD_REWIND, NO_ARG, NO_ARG);
+	}
+	else
+	{
+		cmd = create_tapedev_cmd(TAPEDEV_CMD_EJECT_TAPE, NO_ARG, NO_ARG);
+	}
 
 	sec->req_state.cmd = cmd;
 	sec->req_state.is_ioctl = false;
@@ -323,7 +331,7 @@ static int init_req_state(u64 start_sector, int write, int original_nents, int n
 	sec->req_state.nents = nents;
 	sec->req_state.completed = false;
 	sec->req_state.device_pgt_offset = 0;
-	// pr_warn("%s:%u: Moving to correct pos ENDED\n", __func__, __LINE__);
+
 	return 0;
 }
 
@@ -374,13 +382,8 @@ static int do_scatter_gather(struct request *req, u64 start_sector, struct secti
 	}
 
 	pr_warn("%s:%u: DOING SCATTER GATHER section: %u, section size bytes: %u,blk_size: %u, one tape has: %u sectors \n", __func__, __LINE__, sec->idx, SIZE_OF_SECTION_IN_BYTES(sec->section_type, sec->n_tapes), section_blk_size, (SIZE_OF_TAPE(sec->section_type) / 512));
-	// TODO:
-	// Even kmalloc inside queue_rq is BAD --> what we should do is preallocate sg
+	// 	kmalloc inside queue_rq is BAD --> what we should do is preallocate sg
 	// 	array inside requests private memory,
-	// 	we should create a current request context which will be a state machine
-	// 	and here instead of creating all cmds and then starting our task we will
-	// 	set state machine to eject and irq handler will handle the rest and 
-	// 	transition to the next steps
 
 	// Clears provided ptr and initializes in 
 	sg_init_table(sec->sg_arr, MAX_SG_PGT_ENTRIES);
@@ -407,10 +410,6 @@ static int do_scatter_gather(struct request *req, u64 start_sector, struct secti
 
 	struct scatterlist *sg;
 	int ent_id;
-	// int cmd_start_pos = 0;
-	// uint32_t cmd_total_blocks = 0;
-	// const uint32_t blocks_in_tape = GET_NBR_OF_BLOCKS_IN_TAPE(sec->section_type, sec->blk_size);
-	// uint32_t blocks_left_in_tape = blocks_in_tape - start_block_within_tape;
 
 	if (init_req_state(start_sector, write, original_nents, nents, sec))
 	{
@@ -452,6 +451,13 @@ static int do_scatter_gather(struct request *req, u64 start_sector, struct secti
 		sec->req_state.is_being_executed = true;
 		section_send_cmd(sec->req_state.cmd, sec);
 	}
+	else
+	{
+		// If list is not empty it means that tape will be ejected, thus we will need
+		// to insert tape as our first command
+		uint32_t cmd = create_tapedev_cmd(TAPEDEV_CMD_TAKE_TAPE, tape_nbr, NO_ARG);
+		sec->req_state.cmd = cmd;
+	}
 
 	return BLK_STS_OK;
 unmap_sg:
@@ -473,7 +479,6 @@ static inline int submit_request_sg(struct request *req, struct section *sec)
 {
 	int err = BLK_STS_OK;
 
-	sec->req = req;
 
 	pr_warn("%s:%u: START submit_request_sg\n", __func__, __LINE__);
 
@@ -513,6 +518,7 @@ static inline int submit_request_sg(struct request *req, struct section *sec)
 	if (err)
 		goto cleanup;
 
+	sec->req = req;
 	return err;
 
 cleanup:
@@ -555,17 +561,9 @@ static blk_status_t tapedev_queue_rq(struct blk_mq_hw_ctx *hctx, const struct bl
 
 	if (status)
 	{
-		if (sec->req != NULL)
-		{
-			pr_warn("%s:%u: doing blk_mq_end_request\n", __func__, __LINE__);
-			blk_mq_end_request(req, status);
-			sec->req = NULL;
-		}
-		else
-		{
-			pr_err("%s:%u: wanted to do blk_mq_end_request but sec->req WAS NULL\n", __func__, __LINE__);
-		}
-
+		pr_err("%s:%u: process request encountered error\n", __func__, __LINE__);
+		blk_mq_end_request(req, status);
+		sec->req = NULL;
 	}
 
 	spin_unlock_irqrestore(&sec->lock, flags);
@@ -1031,6 +1029,7 @@ static int create_section(
 	sec->ioctl_cmd_done = false;
 	sec->status = 0;
 	sec->ioctl_status = 0;
+	sec->curr_tape = section_ior(tape_dev, GET_SECTION_ADDR(section_id), TAPEDEV_SECT_TAPE_NO_ADDR);
 	sec->req_state = NULL_REQ_STATE;
 	sec->req = NULL;
 	sec->sg_arr = kzalloc((sizeof(*(sec->sg_arr)) * MAX_SG_PGT_ENTRIES), GFP_KERNEL);

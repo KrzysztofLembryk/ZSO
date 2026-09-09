@@ -21,6 +21,14 @@ const struct req_state NULL_REQ_STATE = {
 		.overflow_blocks = 0,
 		.inserted_blocks = 0,
 		.idx = 0,
-		.new_pgt_entry = 0
+		.old_pgt_entry = 0
 	},
+};
+
+const struct rewind_data NO_REWIND = {
+	.do_rewind = false,
+	.overflow_blocks = 0,
+	.inserted_blocks = 0,
+	.idx = 0,
+	.old_pgt_entry = 0
 };

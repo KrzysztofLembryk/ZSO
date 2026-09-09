@@ -22,6 +22,7 @@ int handle_sections_interrupts(uint32_t ir_status, uint32_t num_sections, struct
 	uint32_t section_done; 
 	uint32_t section_error;
 	uint32_t section_status;
+	int err = 0;
 
 	for (int sec_id = 0; sec_id < num_sections; sec_id++)
 	{
@@ -34,10 +35,9 @@ int handle_sections_interrupts(uint32_t ir_status, uint32_t num_sections, struct
 		section_error = (ir_status & (1 << TAPEDEV_IRQ_SECT_X_ERROR(sec_id))) > 0;
 		section_status = section_read_from(TAPEDEV_SECT_STATUS_ADDR, sec);
 
-		int err = 0;
 		if (section_done || section_error)
 		{
-			err = _handle_section_interrupt(
+			err = err + _handle_section_interrupt(
 					section_done, 
 					section_error, 
 					section_status, 
@@ -51,7 +51,7 @@ int handle_sections_interrupts(uint32_t ir_status, uint32_t num_sections, struct
 		}
 		// if section currently working we do nothing
 	}
-	return 0;
+	return err;
 }
 
 
@@ -179,14 +179,14 @@ int __handle_section_error(uint32_t section_status, struct section *sec)
 				sec->status = -err;
 				return -err;
 			}
-			else
-			{
-				// Otherwise we ignore this error, since when handling request we 
-				// always firstly eject tape even if there is no tape inside.
-				uint32_t cmd = create_tapedev_cmd(TAPEDEV_CMD_TAKE_TAPE, curr_req->tape_nbr, NO_ARG);
-				curr_req->cmd = cmd;
-			}
-			return -1;
+			// else
+			// {
+			// 	// Otherwise we ignore this error, since when handling request we 
+			// 	// always firstly eject tape even if there is no tape inside.
+			// 	uint32_t cmd = create_tapedev_cmd(TAPEDEV_CMD_TAKE_TAPE, curr_req->tape_nbr, NO_ARG);
+			// 	curr_req->cmd = cmd;
+			// }
+			// return -1;
 		case TAPEDEV_SECT_STATUS_ERR_RESET:
 
 			pr_err("%s:%u: section: %d, error: ERR_RESET\n", __func__, __LINE__, sec->idx);
@@ -265,11 +265,6 @@ static int _rewind_pgt(uint64_t *pgt_buf, int start_idx, int *nents)
 int __handle_section_done(uint32_t section_status, struct section *sec)
 {
 	int err = 0;
-	// Probably it works like this: when error check status, if section_done we don't
-	// need to check status
-	// TAPEDEV_IRQ_SECT_n_DONE - Section finished a command, if no error we probably
-	// 	can safely assume that everything is OK.
-	// TAPEDEV_IRQ_SECT_n_ERROR - Section error, check status.
 
 	if (section_status != TAPEDEV_SECT_STATUS_DONE)
 	{
@@ -300,6 +295,7 @@ int __handle_section_done(uint32_t section_status, struct section *sec)
 		{
 			pr_warn("%s:%u: cmd DONE: TAPEDEV_CMD_EJECT_TAPE \n", __func__, __LINE__);
 
+			sec->curr_tape = 0;
 			if (curr_req->is_ioctl)
 			{
 				sec->ioctl_cmd_done = true;
@@ -322,12 +318,10 @@ int __handle_section_done(uint32_t section_status, struct section *sec)
 			if (tape != curr_req->tape_nbr)
 			{
 				pr_err("%s:%u: take_tape was done but inserted tape: '%u' is different from requested tape: '%u' \n", __func__, __LINE__, tape, curr_cmd_body);
-				// TODO: rework errors, add INTERNAL_ERROR or sth and return it here
-				// instead of -1
 				err = -1;
 				goto ret;
 			}
-
+			sec->curr_tape = tape;
 			// After we've inserted tape we must rewind it 
 			uint32_t cmd = create_tapedev_cmd(TAPEDEV_CMD_REWIND, NO_ARG, NO_ARG);
 			curr_req->cmd = cmd;
@@ -338,9 +332,16 @@ int __handle_section_done(uint32_t section_status, struct section *sec)
 			pr_warn("%s:%u: cmd DONE: TAPEDEV_CMD_REWIND, tape: %u rewinded \n", __func__, __LINE__, tape_nbr);
 
 			// After rewind we must fast forward to correct sector
-			uint32_t cmd = create_tapedev_cmd(TAPEDEV_CMD_FAST_FWD, curr_req->start_block_within_tape, NO_ARG);
-			curr_req->cmd = cmd;
-			break;
+			if (curr_req->start_block_within_tape != 0)
+			{
+				uint32_t cmd = create_tapedev_cmd(TAPEDEV_CMD_FAST_FWD, curr_req->start_block_within_tape, NO_ARG);
+				curr_req->cmd = cmd;
+				break;
+			}
+			else
+			{
+				pr_warn("%s:%u: Skipping forwarding by 0 blocks \n", __func__, __LINE__);
+			}
 		case TAPEDEV_CMD_FAST_FWD:
 		case TAPEDEV_CMD_READ:
 		case TAPEDEV_CMD_WRITE:
@@ -363,33 +364,42 @@ int __handle_section_done(uint32_t section_status, struct section *sec)
 
 				if (curr_req->rewind_state.do_rewind)
 				{
-
 					// When creating READ/WRITE cmd we have only 23-31 bits for 
 					// offset in page table counted in BLOCKS, so we can at most 
 					// hold offset of 511 blocks, therefore, if we exceed this 
 					// number our stored value will be truncated and we will get 
-					// incorrect offset.
+					// incorrect block offset passed to our device.
+					// This will happen often since request can span LOADS of blocks.
 					// Thanks to rewinding tape our device block offset will 
-					// always be either 0 or inserted blocks
+					// always be 0.
+
+					if (curr_req->rewind_state.overflow_blocks != 0)
+					{
+						uint64_t old_addr = 
+							(curr_req->rewind_state.old_pgt_entry >> 32) << 9;
+						uint64_t new_addr = old_addr + curr_req->rewind_state.inserted_blocks * ((uint64_t)sec->blk_size);
+						new_addr = new_addr >> 9;
+						uint64_t new_pgt_entry = new_addr;
+						new_pgt_entry = new_pgt_entry << 32;
+						new_pgt_entry = new_pgt_entry | curr_req->rewind_state.overflow_blocks;
+	
+						pgt_buf[curr_req->rewind_state.idx] = new_pgt_entry;
+					}
 					_rewind_pgt(pgt_buf, curr_req->rewind_state.idx, &(curr_req->nents));
+
+					curr_req->rewind_state = NO_REWIND;
+					dma_wmb();
 				}
 
-				// TODO: currently we might never got ot sg_idx >= nents, we must 
-				// change the flow, since if there is no rewind and we get 
-				// blocks_in_cmd == left_blocks_in_tape and this is last cmd
-				// we will never set cmd_done = true
-
-				for (int i = curr_req->sg_idx; i < curr_req->nents; i++)
+				for (int i = 0; i < curr_req->nents; i++)
 				{
-					// nbr of blocks in 64bit pgt_buf elem is at low 32 bits
+					// Nbr of blocks in 64bit pgt_buf elem is at low 32 bits
 					uint32_t n_blocks = (uint32_t)(pgt_buf[i] & 0xffffffffULL);
 
 					blocks_in_cmd += n_blocks;
 
 					if (blocks_in_cmd >= curr_req->left_blocks_in_tape)
 					{
-						pr_warn("%s:%u: blocks_in_cmd: %u >= %u : left_blks_in_tape rewinded \n", __func__, __LINE__, blocks_in_cmd, curr_req->left_blocks_in_tape);
-
 						uint64_t overflow_blocks = 
 							blocks_in_cmd - curr_req->left_blocks_in_tape;
 						uint64_t inserted_blocks = n_blocks - overflow_blocks;
@@ -400,41 +410,36 @@ int __handle_section_done(uint32_t section_status, struct section *sec)
 							curr_req->device_pgt_offset, 
 							blocks_in_cmd
 						);
-						curr_req->sg_idx = 0;
 						curr_req->cmd = cmd;
 						curr_req->left_blocks_in_tape = curr_req->total_blocks_in_tape;
 						curr_req->tape_nbr++;
 						curr_req->start_block_within_tape = 0;
-						// We always want to start reading from 0
-
+						// Thanks to rewinding the pgt_buf we always start at 0 block
+						// offset in device
 						curr_req->device_pgt_offset = 0;
 						curr_req->rewind_state.do_rewind = true;
 						curr_req->rewind_state.overflow_blocks = overflow_blocks;
 						curr_req->rewind_state.inserted_blocks = inserted_blocks;
 						if (overflow_blocks == 0)
 						{
-							i++;
+							// If this is last block to read, i+1 == nents thus
+							// sg_idx == nents so we will go into completed=true
+							// branch and there will be no rewind.
+							// If this is not last block, we will simply rewind our
+							// pgt_buf so that i + 1 entry is at 0 position
+							curr_req->sg_idx = i + 1;
 							curr_req->rewind_state.idx = i + 1;
 						}
 						else
 						{
+							// We still have overflow_blocks to read from pgt_buf[i]
+							// thus we must stay at this pgt_buf entry, but we must
+							// forward dma_addr by inserted_blocks * blk_size, so 
+							// that our device can start reading at 0 block offset.
+							// This forwarding pgt_buf will be done in rewind branch
+							curr_req->sg_idx = i;
 							curr_req->rewind_state.idx = i;
-							// We have still some more blocks to read from pgt_buf[i]
-							// but inserted blocks, which is our offset might be 
-							// greater than 511, thus we need to calculate new dma
-							// address already shifted by inserted_blocks, so that
-							// our offset is 0 and we will easily read/write overflow
-							// nbr of blocks
-
-							uint64_t old_addr = (pgt_buf[i] >> 32) << 9;
-							uint64_t new_addr = old_addr + inserted_blocks * ((uint64_t)sec->blk_size);
-							new_addr = new_addr >> 9;
-							uint64_t new_pgt_entry = new_addr;
-							new_pgt_entry = new_pgt_entry << 32;
-							new_pgt_entry = new_pgt_entry | (u64)overflow_blocks;
-
-							curr_req->rewind_state.new_pgt_entry = new_pgt_entry;
-
+							curr_req->rewind_state.old_pgt_entry = pgt_buf[i];
 						}
 
 						blocks_in_cmd = 0;
@@ -444,12 +449,13 @@ int __handle_section_done(uint32_t section_status, struct section *sec)
 
 				if (blocks_in_cmd != 0)			
 				{
-					// we will be sending LAST cmd, no more blocks
+					// This is LAST command for this request
 					uint32_t cmd = create_tapedev_cmd(
 						curr_req->is_write ? TAPEDEV_CMD_WRITE : TAPEDEV_CMD_READ, 
 						curr_req->device_pgt_offset, 
 						blocks_in_cmd
 					);
+					// Thanks to this assignment we will go into completed branch
 					curr_req->sg_idx = curr_req->nents;
 					curr_req->cmd = cmd;
 				}
@@ -479,6 +485,7 @@ void __handle_next_cmd(struct section *sec)
 	}
 	else if (!list_empty(&sec->ioctl_cmd_queue_head))
 	{
+		pr_warn("%s:%u: next cmd is IOCTL for section: %u\n", __func__, __LINE__, sec->idx);
 		struct lst_node *node = list_first_entry(&sec->ioctl_cmd_queue_head, struct lst_node, lst_link);
 		node->cmd.is_being_executed = true;
 		section_send_cmd(node->cmd.cmd, sec);
@@ -489,6 +496,7 @@ void __handle_next_cmd(struct section *sec)
 		pr_err("%s:%u: INVALID STATE in section: %u, sec->req and sec->req_state have different states \n", __func__, __LINE__, sec->idx);
 		return;
 	}
+	pr_warn("%s:%u: No next cmd present, section: %u\n", __func__, __LINE__, sec->idx);
 	// No next cmd present
 }
 
