@@ -309,8 +309,11 @@ static void _handle_read_write(struct req_state *curr_req, struct section *sec)
 			// Nbr of blocks in 64bit pgt_buf elem is at low 32 bits
 			uint32_t n_blocks = (uint32_t)(pgt_buf[i] & 0xffffffffULL);
 
+			curr_req->sg_idx = i;
 			if (n_blocks == 0)
 			{
+				pr_err("%s:%u: section: %u got 0 blocks in pgt_buf, i= %d, nents= %u \n", __func__, __LINE__, sec->idx, i, curr_req->nents);
+				pr_err("%s:%u: section: %u got 0 blocks in pgt_buf, i= %d, nents= %u \n", __func__, __LINE__, sec->idx, i, curr_req->nents);
 				pr_err("%s:%u: section: %u got 0 blocks in pgt_buf, i= %d, nents= %u \n", __func__, __LINE__, sec->idx, i, curr_req->nents);
 			}
 
@@ -503,7 +506,10 @@ void __handle_next_cmd(struct section *sec)
 		pr_err("%s:%u: INVALID STATE in section: %u, sec->req and sec->req_state have different states \n", __func__, __LINE__, sec->idx);
 		return;
 	}
-	pr_warn("%s:%u: No next cmd present, section: %u\n", __func__, __LINE__, sec->idx);
+	else
+	{
+		pr_warn("%s:%u: No next cmd present, section: %u\n", __func__, __LINE__, sec->idx);
+	}
 	// No next cmd present
 }
 
